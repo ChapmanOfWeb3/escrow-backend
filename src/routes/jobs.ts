@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { Request, Response } from "express";
+import type { Request, Response, NextFunction } from "express";
 import {
   Contract,
   Networks,
@@ -250,25 +250,17 @@ router.get(
   jobContractCors,
   jobContractSecurityHeaders,
   jobWhitelistRateLimit,
+  (req: Request, _res: Response, next: NextFunction) => {
+    logger.info("Fetching whitelisted tokens", { contractId: req.params.contractId });
+    next();
+  },
   validate(contractIdParamsSchema, "params", (req) =>
-    logger.warn("Invalid contractId on whitelist request", { contractId: req.params.contractId }),
+    logger.warn("Invalid contractId provided", { contractId: req.params.contractId }),
   ),
   async (req: Request, res: Response) => {
     const contractId = req.params.contractId as string;
 
     try {
-<<<<<<< feat/issue-48-whitelist-logger-traces
-      logger.info("Fetching whitelisted tokens", { contractId });
-
-      const validation = validateContractId(contractId);
-      if (!validation.valid) {
-        logger.warn("Invalid contractId provided", { contractId });
-        sendError(res, 400, validation.error!);
-        return;
-      }
-
-=======
->>>>>>> main
       const requiredApiKey = process.env.API_KEY;
       if (requiredApiKey) {
         const providedKey = req.header("x-api-key");
@@ -356,7 +348,7 @@ router.get(
         return;
       }
       if (/not found|404/i.test(message)) {
-        logger.error("Failed to fetch whitelisted tokens", { contractId, error: message });
+        logger.warn("Job not found", { contractId });
         sendError(res, 404, "Job not found");
         return;
       }
