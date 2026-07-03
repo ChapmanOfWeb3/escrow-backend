@@ -545,6 +545,9 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
 
       expect(mockGetAccount).not.toHaveBeenCalled();
       expect(mockSimulateTransaction).not.toHaveBeenCalled();
+    });
+  });
+
   // --- ISSUE #50: Node-Cache in-memory caching ---
   describe("Node-Cache in-memory caching (Issue #50)", () => {
     it("returns tokens from RPC on first request", async () => {
