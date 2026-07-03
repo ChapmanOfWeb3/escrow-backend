@@ -257,10 +257,23 @@ router.get(
     const contractId = req.params.contractId as string;
 
     try {
+<<<<<<< feat/issue-48-whitelist-logger-traces
+      logger.info("Fetching whitelisted tokens", { contractId });
+
+      const validation = validateContractId(contractId);
+      if (!validation.valid) {
+        logger.warn("Invalid contractId provided", { contractId });
+        sendError(res, 400, validation.error!);
+        return;
+      }
+
+=======
+>>>>>>> main
       const requiredApiKey = process.env.API_KEY;
       if (requiredApiKey) {
         const providedKey = req.header("x-api-key");
         if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized request", { contractId });
           sendError(res, 401, "Unauthorized");
           return;
         }
