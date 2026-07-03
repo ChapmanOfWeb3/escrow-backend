@@ -88,9 +88,9 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
     }
   });
 
-  // --- ISSUE #44: Address Validation ---
-  describe("Address Validation (Issue #44)", () => {
-    it("returns 400 for an invalid contractId", async () => {
+  // --- ISSUE #88 / #89: Schema validation and Stellar address format ---
+  describe("Schema and Stellar address validation (Issues #88, #89)", () => {
+    it("returns 400 for a garbage contractId", async () => {
       const res = await request(buildApp())
         .get("/api/jobs/not-a-valid-contract/whitelist")
         .expect(400);
@@ -110,6 +110,43 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
 
       expect(res.body.success).toBe(false);
       expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    });
+
+    it("returns 400 for a contractId that is too short", async () => {
+      const short = "C" + "A".repeat(40);
+      const res = await request(buildApp())
+        .get(`/api/jobs/${short}/whitelist`)
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    });
+
+    it("returns 400 for a contractId that is too long", async () => {
+      const long = "C" + "A".repeat(60);
+      const res = await request(buildApp())
+        .get(`/api/jobs/${long}/whitelist`)
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    });
+
+    it("returns standardised error shape for all invalid contractId inputs", async () => {
+      const res = await request(buildApp())
+        .get("/api/jobs/bad/whitelist")
+        .expect(400);
+
+      expect(res.body).toMatchObject({ success: false, error: expect.any(String) });
+    });
+
+    it("does not return 400 for a syntactically valid contractId", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        error: "contract not found on network",
+      });
+
+      const res = await request(buildApp()).get(`/api/jobs/${VALID_CONTRACT}/whitelist`);
+      expect(res.status).not.toBe(400);
     });
   });
 
@@ -242,8 +279,8 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
     });
   });
 
-  // --- ISSUE #47: Custom Rate Limiting ---
-  describe("Custom Rate Limiting (Issue #47)", () => {
+  // --- ISSUE #90: Custom Rate Limiting ---
+  describe("Custom Rate Limiting (Issue #90)", () => {
     it("allows requests up to the configured threshold", async () => {
       process.env.JOB_WHITELIST_RATE_MAX = "2";
       const vec = { forEach: () => {} };
@@ -275,6 +312,32 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
         error: "Too many requests, please try again later",
       });
       expect(res.headers["x-ratelimit-remaining"]).toBe("0");
+    });
+
+    it("decrements X-RateLimit-Remaining with each request", async () => {
+      process.env.JOB_WHITELIST_RATE_MAX = "3";
+      const vec = { forEach: () => {} };
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: vec } });
+
+      const app = buildApp();
+      const r1 = await request(app).get(`/api/jobs/${VALID_CONTRACT}/whitelist`).expect(200);
+      const r2 = await request(app).get(`/api/jobs/${VALID_CONTRACT}/whitelist`).expect(200);
+      const r3 = await request(app).get(`/api/jobs/${VALID_CONTRACT}/whitelist`).expect(200);
+
+      expect(r1.headers["x-ratelimit-remaining"]).toBe("2");
+      expect(r2.headers["x-ratelimit-remaining"]).toBe("1");
+      expect(r3.headers["x-ratelimit-remaining"]).toBe("0");
+    });
+
+    it("sets X-RateLimit-Reset as a Unix timestamp in the future", async () => {
+      const vec = { forEach: () => {} };
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: vec } });
+
+      const before = Math.floor(Date.now() / 1000);
+      const res = await request(buildApp()).get(`/api/jobs/${VALID_CONTRACT}/whitelist`).expect(200);
+      const reset = Number(res.headers["x-ratelimit-reset"]);
+
+      expect(reset).toBeGreaterThanOrEqual(before);
     });
   });
 
@@ -377,6 +440,114 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
     });
   });
 
+  // --- ISSUE #49: Zod schema middleware validation ---
+  describe("Zod schema middleware validation (Issue #49)", () => {
+    // ── Invalid contractId formats ────────────────────────────────────────
+
+    it("returns 400 with a field-level error for a completely invalid contractId", async () => {
+      const res = await request(buildApp())
+        .get("/api/jobs/not-a-contract/whitelist")
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/contractId/);
+      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    });
+
+    it("returns 400 when contractId is a Stellar account address (G…)", async () => {
+      const res = await request(buildApp())
+        .get(
+          "/api/jobs/GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX/whitelist"
+        )
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/contractId/);
+      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    });
+
+    it("returns 400 when contractId is too short (< 56 chars)", async () => {
+      const short = "C" + "A".repeat(40); // 41 chars
+      const res = await request(buildApp())
+        .get(`/api/jobs/${short}/whitelist`)
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/contractId/);
+    });
+
+    it("returns 400 when contractId is too long (> 56 chars)", async () => {
+      const long = "C" + "A".repeat(60); // 61 chars
+      const res = await request(buildApp())
+        .get(`/api/jobs/${long}/whitelist`)
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/contractId/);
+    });
+
+    it("returns 400 for an empty-looking contractId segment", async () => {
+      const res = await request(buildApp())
+        .get("/api/jobs/INVALID/whitelist")
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/contractId/);
+    });
+
+    // ── Response shape assertions ─────────────────────────────────────────
+
+    it("error body has exactly {success, error} keys — no extra fields", async () => {
+      const res = await request(buildApp())
+        .get("/api/jobs/bad-id/whitelist")
+        .expect(400);
+
+      expect(Object.keys(res.body)).toEqual(["success", "error"]);
+      expect(res.body.success).toBe(false);
+      expect(typeof res.body.error).toBe("string");
+    });
+
+    it("error message is a non-empty string (not an array or object)", async () => {
+      const res = await request(buildApp())
+        .get("/api/jobs/bad-id/whitelist")
+        .expect(400);
+
+      expect(typeof res.body.error).toBe("string");
+      expect(res.body.error.length).toBeGreaterThan(0);
+    });
+
+    it("error message contains the field name for easy client-side parsing", async () => {
+      const res = await request(buildApp())
+        .get("/api/jobs/bad-id/whitelist")
+        .expect(400);
+
+      // The middleware formats Zod issues as "field: message"
+      expect(res.body.error).toMatch(/contractId/);
+    });
+
+    // ── Valid contractId passes Zod and reaches the route handler ─────────
+
+    it("does NOT return 400 for a syntactically valid contractId", async () => {
+      const vec = { forEach: () => {} };
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: vec } });
+
+      const res = await request(buildApp()).get(
+        `/api/jobs/${VALID_CONTRACT}/whitelist`
+      );
+
+      expect(res.status).not.toBe(400);
+    });
+
+    it("Zod middleware runs before the route handler (RPC is never called on invalid input)", async () => {
+      await request(buildApp())
+        .get("/api/jobs/INVALID_ID/whitelist")
+        .expect(400);
+
+      expect(mockGetAccount).not.toHaveBeenCalled();
+      expect(mockSimulateTransaction).not.toHaveBeenCalled();
+    });
+  });
+
   // --- ISSUE #50: Node-Cache in-memory caching ---
   describe("Node-Cache in-memory caching (Issue #50)", () => {
     it("returns tokens from RPC on first request", async () => {
@@ -421,6 +592,25 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
         .expect(200);
 
       expect(cached.body).toEqual({ success: true, data: { tokens: ["TOKEN1", "TOKEN2"] } });
+    });
+
+    it("deduplicates concurrent whitelist requests with one RPC call", async () => {
+      const vec = {
+        forEach: (fn: (item: unknown) => void) => ["TOKEN1", "TOKEN2"].forEach(fn),
+      };
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: vec } });
+
+      const app = buildApp();
+      const requests = await Promise.all([
+        request(app).get(`/api/jobs/${VALID_CONTRACT}/whitelist`),
+        request(app).get(`/api/jobs/${VALID_CONTRACT}/whitelist`),
+      ]);
+
+      expect(requests[0].status).toBe(200);
+      expect(requests[1].status).toBe(200);
+      expect(requests[0].body).toEqual({ success: true, data: { tokens: ["TOKEN1", "TOKEN2"] } });
+      expect(requests[1].body).toEqual({ success: true, data: { tokens: ["TOKEN1", "TOKEN2"] } });
+      expect(mockSimulateTransaction).toHaveBeenCalledTimes(1);
     });
 
     it("caches different contractIds independently", async () => {

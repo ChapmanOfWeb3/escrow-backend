@@ -1,10 +1,12 @@
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import cors from "cors";
+import helmet from "helmet";
 import dotenv from "dotenv";
 import jobRoutes from "./routes/jobs.js";
 import adminRoutes from "./routes/admin.js";
-import { initSchema } from "./indexer/db.js";
+import webhookRoutes from "./routes/webhooks.js";
+import { runMigrations } from "./indexer/db.js";
 import { generalLimiter } from "./middleware/rateLimiter.js";
 import { startPoller } from "./indexer/poller.js";
 import { markIndexerStarted } from "./indexer/status.js";
@@ -17,30 +19,47 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
+app.use(helmet());
 app.use(express.json());
 
-app.get("/health", (req, res) => {
+// Structured HTTP request logging (#86)
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    logger.info("HTTP request", {
+      method: req.method,
+      url: req.originalUrl,
+      status: res.statusCode,
+      durationMs: Date.now() - start,
+      ip: req.ip ?? req.socket?.remoteAddress,
+    });
+  });
+  next();
+});
+
+app.get("/health", (_req, res) => {
   res.json({ status: "ok", contract: process.env.CONTRACT_ID });
 });
 
 app.use("/api", generalLimiter);
 app.use("/api/jobs", jobRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/webhooks", webhookRoutes);
 
-// Global error handler - prevents stack trace leakage
+// Global error handler – prevents stack trace leakage
 app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
   const message = err instanceof Error ? err.message : String(err);
   logger.error("Unhandled error", { error: message, path: req.path });
   res.status(500).json({ success: false, error: "Internal server error" });
 });
 
-// Initialize indexer schema and start polling
-initSchema();
+// Run DB migrations then start the indexer poller
+runMigrations();
 markIndexerStarted();
 startPoller();
 
 app.listen(PORT, () => {
-  console.log(`Escrow backend running on port ${PORT}`);
+  logger.info("Escrow backend started", { port: PORT });
 });
 
 export default app;
