@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { StrKey } from "@stellar/stellar-sdk";
 import { isValidStellarContractId, isValidStellarAddress } from "../utils/stellar.js";
 
 // ---------------------------------------------------------------------------
@@ -27,16 +28,16 @@ export const stellarAddressSchema = z
 
 /**
  * Milestone index: non-negative integer (supplied as a URL param string or number).
+ * Validated against the raw value before transforming, since parseInt() would
+ * otherwise silently truncate decimal strings like "1.5" down to 1.
  */
 export const milestoneIndexSchema = z
   .union([z.string(), z.number()])
-  .transform((v) => {
-    const n = typeof v === "number" ? v : parseInt(v, 10);
-    return n;
-  })
-  .refine((n) => Number.isInteger(n) && n >= 0, {
-    message: "index must be a non-negative integer",
-  });
+  .refine(
+    (v) => (typeof v === "number" ? Number.isInteger(v) && v >= 0 : /^\d+$/.test(v)),
+    { message: "index must be a non-negative integer" },
+  )
+  .transform((v) => (typeof v === "number" ? v : parseInt(v, 10)));
 
 /**
  * Amount: a positive numeric string or integer that can be coerced to BigInt.
@@ -86,40 +87,12 @@ export const submitBodySchema = z.object({
     .min(1, "signedXdr cannot be empty"),
 });
 
-/** POST /:contractId/milestones/:index/partial-release body */
-export const partialReleaseBodySchema = z.object({
-  amount: amountSchema,
-  sourceAddress: stellarAddressSchema,
-});
-
-/** POST /:contractId/milestones/:index/claim-auto-release body */
-export const claimAutoReleaseBodySchema = z.object({
-  sourceAddress: stellarAddressSchema,
-});
-
-export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
-
-export const whitelistParamsSchema = z.object({
-  contractId: z
-    .string({ required_error: "contractId is required" })
-    .refine(isValidStellarContractId, {
-      message: "contractId must be a valid Stellar contract address (C...)",
-    }),
-});
-
-export type WhitelistParams = z.infer<typeof whitelistParamsSchema>;
-
-export const partialReleaseParamsSchema = z.object({
-  contractId: z
-    .string({ required_error: "contractId is required" })
-    .refine(isValidStellarContractId, {
-      message: "contractId must be a valid Stellar contract address (C...)",
-    }),
-  index: z
-    .string({ required_error: "index is required" })
-    .regex(/^\d+$/, { message: "index must be a non-negative integer" }),
-});
-
+/**
+ * POST /:contractId/milestones/:index/partial-release body.
+ * Keeps its pre-existing field-specific error wording (rather than the
+ * generic amountSchema/stellarAddressSchema messages) since __tests__/
+ * partial-release.test.ts asserts on these exact strings.
+ */
 export const partialReleaseBodySchema = z.object({
   amount: z
     .union([z.string(), z.number()])
@@ -139,3 +112,15 @@ export const partialReleaseBodySchema = z.object({
       message: "sourceAddress must be a valid Stellar account address (G...)",
     }),
 });
+
+/** POST /:contractId/milestones/:index/claim-auto-release body */
+export const claimAutoReleaseBodySchema = z.object({
+  sourceAddress: stellarAddressSchema,
+});
+
+export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
+export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;
+export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
+export type SubmitBody = z.infer<typeof submitBodySchema>;
+export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
+export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;

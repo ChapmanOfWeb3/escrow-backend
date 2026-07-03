@@ -24,9 +24,11 @@ import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
-  whitelistParamsSchema,
-  partialReleaseParamsSchema,
+  contractMilestoneParamsSchema,
+  buildTxBodySchema,
+  submitBodySchema,
   partialReleaseBodySchema,
+  claimAutoReleaseBodySchema,
 } from "../schemas/jobs.js";
 import { strictLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -177,7 +179,7 @@ router.get(
     logger.warn("Invalid contractId provided", { contractId: req.params.contractId }),
   ),
   async (req: Request, res: Response) => {
-    const { contractId } = req.params;
+    const contractId = req.params.contractId as string;
 
     logger.info("Fetching job", { contractId });
 
@@ -248,11 +250,11 @@ router.get(
   jobContractCors,
   jobContractSecurityHeaders,
   jobWhitelistRateLimit,
-  validate(whitelistParamsSchema, "params", (req) =>
+  validate(contractIdParamsSchema, "params", (req) =>
     logger.warn("Invalid contractId on whitelist request", { contractId: req.params.contractId }),
   ),
   async (req: Request, res: Response) => {
-    const contractId = req.params.contractId;
+    const contractId = req.params.contractId as string;
 
     try {
       const requiredApiKey = process.env.API_KEY;
@@ -284,7 +286,7 @@ router.get(
         const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
         const tx = new TransactionBuilder(account, {
           fee: BASE_FEE,
-          networkPassphrase: Networks.TESTNET,
+          networkPassphrase: NETWORK_PASSPHRASE,
         })
           .addOperation(contract.call("get_whitelisted_tokens"))
           .setTimeout(30)
@@ -397,11 +399,30 @@ router.post(
         return nativeToScVal(a.value);
       });
 
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(contract.call(method, ...scArgs))
+        .setTimeout(30)
+        .build();
+
+      const prepared = await server.prepareTransaction(tx);
+      res.json({ success: true, xdr: prepared.toXDR() });
+    } catch (err: any) {
+      logger.error("Failed to build transaction", { error: err?.message });
+      res.status(500).json({ success: false, error: "Internal server error" });
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
 // POST /api/jobs/:contractId/milestones/:index/partial-release
+// ---------------------------------------------------------------------------
 router.post(
   "/:contractId/milestones/:index/partial-release",
   partialReleaseRateLimit,
-  validate(partialReleaseParamsSchema, "params"),
+  validate(contractMilestoneParamsSchema, "params"),
   validate(partialReleaseBodySchema, "body"),
   async (req: Request, res: Response) => {
     try {
@@ -413,12 +434,12 @@ router.post(
 
       const tx = new TransactionBuilder(account, {
         fee: BASE_FEE,
-        networkPassphrase: Networks.TESTNET,
+        networkPassphrase: NETWORK_PASSPHRASE,
       })
         .addOperation(contract.call(
           "approve_partial",
           Address.fromString(sourceAddress).toScVal(),
-          nativeToScVal(parseInt(index as string), { type: "u32" }),
+          nativeToScVal(Number(index), { type: "u32" }),
           nativeToScVal(amountNum, { type: "i128" })
         ))
         .setTimeout(30)
@@ -442,7 +463,8 @@ router.get(
   ),
   async (req: Request, res: Response) => {
     try {
-      const { contractId, index } = req.params;
+      const contractId = req.params.contractId as string;
+      const { index } = req.params;
       const contract = new Contract(contractId);
       const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
       const tx = new TransactionBuilder(account, {
@@ -489,7 +511,8 @@ router.post(
   ),
   async (req: Request, res: Response) => {
     try {
-      const { contractId, index } = req.params;
+      const contractId = req.params.contractId as string;
+      const { index } = req.params;
       const { sourceAddress } = req.body;
       const contract = new Contract(contractId);
       const account = await server.getAccount(sourceAddress as string);
