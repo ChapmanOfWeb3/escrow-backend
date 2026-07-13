@@ -13,6 +13,9 @@
   "author": "",
   "license": "ISC",
   "description": "",
+  "overrides": {
+    "axios": "^1.18.1"
+  },
   "dependencies": {
     "@stellar/stellar-sdk": "^15.1.0",
     "better-sqlite3": "^12.11.1",
