@@ -264,6 +264,10 @@ describe("getJobsByWallet() – unit", () => {
 // HTTP integration tests: GET /api/jobs/by-wallet/:address
 // ---------------------------------------------------------------------------
 
+const VALID_WALLET = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
+const VALID_WALLET_2 = "GB5CRPXUGXZCG6BESL4CM4F3VUAGQGFNYNBHPBRJAGLXXSRYJSEGZHUV";
+const VALID_WALLET_3 = "GABNCQRZNTG6MMITD33VHFITKJZ5PSYW2XVEXMP52BSMTPLU7WORDQNT";
+
 describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   let app: express.Express;
 
@@ -276,7 +280,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("returns success:true with jobs array and pagination fields", async () => {
-    const addr = "GHTTPTEST1";
+    const addr = VALID_WALLET;
     seedEvent(testDb, {
       contractId: "HTTP-C1",
       eventType: "initialized",
@@ -298,7 +302,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
 
   it("returns empty jobs array for unknown address", async () => {
     const res = await request(app)
-      .get("/api/jobs/by-wallet/GNOBODYKNOWSME")
+      .get(`/api/jobs/by-wallet/${VALID_WALLET_2}`)
       .expect(200);
 
     expect(res.body.success).toBe(true);
@@ -307,7 +311,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("respects ?page=1&limit=2 query params", async () => {
-    const addr = "GHTTPPAGE";
+    const addr = VALID_WALLET_3;
     for (let i = 1; i <= 4; i++) {
       seedEvent(testDb, {
         contractId: `HP${i}`,
@@ -330,7 +334,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("each job entry has the expected shape", async () => {
-    const addr = "GSHAPETEST";
+    const addr = VALID_WALLET;
     seedEvent(testDb, {
       contractId: "SHAPE-C",
       eventType: "funded",
@@ -352,5 +356,109 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       latest_ledger: expect.any(Number),
       latest_timestamp: expect.any(Number),
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zod middleware validation: GET /api/jobs/by-wallet/:address
+// ---------------------------------------------------------------------------
+
+describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
+  let app: express.Express;
+
+  beforeAll(async () => {
+    const { default: router } = await import("../src/routes/jobs.js");
+    app = express();
+    app.use(express.json());
+    app.use("/api/jobs", router);
+  });
+
+  it("returns 400 for an invalid wallet address format", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/not-a-stellar-address")
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toMatch(/valid Stellar account address/i);
+  });
+
+  it("returns 400 for a contract address (C…) used as wallet", async () => {
+    const res = await request(app)
+      .get(
+        "/api/jobs/by-wallet/CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH",
+      )
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/address/i);
+  });
+
+  it("returns 400 for an address that is too short", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/GSHORT")
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/address/i);
+  });
+
+  it("returns 400 when page is not a positive integer", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=0`)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "page must be a positive integer",
+    });
+  });
+
+  it("returns 400 when page is not numeric", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=abc`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/page/i);
+  });
+
+  it("returns 400 when limit is greater than 100", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=101`)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "limit must be between 1 and 100",
+    });
+  });
+
+  it("returns 400 when limit is less than 1", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=0`)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "limit must be between 1 and 100",
+    });
+  });
+
+  it("error body has exactly {success, error} keys", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/bad-address")
+      .expect(400);
+
+    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
+  });
+
+  it("does not return 400 for a valid address and query", async () => {
+    const res = await request(app).get(
+      `/api/jobs/by-wallet/${VALID_WALLET}?page=1&limit=10`,
+    );
+    expect(res.status).not.toBe(400);
   });
 });
