@@ -19,9 +19,12 @@ import {
 import {
   jobContractCors,
   jobContractSecurityHeaders,
+  createJobDraftCors,
+  createJobDraftSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate } from "../middleware/validate.js";
+import type { RequestWithValidatedQuery } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
   contractMilestoneParamsSchema,
@@ -29,9 +32,15 @@ import {
   submitBodySchema,
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
+  byWalletParamsSchema,
+  byWalletQuerySchema,
+  createJobDraftBodySchema,
+  type ByWalletQuery,
+  type CreateJobDraftBody,
 } from "../schemas/jobs.js";
 import { strictLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
+import { randomUUID } from "crypto";
 
 const router = Router();
 const CONTRACT_ID = process.env.CONTRACT_ID || "";
@@ -116,31 +125,66 @@ const parseJobFromResult = (result: any, contractId: string) => {
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
-router.get("/by-wallet/:address", (req: Request, res: Response) => {
-  try {
-    const address = req.params.address as string;
-    const page = parseInt((req.query.page as string) || "1", 10);
-    const limit = parseInt((req.query.limit as string) || "10", 10);
+router.get(
+  "/by-wallet/:address",
+  validate(byWalletParamsSchema, "params", (req) =>
+    logger.warn("Invalid by-wallet address", { address: req.params.address }),
+  ),
+  validate(byWalletQuerySchema, "query", (req) =>
+    logger.warn("Invalid by-wallet query", { query: req.query }),
+  ),
+  (req: Request, res: Response) => {
+    try {
+      const address = req.params.address as string;
+      const { page, limit } = (req as RequestWithValidatedQuery)
+        .validatedQuery as ByWalletQuery;
 
-    if (!address || address.trim() === "") {
-      res.status(400).json({ success: false, error: "address is required" });
-      return;
+      const result = getJobsByWallet(address, page, limit);
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: "Internal server error" });
     }
-    if (isNaN(page) || page < 1) {
-      res.status(400).json({ success: false, error: "page must be a positive integer" });
-      return;
-    }
-    if (isNaN(limit) || limit < 1 || limit > 100) {
-      res.status(400).json({ success: false, error: "limit must be between 1 and 100" });
-      return;
-    }
+  },
+);
 
-    const result = getJobsByWallet(address, page, limit);
-    res.json({ success: true, ...result });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: "Internal server error" });
-  }
-});
+// ---------------------------------------------------------------------------
+// POST /api/jobs/create-job-draft
+// Validates and stores a job draft payload (off-chain) before on-chain create.
+// ---------------------------------------------------------------------------
+router.options("/create-job-draft", createJobDraftCors);
+
+router.post(
+  "/create-job-draft",
+  createJobDraftCors,
+  createJobDraftSecurityHeaders,
+  validate(createJobDraftBodySchema, "body", (req) =>
+    logger.warn("Invalid create-job-draft request body", { body: req.body }),
+  ),
+  (req: Request, res: Response) => {
+    try {
+      const body = req.body as CreateJobDraftBody;
+
+      const draft = {
+        id: randomUUID(),
+        status: "draft" as const,
+        client: body.client,
+        freelancer: body.freelancer,
+        arbiter: body.arbiter,
+        token: body.token,
+        autoReleaseDays: body.autoReleaseDays,
+        milestones: body.milestones,
+        acceptedAssets: body.acceptedAssets,
+        requirements: body.requirements,
+        createdAt: new Date().toISOString(),
+      };
+
+      sendSuccess(res, draft);
+    } catch (err: any) {
+      logger.error("Failed to create job draft", { error: err?.message });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
 
 // GET /api/jobs/:contractId/history - event timeline for a single job
 router.get("/:contractId/history", (req: Request, res: Response) => {
