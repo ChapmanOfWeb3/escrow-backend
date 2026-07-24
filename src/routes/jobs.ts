@@ -29,6 +29,8 @@ import {
   submitBodySchema,
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
+  byWalletParamsSchema,
+  byWalletQuerySchema,
 } from "../schemas/jobs.js";
 import { strictLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -116,31 +118,48 @@ const parseJobFromResult = (result: any, contractId: string) => {
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
-router.get("/by-wallet/:address", (req: Request, res: Response) => {
-  try {
-    const address = req.params.address as string;
-    const page = parseInt((req.query.page as string) || "1", 10);
-    const limit = parseInt((req.query.limit as string) || "10", 10);
+router.get(
+  "/by-wallet/:address",
+  validate(byWalletParamsSchema, "params", (req) =>
+    logger.warn("Invalid address provided to by-wallet", {
+      address: req.params.address,
+    }),
+  ),
+  validate(byWalletQuerySchema, "query", (req) =>
+    logger.warn("Invalid query params for by-wallet", {
+      query: req.query,
+    }),
+  ),
+  (req: Request, res: Response) => {
+    try {
+      const { address } = req.params as { address: string };
+      const { page, limit } = req.query as unknown as {
+        page: number;
+        limit: number;
+      };
 
-    if (!address || address.trim() === "") {
-      res.status(400).json({ success: false, error: "address is required" });
-      return;
-    }
-    if (isNaN(page) || page < 1) {
-      res.status(400).json({ success: false, error: "page must be a positive integer" });
-      return;
-    }
-    if (isNaN(limit) || limit < 1 || limit > 100) {
-      res.status(400).json({ success: false, error: "limit must be between 1 and 100" });
-      return;
-    }
+      logger.info("Fetching jobs by wallet", { address, page, limit });
 
-    const result = getJobsByWallet(address, page, limit);
-    res.json({ success: true, ...result });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: "Internal server error" });
-  }
-});
+      const result = getJobsByWallet(address, page, limit);
+
+      logger.info("Jobs by wallet fetched successfully", {
+        address,
+        total: result.total,
+        page: result.page,
+        limit: result.limit,
+      });
+
+      res.json({ success: true, ...result });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to fetch jobs by wallet", {
+        address: req.params.address,
+        error: message,
+      });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
 
 // GET /api/jobs/:contractId/history - event timeline for a single job
 router.get("/:contractId/history", (req: Request, res: Response) => {

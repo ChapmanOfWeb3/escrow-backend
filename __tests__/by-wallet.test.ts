@@ -1,12 +1,24 @@
 import Database from "better-sqlite3";
 import request from "supertest";
 import express from "express";
+import type { Request, Response } from "express";
 import {
   initSchema,
   insertEvent,
   setDb,
   getJobsByWallet,
 } from "../src/indexer/db.js";
+
+// ---------------------------------------------------------------------------
+// Valid 56-char Stellar G-addresses (pass StrKey.isValidEd25519PublicKey).
+// Used in HTTP integration tests where the Zod param schema now validates them.
+// GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX is the well-known
+// valid address already used across the entire test suite.
+// ---------------------------------------------------------------------------
+
+/** The single well-known valid Stellar account address used project-wide. */
+const VALID_G_ADDR = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
+
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -276,17 +288,16 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("returns success:true with jobs array and pagination fields", async () => {
-    const addr = "GHTTPTEST1";
     seedEvent(testDb, {
       contractId: "HTTP-C1",
       eventType: "initialized",
       ledger: 1,
       timestamp: 100,
-      dataJson: JSON.stringify({ client: addr }),
+      dataJson: JSON.stringify({ client: VALID_G_ADDR }),
     });
 
     const res = await request(app)
-      .get(`/api/jobs/by-wallet/${addr}`)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}`)
       .expect(200);
 
     expect(res.body.success).toBe(true);
@@ -298,7 +309,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
 
   it("returns empty jobs array for unknown address", async () => {
     const res = await request(app)
-      .get("/api/jobs/by-wallet/GNOBODYKNOWSME")
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}`)
       .expect(200);
 
     expect(res.body.success).toBe(true);
@@ -307,19 +318,18 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("respects ?page=1&limit=2 query params", async () => {
-    const addr = "GHTTPPAGE";
     for (let i = 1; i <= 4; i++) {
       seedEvent(testDb, {
         contractId: `HP${i}`,
         eventType: "initialized",
         ledger: i,
         timestamp: i * 100,
-        dataJson: JSON.stringify({ client: addr }),
+        dataJson: JSON.stringify({ client: VALID_G_ADDR }),
       });
     }
 
     const res = await request(app)
-      .get(`/api/jobs/by-wallet/${addr}?page=1&limit=2`)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}?page=1&limit=2`)
       .expect(200);
 
     expect(res.body.success).toBe(true);
@@ -330,17 +340,16 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("each job entry has the expected shape", async () => {
-    const addr = "GSHAPETEST";
     seedEvent(testDb, {
       contractId: "SHAPE-C",
       eventType: "funded",
       ledger: 50,
       timestamp: 5000,
-      dataJson: JSON.stringify({ freelancer: addr }),
+      dataJson: JSON.stringify({ freelancer: VALID_G_ADDR }),
     });
 
     const res = await request(app)
-      .get(`/api/jobs/by-wallet/${addr}`)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}`)
       .expect(200);
 
     const job = res.body.jobs[0];
@@ -352,5 +361,102 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       latest_ledger: expect.any(Number),
       latest_timestamp: expect.any(Number),
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Validation error tests (new Zod-based param / query validation)
+  // -------------------------------------------------------------------------
+
+  it("returns 400 with success:false for an invalid (non-Stellar) address", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/not-a-stellar-address")
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
+    expect(res.body.error).toMatch(/address/i);
+    // Must never expose internal stack traces
+    expect(res.body).not.toHaveProperty("stack");
+  });
+
+  it("returns 400 with success:false when page=0 (below minimum)", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}?page=0`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/page must be a positive integer/i);
+    expect(res.body).not.toHaveProperty("stack");
+  });
+
+  it("returns 400 with success:false when limit=0", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}?limit=0`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/limit must be between 1 and 100/i);
+    expect(res.body).not.toHaveProperty("stack");
+  });
+
+  it("returns 400 with success:false when limit=101 (above maximum)", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}?limit=101`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/limit must be between 1 and 100/i);
+    expect(res.body).not.toHaveProperty("stack");
+  });
+
+  it("returns 400 with success:false when page is not a number", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}?page=abc`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body).not.toHaveProperty("stack");
+  });
+
+  // -------------------------------------------------------------------------
+  // 500 error path – server errors produce a clean response without stack traces
+  // -------------------------------------------------------------------------
+
+  it("returns 500 with success:false when getJobsByWallet throws, without leaking stack traces", async () => {
+    // Build a fresh app that mounts a router with a mock DB that always throws
+    const { default: router } = await import("../src/routes/jobs.js");
+
+    // Temporarily break the DB to force getJobsByWallet to throw
+    testDb.exec("DROP TABLE events");
+
+    try {
+      const errorApp = express();
+      errorApp.use(express.json());
+      errorApp.use("/api/jobs", router);
+
+      const res = await request(errorApp)
+        .get(`/api/jobs/by-wallet/${VALID_G_ADDR}`)
+        .expect(500);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toBe("Internal server error");
+      // Stack traces and internal messages must never reach the client
+      expect(res.body).not.toHaveProperty("stack");
+      expect(JSON.stringify(res.body)).not.toMatch(/events/); // no SQL table name
+    } finally {
+      // Restore the events table for subsequent tests
+      testDb.exec(`
+        CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contract_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          ledger_sequence INTEGER NOT NULL,
+          timestamp INTEGER NOT NULL,
+          data_json TEXT NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(contract_id, ledger_sequence, event_type)
+        )
+      `);
+    }
   });
 });

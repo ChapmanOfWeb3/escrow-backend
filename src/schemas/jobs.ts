@@ -118,9 +118,45 @@ export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAddressSchema,
 });
 
+/**
+ * Pagination query params: ?page=1&limit=10
+ * Both values are optional (defaults handled by the route), but when provided
+ * they must be positive integers (page) or within 1–100 (limit).
+ */
+export const byWalletQuerySchema = z.object({
+  page: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? 1 : parseInt(v, 10)))
+    .pipe(
+      z
+        .number()
+        .int("page must be a positive integer")
+        .min(1, "page must be a positive integer"),
+    ),
+  limit: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? 10 : parseInt(v, 10)))
+    .pipe(
+      z
+        .number()
+        .int("limit must be between 1 and 100")
+        .min(1, "limit must be between 1 and 100")
+        .max(100, "limit must be between 1 and 100"),
+    ),
+});
+
+/** Route params: /by-wallet/:address */
+export const byWalletParamsSchema = z.object({
+  address: stellarAddressSchema,
+});
+
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;
 export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
 export type SubmitBody = z.infer<typeof submitBodySchema>;
 export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
 export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;
+export type ByWalletQuery = z.infer<typeof byWalletQuerySchema>;
+export type ByWalletParams = z.infer<typeof byWalletParamsSchema>;
