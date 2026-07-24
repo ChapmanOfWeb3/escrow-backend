@@ -118,9 +118,28 @@ export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAddressSchema,
 });
 
+/** POST /create-job-draft body */
+export const createJobDraftBodySchema = z.object({
+  clientAddress: stellarAddressSchema,
+  freelancerAddress: stellarAddressSchema,
+  arbiterAddress: stellarAddressSchema,
+  tokenAddress: z
+    .string({ required_error: "tokenAddress is required" })
+    .min(1, "tokenAddress cannot be empty"),
+  milestones: z
+    .array(
+      z.object({
+        amount: amountSchema,
+      }),
+      { required_error: "milestones is required" },
+    )
+    .min(1, "milestones must contain at least one entry"),
+});
+
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;
 export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
 export type SubmitBody = z.infer<typeof submitBodySchema>;
 export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
 export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;
+export type CreateJobDraftBody = z.infer<typeof createJobDraftBodySchema>;

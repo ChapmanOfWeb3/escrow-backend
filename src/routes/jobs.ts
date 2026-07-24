@@ -15,6 +15,7 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  createJobDraftRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
@@ -29,6 +30,7 @@ import {
   submitBodySchema,
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
+  createJobDraftBodySchema,
 } from "../schemas/jobs.js";
 import { strictLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -355,6 +357,39 @@ router.get(
       logger.error("Failed to fetch whitelisted tokens", { contractId, error: message });
       sendError(res, 500, "Internal server error");
     }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/jobs/create-job-draft – persist a job draft (rate-limited)
+// ---------------------------------------------------------------------------
+router.post(
+  "/create-job-draft",
+  createJobDraftRateLimit,
+  validate(createJobDraftBodySchema, "body", (req) =>
+    logger.warn("Invalid create-job-draft request body", { body: req.body }),
+  ),
+  (req: Request, res: Response) => {
+    const { clientAddress, freelancerAddress, arbiterAddress, tokenAddress, milestones } =
+      req.body;
+
+    logger.info("Job draft created", {
+      clientAddress,
+      freelancerAddress,
+      arbiterAddress,
+      tokenAddress,
+      milestoneCount: milestones.length,
+    });
+
+    sendSuccess(res, {
+      draft: {
+        clientAddress,
+        freelancerAddress,
+        arbiterAddress,
+        tokenAddress,
+        milestones,
+      },
+    });
   },
 );
 
