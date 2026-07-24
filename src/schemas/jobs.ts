@@ -118,9 +118,56 @@ export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAddressSchema,
 });
 
+/**
+ * POST /create-job-draft body.
+ *
+ * Fields:
+ *  - clientAddress   – Stellar account (G...) acting as client
+ *  - freelancerAddress – Stellar account (G...) acting as freelancer
+ *  - arbiterAddress  – Stellar account (G...) acting as arbiter
+ *  - tokenAddress    – Stellar contract (C...) of the payment token
+ *  - milestones      – non-empty array of milestone amounts (positive numeric)
+ *  - title           – optional human-readable job title (max 200 chars)
+ *  - description     – optional job description (max 2000 chars)
+ */
+export const createJobDraftBodySchema = z.object({
+  clientAddress: z
+    .string({ required_error: "clientAddress is required" })
+    .refine(isValidStellarAddress, {
+      message: "clientAddress must be a valid Stellar account address (G...)",
+    }),
+  freelancerAddress: z
+    .string({ required_error: "freelancerAddress is required" })
+    .refine(isValidStellarAddress, {
+      message: "freelancerAddress must be a valid Stellar account address (G...)",
+    }),
+  arbiterAddress: z
+    .string({ required_error: "arbiterAddress is required" })
+    .refine(isValidStellarAddress, {
+      message: "arbiterAddress must be a valid Stellar account address (G...)",
+    }),
+  tokenAddress: z
+    .string({ required_error: "tokenAddress is required" })
+    .refine(isValidStellarContractId, {
+      message: "tokenAddress must be a valid Stellar contract address (C...)",
+    }),
+  milestones: z
+    .array(amountSchema, { required_error: "milestones is required" })
+    .min(1, "milestones must contain at least one entry"),
+  title: z
+    .string()
+    .max(200, "title must be at most 200 characters")
+    .optional(),
+  description: z
+    .string()
+    .max(2000, "description must be at most 2000 characters")
+    .optional(),
+});
+
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;
 export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
 export type SubmitBody = z.infer<typeof submitBodySchema>;
 export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
 export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;
+export type CreateJobDraftBody = z.infer<typeof createJobDraftBodySchema>;

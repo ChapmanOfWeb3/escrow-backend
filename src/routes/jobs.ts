@@ -29,6 +29,7 @@ import {
   submitBodySchema,
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
+  createJobDraftBodySchema,
 } from "../schemas/jobs.js";
 import { strictLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -353,6 +354,66 @@ router.get(
         return;
       }
       logger.error("Failed to fetch whitelisted tokens", { contractId, error: message });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/jobs/create-job-draft – persist a job draft (off-chain)
+// ---------------------------------------------------------------------------
+router.post(
+  "/create-job-draft",
+  strictLimiter,
+  validate(createJobDraftBodySchema, "body", (req) =>
+    logger.warn("Invalid create-job-draft request body", { body: req.body }),
+  ),
+  (req: Request, res: Response) => {
+    try {
+      const requiredApiKey = process.env.API_KEY;
+      if (requiredApiKey) {
+        const providedKey = req.header("x-api-key");
+        if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized create-job-draft request");
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+      }
+
+      const {
+        clientAddress,
+        freelancerAddress,
+        arbiterAddress,
+        tokenAddress,
+        milestones,
+        title,
+        description,
+      } = req.body;
+
+      const draft = {
+        clientAddress,
+        freelancerAddress,
+        arbiterAddress,
+        tokenAddress,
+        milestones: (milestones as (string | number | bigint)[]).map((m) =>
+          String(m),
+        ),
+        ...(title !== undefined && { title }),
+        ...(description !== undefined && { description }),
+        createdAt: new Date().toISOString(),
+      };
+
+      logger.info("Job draft created", {
+        clientAddress,
+        freelancerAddress,
+        arbiterAddress,
+        tokenAddress,
+        milestoneCount: milestones.length,
+      });
+
+      res.status(201).json({ success: true, data: draft });
+    } catch (err: any) {
+      logger.error("Failed to create job draft", { error: err?.message });
       sendError(res, 500, "Internal server error");
     }
   },
