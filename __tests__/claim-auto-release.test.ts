@@ -15,7 +15,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
   },
 }));
 
-const { default: router } = await import("../src/routes/jobs.js");
+const { default: router, resetClaimAutoReleaseCache } = await import("../src/routes/jobs.js");
 
 function buildApp() {
   const app = express();
@@ -29,6 +29,7 @@ const VALID_BODY = { sourceAddress: VALID_ADDRESS };
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () => {
   beforeEach(() => {
+    resetClaimAutoReleaseCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
 
@@ -110,6 +111,34 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
     const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
 
     expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("serves subsequent requests from the in-memory cache without calling Stellar RPC again", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const app = buildApp();
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+    expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates concurrent requests with one Stellar RPC call", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const app = buildApp();
+    const requests = await Promise.all([
+      request(app).post(ENDPOINT).send(VALID_BODY),
+      request(app).post(ENDPOINT).send(VALID_BODY),
+    ]);
+
+    expect(requests[0].status).toBe(200);
+    expect(requests[1].status).toBe(200);
+    expect(requests[0].body).toEqual({ success: true, xdr: "AAAAAQ==" });
+    expect(requests[1].body).toEqual({ success: true, xdr: "AAAAAQ==" });
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+    expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
   });
 
   it("validates before the route handler reaches Stellar RPC", async () => {
