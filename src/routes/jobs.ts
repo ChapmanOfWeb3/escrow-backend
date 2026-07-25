@@ -133,13 +133,13 @@ router.get(
   validate(byWalletQuerySchema, "query", (req) =>
     logger.warn("Invalid by-wallet query", { query: req.query }),
   ),
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
       const address = req.params.address as string;
       const { page, limit } = (req as RequestWithValidatedQuery)
         .validatedQuery as ByWalletQuery;
 
-      const result = getJobsByWallet(address, page, limit);
+      const result = await getJobsByWallet(address, page, limit);
       res.json({ success: true, ...result });
     } catch (err: any) {
       res.status(500).json({ success: false, error: "Internal server error" });
