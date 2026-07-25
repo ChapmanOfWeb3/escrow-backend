@@ -95,3 +95,35 @@ describe("POST /api/jobs/build-tx — error sanitization (#70)", () => {
     expect(typeof res.body.error).toBe("string");
   });
 });
+
+describe("POST /api/jobs/build-tx — validation", () => {
+  it("returns 400 with field errors when payload is completely empty", async () => {
+    const res = await request(app).post("/api/jobs/build-tx").send({}).expect(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.fields).toBeDefined();
+    expect(res.body.fields.contractId).toMatch(/contractId is required/i);
+    expect(res.body.fields.method).toMatch(/method is required/i);
+    expect(res.body.fields.sourceAddress).toMatch(/address is required/i);
+  });
+
+  it("returns 400 with field errors for invalid formats", async () => {
+    const res = await request(app).post("/api/jobs/build-tx").send({
+      contractId: "invalid-contract-id",
+      method: "",
+      sourceAddress: "invalid-source-address",
+    }).expect(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.fields).toBeDefined();
+    expect(res.body.fields.contractId).toMatch(/valid Stellar contract address/i);
+    expect(res.body.fields.method).toMatch(/method cannot be empty/i);
+    expect(res.body.fields.sourceAddress).toMatch(/valid Stellar account address/i);
+  });
+
+  it("returns 400 if method is missing", async () => {
+    const { method, ...bodyWithoutMethod } = VALID_BODY;
+    const res = await request(app).post("/api/jobs/build-tx").send(bodyWithoutMethod).expect(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.fields).toBeDefined();
+    expect(res.body.fields.method).toMatch(/method is required/i);
+  });
+});

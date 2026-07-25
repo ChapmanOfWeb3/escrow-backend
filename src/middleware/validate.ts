@@ -31,3 +31,37 @@ export function validate(
     next();
   };
 }
+export function validateWithFields(
+  schema: ZodSchema,
+  target: Target = "params",
+  onReject?: (req: Request) => void,
+) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const result = schema.safeParse(req[target]);
+    if (!result.success) {
+      onReject?.(req);
+      const errors = (result.error as ZodError).errors;
+      const first = errors[0];
+      
+      const fields = errors.reduce((acc, err) => {
+        const path = err.path.join(".");
+        if (path) {
+          acc[path] = err.message;
+        } else {
+          acc["_root"] = err.message;
+        }
+        return acc;
+      }, {} as Record<string, string>);
+
+      res.status(400).json({ success: false, error: first.message, fields });
+      return;
+    }
+    
+    if (target === "query") {
+      (req as RequestWithValidatedQuery).validatedQuery = result.data;
+    } else {
+      req[target] = result.data;
+    }
+    next();
+  };
+}

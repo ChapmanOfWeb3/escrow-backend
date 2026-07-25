@@ -15,15 +15,18 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  buildTxRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
   jobContractSecurityHeaders,
   createJobDraftCors,
   createJobDraftSecurityHeaders,
+  byWalletCors,
+  byWalletSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
-import { validate } from "../middleware/validate.js";
+import { validate, validateWithFields } from "../middleware/validate.js";
 import type { RequestWithValidatedQuery } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
@@ -125,8 +128,12 @@ const parseJobFromResult = (result: any, contractId: string) => {
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
+router.options("/by-wallet/:address", byWalletCors);
+
 router.get(
   "/by-wallet/:address",
+  byWalletCors,
+  byWalletSecurityHeaders,
   validate(byWalletParamsSchema, "params", (req) =>
     logger.warn("Invalid by-wallet address", { address: req.params.address }),
   ),
@@ -407,8 +414,8 @@ router.get(
 // ---------------------------------------------------------------------------
 router.post(
   "/build-tx",
-  strictLimiter,
-  validate(buildTxBodySchema, "body", (req) =>
+  buildTxRateLimit,
+  validateWithFields(buildTxBodySchema, "body", (req) =>
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
@@ -604,10 +611,10 @@ router.post(
       const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
       const tx = TB.fromXDR(signedXdr as string, NETWORK_PASSPHRASE);
       const result = await server.sendTransaction(tx);
-      res.json({ success: true, data: result });
+      sendSuccess(res, result);
     } catch (err: any) {
       logger.error("Failed to submit transaction", { error: err?.message });
-      res.status(500).json({ success: false, error: "Internal server error" });
+      sendError(res, 500, "Internal server error");
     }
   },
 );
