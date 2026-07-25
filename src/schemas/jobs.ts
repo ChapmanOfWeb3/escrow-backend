@@ -88,6 +88,16 @@ export const submitBodySchema = z.object({
 });
 
 /**
+ * Named Stellar account field (G…) with field-specific error messages.
+ */
+const stellarAccountField = (field: string) =>
+  z
+    .string({ required_error: `${field} is required` })
+    .refine(isValidStellarAddress, {
+      message: `${field} must be a valid Stellar account address (G...)`,
+    });
+
+/**
  * POST /:contractId/milestones/:index/partial-release body.
  * Keeps its pre-existing field-specific error wording (rather than the
  * generic amountSchema/stellarAddressSchema messages) since __tests__/
@@ -115,18 +125,8 @@ export const partialReleaseBodySchema = z.object({
 
 /** POST /:contractId/milestones/:index/claim-auto-release body */
 export const claimAutoReleaseBodySchema = z.object({
-  sourceAddress: stellarAddressSchema,
+  sourceAddress: stellarAccountField("sourceAddress"),
 });
-
-/**
- * Named Stellar account field (G…) with field-specific error messages.
- */
-const stellarAccountField = (field: string) =>
-  z
-    .string({ required_error: `${field} is required` })
-    .refine(isValidStellarAddress, {
-      message: `${field} must be a valid Stellar account address (G...)`,
-    });
 
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
