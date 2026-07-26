@@ -277,11 +277,11 @@ describe("Indexer load test — query performance at scale", () => {
     );
   });
 
-  it("getJobsByWallet() completes within 200 ms for a known wallet", () => {
+  it("getJobsByWallet() completes within 200 ms for a known wallet", async () => {
     const wallet = makeAddress(0);
 
     const start  = performance.now();
-    const result = getJobsByWallet(wallet, 1, 50);
+    const result = await getJobsByWallet(wallet, 1, 50);
     const elapsed = performance.now() - start;
 
     expect(result.total).toBeGreaterThan(0);
@@ -293,18 +293,18 @@ describe("Indexer load test — query performance at scale", () => {
     );
   });
 
-  it("getJobsByWallet() pagination is correct at scale", () => {
+  it("getJobsByWallet() pagination is correct at scale", async () => {
     const wallet = makeAddress(0);
-    const full   = getJobsByWallet(wallet, 1, 1000); // fetch all
+    const full   = await getJobsByWallet(wallet, 1, 1000); // fetch all
     const total  = full.total;
 
     expect(total).toBeGreaterThan(0);
 
-    const page1 = getJobsByWallet(wallet, 1, 5);
+    const page1 = await getJobsByWallet(wallet, 1, 5);
     expect(page1.jobs).toHaveLength(Math.min(5, total));
     expect(page1.total).toBe(total);
 
-    const page2 = getJobsByWallet(wallet, 2, 5);
+    const page2 = await getJobsByWallet(wallet, 2, 5);
     expect(page2.total).toBe(total);
 
     // Pages must not overlap
@@ -318,8 +318,8 @@ describe("Indexer load test — query performance at scale", () => {
     expect(getEventsByAddress(makeAddress(999))).toHaveLength(0);
   });
 
-  it("getJobsByWallet() returns zero results for an address not in the batch", () => {
-    const result = getJobsByWallet(makeAddress(999));
+  it("getJobsByWallet() returns zero results for an address not in the batch", async () => {
+    const result = await getJobsByWallet(makeAddress(999));
     expect(result.total).toBe(0);
     expect(result.jobs).toHaveLength(0);
   });
