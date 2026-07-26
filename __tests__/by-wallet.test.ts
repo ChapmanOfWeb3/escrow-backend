@@ -6,6 +6,7 @@ import {
   insertEvent,
   setDb,
   getJobsByWallet,
+  resetJobsByWalletCache,
 } from "../src/indexer/db.js";
 
 // ---------------------------------------------------------------------------
@@ -54,7 +55,9 @@ afterAll(() => {
 
 beforeEach(() => {
   testDb.exec("DELETE FROM events");
+  resetJobsByWalletCache();
 });
+
 
 // ---------------------------------------------------------------------------
 // Unit tests: getJobsByWallet()
@@ -68,15 +71,15 @@ describe("getJobsByWallet() – unit", () => {
   const CONTRACT_B = "CONTRACT-B";
   const CONTRACT_C = "CONTRACT-C";
 
-  it("returns empty result when no events exist for address", () => {
-    const result = getJobsByWallet("GNOBODY");
+  it("returns empty result when no events exist for address", async () => {
+    const result = await getJobsByWallet("GNOBODY");
     expect(result.total).toBe(0);
     expect(result.jobs).toHaveLength(0);
     expect(result.page).toBe(1);
     expect(result.limit).toBe(10);
   });
 
-  it("returns a job where address is the CLIENT", () => {
+  it("returns a job where address is the CLIENT", async () => {
     seedEvent(testDb, {
       contractId: CONTRACT_A,
       eventType: "initialized",
@@ -85,13 +88,13 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ client: CLIENT, freelancer: FREELANCER, arbiter: ARBITER }),
     });
 
-    const result = getJobsByWallet(CLIENT);
+    const result = await getJobsByWallet(CLIENT);
     expect(result.total).toBe(1);
     expect(result.jobs[0].contract_id).toBe(CONTRACT_A);
     expect(result.jobs[0].role).toBe("client");
   });
 
-  it("returns a job where address is the FREELANCER", () => {
+  it("returns a job where address is the FREELANCER", async () => {
     seedEvent(testDb, {
       contractId: CONTRACT_B,
       eventType: "funded",
@@ -100,13 +103,13 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ client: CLIENT, freelancer: FREELANCER }),
     });
 
-    const result = getJobsByWallet(FREELANCER);
+    const result = await getJobsByWallet(FREELANCER);
     expect(result.total).toBe(1);
     expect(result.jobs[0].contract_id).toBe(CONTRACT_B);
     expect(result.jobs[0].role).toBe("freelancer");
   });
 
-  it("returns a job where address is the ARBITER", () => {
+  it("returns a job where address is the ARBITER", async () => {
     seedEvent(testDb, {
       contractId: CONTRACT_C,
       eventType: "dispute_raised",
@@ -115,13 +118,13 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ arbiter: ARBITER }),
     });
 
-    const result = getJobsByWallet(ARBITER);
+    const result = await getJobsByWallet(ARBITER);
     expect(result.total).toBe(1);
     expect(result.jobs[0].contract_id).toBe(CONTRACT_C);
     expect(result.jobs[0].role).toBe("arbiter");
   });
 
-  it("groups multiple events for the same contract_id into one job", () => {
+  it("groups multiple events for the same contract_id into one job", async () => {
     // Two events, same contract, same freelancer
     seedEvent(testDb, {
       contractId: CONTRACT_A,
@@ -138,13 +141,13 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ freelancer: FREELANCER }),
     });
 
-    const result = getJobsByWallet(FREELANCER);
+    const result = await getJobsByWallet(FREELANCER);
     expect(result.total).toBe(1);
     // Should capture the most-recent event type (highest ledger comes first)
     expect(result.jobs[0].latest_event_type).toBe("funded");
   });
 
-  it("returns distinct jobs across multiple contracts", () => {
+  it("returns distinct jobs across multiple contracts", async () => {
     const addr = "GMULTICONTRACT";
     seedEvent(testDb, {
       contractId: "C1",
@@ -168,11 +171,11 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ client: addr }),
     });
 
-    const result = getJobsByWallet(addr);
+    const result = await getJobsByWallet(addr);
     expect(result.total).toBe(3);
   });
 
-  it("does not match address that only appears in non-role fields", () => {
+  it("does not match address that only appears in non-role fields", async () => {
     const addr = "GNOTAROLE";
     seedEvent(testDb, {
       contractId: "C-FAKE",
@@ -182,7 +185,7 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ token: addr, some_other_field: addr }),
     });
 
-    const result = getJobsByWallet(addr);
+    const result = await getJobsByWallet(addr);
     expect(result.total).toBe(0);
   });
 
@@ -190,7 +193,7 @@ describe("getJobsByWallet() – unit", () => {
   // Pagination
   // -------------------------------------------------------------------------
 
-  it("pagination: page=1 limit=2 returns first 2 of 5 jobs", () => {
+  it("pagination: page=1 limit=2 returns first 2 of 5 jobs", async () => {
     const addr = "GPAGER";
     for (let i = 1; i <= 5; i++) {
       seedEvent(testDb, {
@@ -202,14 +205,14 @@ describe("getJobsByWallet() – unit", () => {
       });
     }
 
-    const p1 = getJobsByWallet(addr, 1, 2);
+    const p1 = await getJobsByWallet(addr, 1, 2);
     expect(p1.total).toBe(5);
     expect(p1.jobs).toHaveLength(2);
     expect(p1.page).toBe(1);
     expect(p1.limit).toBe(2);
   });
 
-  it("pagination: page=2 limit=2 returns jobs 3-4 of 5", () => {
+  it("pagination: page=2 limit=2 returns jobs 3-4 of 5", async () => {
     const addr = "GPAGER2";
     for (let i = 1; i <= 5; i++) {
       seedEvent(testDb, {
@@ -221,13 +224,13 @@ describe("getJobsByWallet() – unit", () => {
       });
     }
 
-    const p2 = getJobsByWallet(addr, 2, 2);
+    const p2 = await getJobsByWallet(addr, 2, 2);
     expect(p2.total).toBe(5);
     expect(p2.jobs).toHaveLength(2);
     expect(p2.page).toBe(2);
   });
 
-  it("pagination: last page returns remaining jobs (not a full page)", () => {
+  it("pagination: last page returns remaining jobs (not a full page)", async () => {
     const addr = "GPAGER3";
     for (let i = 1; i <= 5; i++) {
       seedEvent(testDb, {
@@ -239,12 +242,12 @@ describe("getJobsByWallet() – unit", () => {
       });
     }
 
-    const p3 = getJobsByWallet(addr, 3, 2);
+    const p3 = await getJobsByWallet(addr, 3, 2);
     expect(p3.total).toBe(5);
     expect(p3.jobs).toHaveLength(1); // page 3 of 2-per-page = only 1 left
   });
 
-  it("pagination: page beyond total returns empty jobs array", () => {
+  it("pagination: page beyond total returns empty jobs array", async () => {
     const addr = "GPAGER4";
     seedEvent(testDb, {
       contractId: "F1",
@@ -254,7 +257,7 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ client: addr }),
     });
 
-    const p = getJobsByWallet(addr, 99, 10);
+    const p = await getJobsByWallet(addr, 99, 10);
     expect(p.total).toBe(1);
     expect(p.jobs).toHaveLength(0);
   });
@@ -263,6 +266,10 @@ describe("getJobsByWallet() – unit", () => {
 // ---------------------------------------------------------------------------
 // HTTP integration tests: GET /api/jobs/by-wallet/:address
 // ---------------------------------------------------------------------------
+
+const VALID_WALLET = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
+const VALID_WALLET_2 = "GB5CRPXUGXZCG6BESL4CM4F3VUAGQGFNYNBHPBRJAGLXXSRYJSEGZHUV";
+const VALID_WALLET_3 = "GABNCQRZNTG6MMITD33VHFITKJZ5PSYW2XVEXMP52BSMTPLU7WORDQNT";
 
 describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   let app: express.Express;
@@ -276,7 +283,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("returns success:true with jobs array and pagination fields", async () => {
-    const addr = "GHTTPTEST1";
+    const addr = VALID_WALLET;
     seedEvent(testDb, {
       contractId: "HTTP-C1",
       eventType: "initialized",
@@ -298,7 +305,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
 
   it("returns empty jobs array for unknown address", async () => {
     const res = await request(app)
-      .get("/api/jobs/by-wallet/GNOBODYKNOWSME")
+      .get(`/api/jobs/by-wallet/${VALID_WALLET_2}`)
       .expect(200);
 
     expect(res.body.success).toBe(true);
@@ -307,7 +314,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("respects ?page=1&limit=2 query params", async () => {
-    const addr = "GHTTPPAGE";
+    const addr = VALID_WALLET_3;
     for (let i = 1; i <= 4; i++) {
       seedEvent(testDb, {
         contractId: `HP${i}`,
@@ -330,7 +337,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   });
 
   it("each job entry has the expected shape", async () => {
-    const addr = "GSHAPETEST";
+    const addr = VALID_WALLET;
     seedEvent(testDb, {
       contractId: "SHAPE-C",
       eventType: "funded",
@@ -352,5 +359,138 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       latest_ledger: expect.any(Number),
       latest_timestamp: expect.any(Number),
     });
+  });
+
+  it("serves concurrent requests from the in-memory wallet jobs cache", async () => {
+    const addr = VALID_WALLET;
+    seedEvent(testDb, {
+      contractId: "CACHED-REQ",
+      eventType: "initialized",
+      ledger: 42,
+      timestamp: 4200,
+      dataJson: JSON.stringify({ client: addr }),
+    });
+
+    const originalPrepare = testDb.prepare.bind(testDb);
+    let prepareCalls = 0;
+    testDb.prepare = function (sql: string) {
+      prepareCalls += 1;
+      return originalPrepare(sql);
+    } as typeof testDb.prepare;
+
+    const [first, second] = await Promise.all([
+      request(app).get(`/api/jobs/by-wallet/${addr}`).expect(200),
+      request(app).get(`/api/jobs/by-wallet/${addr}`).expect(200),
+    ]);
+
+    expect(first.body.success).toBe(true);
+    expect(second.body.success).toBe(true);
+    expect(first.body.jobs).toHaveLength(1);
+    expect(second.body.jobs).toHaveLength(1);
+    expect(prepareCalls).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zod middleware validation: GET /api/jobs/by-wallet/:address
+// ---------------------------------------------------------------------------
+
+describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
+  let app: express.Express;
+
+  beforeAll(async () => {
+    const { default: router } = await import("../src/routes/jobs.js");
+    app = express();
+    app.use(express.json());
+    app.use("/api/jobs", router);
+  });
+
+  it("returns 400 for an invalid wallet address format", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/not-a-stellar-address")
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toMatch(/valid Stellar account address/i);
+  });
+
+  it("returns 400 for a contract address (C…) used as wallet", async () => {
+    const res = await request(app)
+      .get(
+        "/api/jobs/by-wallet/CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH",
+      )
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/address/i);
+  });
+
+  it("returns 400 for an address that is too short", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/GSHORT")
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/address/i);
+  });
+
+  it("returns 400 when page is not a positive integer", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=0`)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "page must be a positive integer",
+    });
+  });
+
+  it("returns 400 when page is not numeric", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=abc`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/page/i);
+  });
+
+  it("returns 400 when limit is greater than 100", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=101`)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "limit must be between 1 and 100",
+    });
+  });
+
+  it("returns 400 when limit is less than 1", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=0`)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "limit must be between 1 and 100",
+    });
+  });
+
+  it("error body has exactly {success, error} keys", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/bad-address")
+      .expect(400);
+
+    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
+  });
+
+  it("does not return 400 for a valid address and query", async () => {
+    const res = await request(app).get(
+      `/api/jobs/by-wallet/${VALID_WALLET}?page=1&limit=10`,
+    );
+    expect(res.status).not.toBe(400);
   });
 });

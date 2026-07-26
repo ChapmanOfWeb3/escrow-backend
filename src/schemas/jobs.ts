@@ -88,6 +88,16 @@ export const submitBodySchema = z.object({
 });
 
 /**
+ * Named Stellar account field (G…) with field-specific error messages.
+ */
+const stellarAccountField = (field: string) =>
+  z
+    .string({ required_error: `${field} is required` })
+    .refine(isValidStellarAddress, {
+      message: `${field} must be a valid Stellar account address (G...)`,
+    });
+
+/**
  * POST /:contractId/milestones/:index/partial-release body.
  * Keeps its pre-existing field-specific error wording (rather than the
  * generic amountSchema/stellarAddressSchema messages) since __tests__/
@@ -115,7 +125,93 @@ export const partialReleaseBodySchema = z.object({
 
 /** POST /:contractId/milestones/:index/claim-auto-release body */
 export const claimAutoReleaseBodySchema = z.object({
-  sourceAddress: stellarAddressSchema,
+  sourceAddress: stellarAccountField("sourceAddress"),
+});
+
+/** Route params: /by-wallet/:address */
+export const byWalletParamsSchema = z.object({
+  address: stellarAddressSchema,
+});
+
+/** Query params: ?page=&limit= for GET /by-wallet/:address */
+export const byWalletQuerySchema = z.object({
+  page: z
+    .union([z.string(), z.number()])
+    .optional()
+    .default("1")
+    .refine(
+      (v) =>
+        typeof v === "number"
+          ? Number.isInteger(v) && v >= 1
+          : /^\d+$/.test(v) && parseInt(v, 10) >= 1,
+      { message: "page must be a positive integer" },
+    )
+    .transform((v) => (typeof v === "number" ? v : parseInt(v, 10))),
+  limit: z
+    .union([z.string(), z.number()])
+    .optional()
+    .default("10")
+    .refine(
+      (v) =>
+        typeof v === "number"
+          ? Number.isInteger(v) && v >= 1 && v <= 100
+          : /^\d+$/.test(v) &&
+            parseInt(v, 10) >= 1 &&
+            parseInt(v, 10) <= 100,
+      { message: "limit must be between 1 and 100" },
+    )
+    .transform((v) => (typeof v === "number" ? v : parseInt(v, 10))),
+});
+
+/**
+ * POST /create-job-draft body.
+ * Validates payload shape/types and Stellar address formats for all party/token fields.
+ */
+export const createJobDraftBodySchema = z.object({
+  client: stellarAccountField("client").optional(),
+  freelancer: stellarAccountField("freelancer"),
+  arbiter: stellarAccountField("arbiter"),
+  token: z
+    .string({ required_error: "token is required" })
+    .refine(isValidStellarContractId, {
+      message: "token must be a valid Stellar contract address (C...)",
+    }),
+  autoReleaseDays: z
+    .any({ required_error: "autoReleaseDays is required" })
+    .refine((v) => typeof v === "string" || typeof v === "number", {
+      message: "autoReleaseDays must be a number",
+    })
+    .refine(
+      (v) => {
+        const n = typeof v === "number" ? v : Number(v);
+        return Number.isInteger(n) && n >= 1 && n <= 365;
+      },
+      { message: "autoReleaseDays must be an integer between 1 and 365" },
+    )
+    .transform((v) => (typeof v === "number" ? v : parseInt(String(v), 10))),
+  milestones: z
+    .array(
+      z.object({
+        amount: z
+          .union([z.string(), z.number()], {
+            invalid_type_error: "amount must be a positive integer",
+          })
+          .refine(
+            (val) => {
+              try {
+                return BigInt(String(val)) > 0n;
+              } catch {
+                return false;
+              }
+            },
+            { message: "amount must be a positive integer" },
+          ),
+      }),
+      { required_error: "milestones is required", invalid_type_error: "milestones must be an array" },
+    )
+    .min(1, "milestones must contain at least one milestone"),
+  acceptedAssets: z.array(z.string()).optional().default([]),
+  requirements: z.array(z.string()).optional().default([]),
 });
 
 /**
@@ -170,4 +266,6 @@ export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
 export type SubmitBody = z.infer<typeof submitBodySchema>;
 export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
 export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;
+export type ByWalletParams = z.infer<typeof byWalletParamsSchema>;
+export type ByWalletQuery = z.infer<typeof byWalletQuerySchema>;
 export type CreateJobDraftBody = z.infer<typeof createJobDraftBodySchema>;
