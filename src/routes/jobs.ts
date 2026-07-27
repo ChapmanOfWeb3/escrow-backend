@@ -19,9 +19,14 @@ import {
 import {
   jobContractCors,
   jobContractSecurityHeaders,
+  createJobDraftCors,
+  createJobDraftSecurityHeaders,
+  submitCors,
+  submitSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate } from "../middleware/validate.js";
+import type { RequestWithValidatedQuery } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
   contractMilestoneParamsSchema,
@@ -29,9 +34,15 @@ import {
   submitBodySchema,
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
+  byWalletParamsSchema,
+  byWalletQuerySchema,
+  createJobDraftBodySchema,
+  type ByWalletQuery,
+  type CreateJobDraftBody,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
+import { randomUUID } from "crypto";
 
 const router = Router();
 const CONTRACT_ID = process.env.CONTRACT_ID || "";
@@ -47,6 +58,34 @@ const inFlightWhitelistRequests = new Map<string, Promise<string[]>>();
 export function resetWhitelistCache(): void {
   whitelistCache.flushAll();
   inFlightWhitelistRequests.clear();
+}
+
+const CLAIM_AUTO_RELEASE_TTL = parseInt(
+  process.env.CLAIM_AUTO_RELEASE_CACHE_TTL_S || "60",
+  10,
+);
+export const claimAutoReleaseCache = new NodeCache({
+  stdTTL: CLAIM_AUTO_RELEASE_TTL,
+  useClones: false,
+});
+const inFlightClaimAutoReleaseRequests = new Map<string, Promise<string>>();
+export function resetClaimAutoReleaseCache(): void {
+  claimAutoReleaseCache.flushAll();
+  inFlightClaimAutoReleaseRequests.clear();
+}
+
+const SUBMIT_CACHE_TTL = parseInt(
+  process.env.SUBMIT_CACHE_TTL_S || "30",
+  10,
+);
+export const submitCache = new NodeCache({
+  stdTTL: SUBMIT_CACHE_TTL,
+  useClones: false,
+});
+const inFlightSubmitRequests = new Map<string, Promise<unknown>>();
+export function resetSubmitCache(): void {
+  submitCache.flushAll();
+  inFlightSubmitRequests.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -116,49 +155,81 @@ const parseJobFromResult = (result: any, contractId: string) => {
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
-router.get("/by-wallet/:address", walletLookupLimiter, (req: Request, res: Response) => {
-  const address = req.params.address as string;
+router.get(
+  "/by-wallet/:address",
+  validate(byWalletParamsSchema, "params", (req) =>
+    logger.warn("Invalid by-wallet address", { address: req.params.address }),
+  ),
+  validate(byWalletQuerySchema, "query", (req) =>
+    logger.warn("Invalid by-wallet query", { query: req.query }),
+  ),
+  async (req: Request, res: Response) => {
+    const address = req.params.address as string;
 
-  try {
-    const page = parseInt((req.query.page as string) || "1", 10);
-    const limit = parseInt((req.query.limit as string) || "10", 10);
-
-    if (!address || address.trim() === "") {
-      const error = "address is required";
-      logger.warn("Jobs lookup rejected", { address, status: 400, error });
-      sendError(res, 400, error);
-      return;
-    }
-    if (isNaN(page) || page < 1) {
-      const error = "page must be a positive integer";
-      logger.warn("Jobs lookup rejected", { address, status: 400, error });
-      sendError(res, 400, error);
-      return;
-    }
-    if (isNaN(limit) || limit < 1 || limit > 100) {
-      const error = "limit must be between 1 and 100";
-      logger.warn("Jobs lookup rejected", { address, status: 400, error });
-      sendError(res, 400, error);
-      return;
+    // Optional API-key gate (same pattern as GET /:contractId)
+    const requiredApiKey = process.env.API_KEY;
+    if (requiredApiKey) {
+      const providedKey = req.header("x-api-key");
+      if (providedKey !== requiredApiKey) {
+        logger.warn("Unauthorized by-wallet request", { address });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
     }
 
-    const result = getJobsByWallet(address, page, limit);
-    logger.info("Jobs lookup completed", {
-      address,
-      status: 200,
-      summary: { total: result.total, count: result.jobs.length },
-    });
-    res.json({ success: true, ...result });
-  } catch (err: any) {
-    const error = err?.message ?? "Internal server error";
-    logger.error("Jobs lookup failed", {
-      address,
-      status: 500,
-      error,
-    });
-    sendError(res, 500, "Internal server error");
-  }
-});
+    try {
+      const { page, limit } = (req as RequestWithValidatedQuery)
+        .validatedQuery as ByWalletQuery;
+
+      logger.info("Fetching jobs by wallet", { address, page, limit });
+      const result = await getJobsByWallet(address, page, limit);
+      sendSuccess(res, result);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to fetch jobs by wallet", { address, error: message });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/jobs/create-job-draft
+// Validates and stores a job draft payload (off-chain) before on-chain create.
+// ---------------------------------------------------------------------------
+router.options("/create-job-draft", createJobDraftCors);
+
+router.post(
+  "/create-job-draft",
+  createJobDraftCors,
+  createJobDraftSecurityHeaders,
+  validate(createJobDraftBodySchema, "body", (req) =>
+    logger.warn("Invalid create-job-draft request body", { body: req.body }),
+  ),
+  (req: Request, res: Response) => {
+    try {
+      const body = req.body as CreateJobDraftBody;
+
+      const draft = {
+        id: randomUUID(),
+        status: "draft" as const,
+        client: body.client,
+        freelancer: body.freelancer,
+        arbiter: body.arbiter,
+        token: body.token,
+        autoReleaseDays: body.autoReleaseDays,
+        milestones: body.milestones,
+        acceptedAssets: body.acceptedAssets,
+        requirements: body.requirements,
+        createdAt: new Date().toISOString(),
+      };
+
+      sendSuccess(res, draft);
+    } catch (err: any) {
+      logger.error("Failed to create job draft", { error: err?.message });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
 
 // GET /api/jobs/:contractId/history - event timeline for a single job
 router.get("/:contractId/history", (req: Request, res: Response) => {
@@ -537,25 +608,63 @@ router.post(
       const contractId = req.params.contractId as string;
       const { index } = req.params;
       const { sourceAddress } = req.body;
-      const contract = new Contract(contractId);
-      const account = await server.getAccount(sourceAddress as string);
+      const cacheKey = `${contractId}:${index}:${sourceAddress}`;
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(
-          contract.call(
-            "claim_auto_release",
-            Address.fromString(sourceAddress).toScVal(),
-            nativeToScVal(Number(index), { type: "u32" }),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+      const cached = claimAutoReleaseCache.get<string>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Claim auto-release XDR served from cache", { contractId, index, sourceAddress });
+        res.json({ success: true, xdr: cached });
+        return;
+      }
 
-      const prepared = await server.prepareTransaction(tx);
-      res.json({ success: true, xdr: prepared.toXDR() });
+      const inFlight = inFlightClaimAutoReleaseRequests.get(cacheKey);
+      if (inFlight) {
+        const xdr = await inFlight;
+        logger.info("Claim auto-release XDR served from in-flight cache", {
+          contractId,
+          index,
+          sourceAddress,
+        });
+        res.json({ success: true, xdr });
+        return;
+      }
+
+      const requestPromise = (async (): Promise<string> => {
+        const contract = new Contract(contractId);
+        const account = await server.getAccount(sourceAddress as string);
+
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            contract.call(
+              "claim_auto_release",
+              Address.fromString(sourceAddress).toScVal(),
+              nativeToScVal(Number(index), { type: "u32" }),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        const prepared = await server.prepareTransaction(tx);
+        const xdr = prepared.toXDR();
+        claimAutoReleaseCache.set(cacheKey, xdr);
+        return xdr;
+      })();
+
+      inFlightClaimAutoReleaseRequests.set(cacheKey, requestPromise);
+      let xdr: string;
+      try {
+        xdr = await requestPromise;
+      } catch (err: any) {
+        claimAutoReleaseCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightClaimAutoReleaseRequests.delete(cacheKey);
+      }
+
+      res.json({ success: true, xdr });
     } catch (err: any) {
       logger.error("Failed to build claim-auto-release tx", { error: err?.message });
       res.status(500).json({ success: false, error: "Internal server error" });
@@ -565,22 +674,79 @@ router.post(
 
 // ---------------------------------------------------------------------------
 // POST /api/jobs/submit – submit a signed transaction
+// Caches results by signedXdr to deduplicate concurrent identical submissions.
 // ---------------------------------------------------------------------------
+router.options("/submit", submitCors);
+
 router.post(
   "/submit",
+  submitCors,
+  submitSecurityHeaders,
   strictLimiter,
   validate(submitBodySchema, "body", (req) =>
-    logger.warn("Invalid submit request body", { body: req.body }),
+    logger.warn("Invalid submit request body", {
+      body: req.body,
+      xdrLength: typeof req.body?.signedXdr === "string" ? req.body.signedXdr.length : undefined,
+    }),
   ),
   async (req: Request, res: Response) => {
+    const { signedXdr } = req.body as { signedXdr: string };
+    const cacheKey = signedXdr;
+    const traceId = randomUUID();
+
+    logger.info("Submit transaction request received", {
+      traceId,
+      xdrLength: signedXdr.length,
+    });
+
     try {
-      const { signedXdr } = req.body;
-      const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
-      const tx = TB.fromXDR(signedXdr as string, NETWORK_PASSPHRASE);
-      const result = await server.sendTransaction(tx);
+      const cached = submitCache.get<unknown>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Submit result served from cache", { traceId, source: "cache" });
+        res.json({ success: true, data: cached });
+        return;
+      }
+
+      const inFlight = inFlightSubmitRequests.get(cacheKey);
+      if (inFlight) {
+        logger.info("Submit result served from in-flight cache", { traceId, source: "in-flight" });
+        const result = await inFlight;
+        res.json({ success: true, data: result });
+        return;
+      }
+
+      logger.info("Submitting transaction to network", { traceId });
+
+      const requestPromise = (async (): Promise<unknown> => {
+        const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
+        const tx = TB.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+        const result = await server.sendTransaction(tx);
+        submitCache.set(cacheKey, result);
+        return result;
+      })();
+
+      inFlightSubmitRequests.set(cacheKey, requestPromise);
+      let result: unknown;
+      try {
+        result = await requestPromise;
+      } catch (err: unknown) {
+        submitCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightSubmitRequests.delete(cacheKey);
+      }
+
+      const txResult = result as Record<string, unknown>;
+      logger.info("Transaction submitted successfully", {
+        traceId,
+        status: txResult?.status,
+        hash: txResult?.hash,
+      });
+
       res.json({ success: true, data: result });
-    } catch (err: any) {
-      logger.error("Failed to submit transaction", { error: err?.message });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to submit transaction", { traceId, error: message });
       res.status(500).json({ success: false, error: "Internal server error" });
     }
   },

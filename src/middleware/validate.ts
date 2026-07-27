@@ -4,19 +4,9 @@ import { sendError } from "../utils/api-response.js";
 
 type Target = "params" | "body" | "query";
 
-function formatValidationError(error: ZodError): string {
-  const issues = error.errors;
-  if (issues.length === 1) {
-    return issues[0].message;
-  }
-
-  return issues
-    .map((issue) => {
-      const path = issue.path.length > 0 ? issue.path.join(".") : "value";
-      return `${path}: ${issue.message}`;
-    })
-    .join("; ");
-}
+export type RequestWithValidatedQuery = Request & {
+  validatedQuery?: unknown;
+};
 
 export function validate(
   schema: ZodSchema,
@@ -30,7 +20,13 @@ export function validate(
       sendError(res, 400, formatValidationError(result.error as ZodError));
       return;
     }
-    req[target] = result.data;
+    // Express 5 exposes req.query as a getter-only property, so validated
+    // query data is attached on a custom field instead of reassignment.
+    if (target === "query") {
+      (req as RequestWithValidatedQuery).validatedQuery = result.data;
+    } else {
+      req[target] = result.data;
+    }
     next();
   };
 }

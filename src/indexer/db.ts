@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import NodeCache from "node-cache";
 import logger from "../utils/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -28,6 +29,21 @@ export function setDb(newDb: Database.Database) {
 export const db = getDb();
 
 db.pragma("journal_mode = WAL");
+
+const JOBS_BY_WALLET_CACHE_TTL_S = parseInt(
+  process.env.JOBS_BY_WALLET_CACHE_TTL_S || "60",
+  10,
+);
+const jobsByWalletCache = new NodeCache({
+  stdTTL: JOBS_BY_WALLET_CACHE_TTL_S,
+  useClones: false,
+});
+const inFlightJobsByWalletRequests = new Map<string, Promise<PaginatedJobs>>();
+
+export function resetJobsByWalletCache(): void {
+  jobsByWalletCache.flushAll();
+  inFlightJobsByWalletRequests.clear();
+}
 
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
@@ -368,98 +384,119 @@ export interface PaginatedJobs {
  *   3. Determines role with a CASE expression in SQL.
  *   4. Applies LIMIT / OFFSET inside the engine, so memory footprint is O(page).
  */
-export function getJobsByWallet(
+export async function getJobsByWallet(
   address: string,
   page: number = 1,
-  limit: number = 10
-): PaginatedJobs {
-  const db = getDb();
-
+  limit: number = 10,
+): Promise<PaginatedJobs> {
   const safePage = Math.max(1, page);
   const safeLimit = Math.max(1, limit);
-  const offset = (safePage - 1) * safeLimit;
+  const cacheKey = `${address.trim().toLowerCase()}::${safePage}::${safeLimit}`;
 
-  // Count distinct contract_ids that match the address in a role field
-  const countRow = db
-    .prepare(
-      `SELECT COUNT(*) AS cnt
-       FROM (
-         SELECT contract_id
-         FROM events
-         WHERE json_extract(data_json, '$.client')     = ?
-            OR json_extract(data_json, '$.freelancer') = ?
-            OR json_extract(data_json, '$.arbiter')    = ?
-         GROUP BY contract_id
-       )`
-    )
-    .get(address, address, address) as { cnt: number };
+  const cachedResult = jobsByWalletCache.get<PaginatedJobs>(cacheKey);
+  if (cachedResult !== undefined) {
+    return cachedResult;
+  }
 
-  const total = countRow?.cnt ?? 0;
+  const inFlightResult = inFlightJobsByWalletRequests.get(cacheKey);
+  if (inFlightResult) {
+    return await inFlightResult;
+  }
 
-  // Fetch one row per contract_id – the most-recent event – with role & extras
-  const rows = db
-    .prepare(
-      `SELECT
-         e.contract_id,
-         e.event_type                                     AS latest_event_type,
-         e.ledger_sequence                                AS latest_ledger,
-         e.timestamp                                      AS latest_timestamp,
-         CASE
-           WHEN json_extract(e.data_json, '$.client')     = ? THEN 'client'
-           WHEN json_extract(e.data_json, '$.freelancer') = ? THEN 'freelancer'
-           WHEN json_extract(e.data_json, '$.arbiter')    = ? THEN 'arbiter'
-           ELSE 'unknown'
-         END                                              AS role,
-         e.data_json
-       FROM events e
-       INNER JOIN (
-         SELECT contract_id, MAX(ledger_sequence) AS max_ledger
-         FROM events
-         WHERE json_extract(data_json, '$.client')     = ?
-            OR json_extract(data_json, '$.freelancer') = ?
-            OR json_extract(data_json, '$.arbiter')    = ?
-         GROUP BY contract_id
-       ) latest
-         ON e.contract_id    = latest.contract_id
-        AND e.ledger_sequence = latest.max_ledger
-       ORDER BY e.ledger_sequence DESC
-       LIMIT ? OFFSET ?`
-    )
-    .all(
-      address, address, address,  // CASE args
-      address, address, address,  // inner subquery args
-      safeLimit, offset
-    ) as Array<{
-      contract_id: string;
-      latest_event_type: string;
-      latest_ledger: number;
-      latest_timestamp: number;
-      role: "client" | "freelancer" | "arbiter" | "unknown";
-      data_json: string;
-    }>;
+  const pendingResult = (async () => {
+    const db = getDb();
+    const offset = (safePage - 1) * safeLimit;
 
-  const jobs: JobSummary[] = rows.map((row) => {
-    let milestoneCount = 0;
-    try {
-      const parsed = JSON.parse(row.data_json) as Record<string, unknown>;
-      milestoneCount = Array.isArray(parsed["milestones"])
-        ? (parsed["milestones"] as unknown[]).length
-        : 0;
-    } catch {
-      // unparseable – leave milestone_count as 0
-    }
+    const countRow = db
+      .prepare(
+        `SELECT COUNT(*) AS cnt
+         FROM (
+           SELECT contract_id
+           FROM events
+           WHERE json_extract(data_json, '$.client')     = ?
+              OR json_extract(data_json, '$.freelancer') = ?
+              OR json_extract(data_json, '$.arbiter')    = ?
+           GROUP BY contract_id
+         )`
+      )
+      .get(address, address, address) as { cnt: number };
 
-    return {
-      contract_id: row.contract_id,
-      role: row.role,
-      milestone_count: milestoneCount,
-      latest_event_type: row.latest_event_type,
-      latest_ledger: row.latest_ledger,
-      latest_timestamp: row.latest_timestamp,
-    };
-  });
+    const total = countRow?.cnt ?? 0;
 
-  return { jobs, total, page: safePage, limit: safeLimit };
+    const rows = db
+      .prepare(
+        `SELECT
+           e.contract_id,
+           e.event_type                                     AS latest_event_type,
+           e.ledger_sequence                                AS latest_ledger,
+           e.timestamp                                      AS latest_timestamp,
+           CASE
+             WHEN json_extract(e.data_json, '$.client')     = ? THEN 'client'
+             WHEN json_extract(e.data_json, '$.freelancer') = ? THEN 'freelancer'
+             WHEN json_extract(e.data_json, '$.arbiter')    = ? THEN 'arbiter'
+             ELSE 'unknown'
+           END                                              AS role,
+           e.data_json
+         FROM events e
+         INNER JOIN (
+           SELECT contract_id, MAX(ledger_sequence) AS max_ledger
+           FROM events
+           WHERE json_extract(data_json, '$.client')     = ?
+              OR json_extract(data_json, '$.freelancer') = ?
+              OR json_extract(data_json, '$.arbiter')    = ?
+           GROUP BY contract_id
+         ) latest
+           ON e.contract_id    = latest.contract_id
+          AND e.ledger_sequence = latest.max_ledger
+         ORDER BY e.ledger_sequence DESC
+         LIMIT ? OFFSET ?`
+      )
+      .all(
+        address, address, address,
+        address, address, address,
+        safeLimit, offset
+      ) as Array<{
+        contract_id: string;
+        latest_event_type: string;
+        latest_ledger: number;
+        latest_timestamp: number;
+        role: "client" | "freelancer" | "arbiter" | "unknown";
+        data_json: string;
+      }>;
+
+    const jobs: JobSummary[] = rows.map((row) => {
+      let milestoneCount = 0;
+      try {
+        const parsed = JSON.parse(row.data_json) as Record<string, unknown>;
+        milestoneCount = Array.isArray(parsed["milestones"])
+          ? (parsed["milestones"] as unknown[]).length
+          : 0;
+      } catch {
+        // unparseable – leave milestone_count as 0
+      }
+
+      return {
+        contract_id: row.contract_id,
+        role: row.role,
+        milestone_count: milestoneCount,
+        latest_event_type: row.latest_event_type,
+        latest_ledger: row.latest_ledger,
+        latest_timestamp: row.latest_timestamp,
+      };
+    });
+
+    const result = { jobs, total, page: safePage, limit: safeLimit };
+    jobsByWalletCache.set(cacheKey, result);
+    return result;
+  })();
+
+  inFlightJobsByWalletRequests.set(cacheKey, pendingResult);
+
+  try {
+    return await pendingResult;
+  } finally {
+    inFlightJobsByWalletRequests.delete(cacheKey);
+  }
 }
 
 export interface EventDbRow {
