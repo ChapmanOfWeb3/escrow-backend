@@ -15,6 +15,7 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  timeRemainingRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
@@ -23,6 +24,8 @@ import {
   createJobDraftSecurityHeaders,
   submitCors,
   submitSecurityHeaders,
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate } from "../middleware/validate.js";
@@ -552,6 +555,9 @@ router.post(
 // ---------------------------------------------------------------------------
 router.get(
   "/:contractId/milestones/:index/time-remaining",
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
+  timeRemainingRateLimit,
   validate(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for time-remaining", { params: req.params }),
   ),
@@ -559,6 +565,14 @@ router.get(
     try {
       const contractId = req.params.contractId as string;
       const { index } = req.params;
+
+      logger.debug("GET time-remaining request", {
+        contractId,
+        index,
+        ip: req.ip ?? req.socket?.remoteAddress,
+        requestId: (req as any).requestId,
+      });
+
       const contract = new Contract(contractId);
       const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
       const tx = new TransactionBuilder(account, {
@@ -577,16 +591,40 @@ router.get(
       const result = await server.simulateTransaction(tx);
       if ("error" in result) {
         const { status, message } = classifySimError(String(result.error));
-        logger.warn("Simulation error for time-remaining", { contractId, index, status });
+        logger.warn("Simulation error for time-remaining", {
+          contractId,
+          index,
+          status,
+          error: String(result.error),
+          requestId: (req as any).requestId,
+        });
         sendError(res, status, message);
       } else if ("result" in result && result.result?.retval) {
         const secondsRemaining = Number(result.result.retval);
+        logger.info("Time-remaining retrieved successfully", {
+          contractId,
+          index,
+          secondsRemaining,
+          requestId: (req as any).requestId,
+        });
         res.json({ success: true, secondsRemaining });
       } else {
+        logger.warn("Unexpected simulation result for time-remaining", {
+          contractId,
+          index,
+          result: JSON.stringify(result),
+          requestId: (req as any).requestId,
+        });
         sendError(res, 500, "Internal server error");
       }
     } catch (err: any) {
-      logger.error("Failed to get time remaining", { error: err?.message });
+      logger.error("Failed to get time remaining", {
+        error: err?.message,
+        contractId: req.params.contractId,
+        index: req.params.index,
+        stack: err?.stack,
+        requestId: (req as any).requestId,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
