@@ -83,8 +83,18 @@ export const buildTxBodySchema = z.object({
 /** POST /submit body */
 export const submitBodySchema = z.object({
   signedXdr: z
-    .string({ required_error: "signedXdr is required" })
-    .min(1, "signedXdr cannot be empty"),
+    .string({ required_error: "signedXdr is required", invalid_type_error: "signedXdr must be a string" })
+    .min(1, "signedXdr cannot be empty")
+    .refine((v) => !/\s/.test(v), {
+      message: "signedXdr must not contain whitespace",
+    })
+    .refine(
+      (v) => {
+        // Valid base64: only A-Z a-z 0-9 + / = characters, length divisible by 4
+        return /^[A-Za-z0-9+/]*={0,2}$/.test(v) && v.length % 4 === 0;
+      },
+      { message: "signedXdr must be a valid base64-encoded XDR string" },
+    ),
 });
 
 /**
