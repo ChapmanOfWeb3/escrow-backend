@@ -30,7 +30,7 @@ import {
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
 } from "../schemas/jobs.js";
-import { strictLimiter } from "../middleware/rateLimiter.js";
+import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
 
 const router = Router();
@@ -116,29 +116,47 @@ const parseJobFromResult = (result: any, contractId: string) => {
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
-router.get("/by-wallet/:address", (req: Request, res: Response) => {
+router.get("/by-wallet/:address", walletLookupLimiter, (req: Request, res: Response) => {
+  const address = req.params.address as string;
+
   try {
-    const address = req.params.address as string;
     const page = parseInt((req.query.page as string) || "1", 10);
     const limit = parseInt((req.query.limit as string) || "10", 10);
 
     if (!address || address.trim() === "") {
-      res.status(400).json({ success: false, error: "address is required" });
+      const error = "address is required";
+      logger.warn("Jobs lookup rejected", { address, status: 400, error });
+      sendError(res, 400, error);
       return;
     }
     if (isNaN(page) || page < 1) {
-      res.status(400).json({ success: false, error: "page must be a positive integer" });
+      const error = "page must be a positive integer";
+      logger.warn("Jobs lookup rejected", { address, status: 400, error });
+      sendError(res, 400, error);
       return;
     }
     if (isNaN(limit) || limit < 1 || limit > 100) {
-      res.status(400).json({ success: false, error: "limit must be between 1 and 100" });
+      const error = "limit must be between 1 and 100";
+      logger.warn("Jobs lookup rejected", { address, status: 400, error });
+      sendError(res, 400, error);
       return;
     }
 
     const result = getJobsByWallet(address, page, limit);
+    logger.info("Jobs lookup completed", {
+      address,
+      status: 200,
+      summary: { total: result.total, count: result.jobs.length },
+    });
     res.json({ success: true, ...result });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: "Internal server error" });
+    const error = err?.message ?? "Internal server error";
+    logger.error("Jobs lookup failed", {
+      address,
+      status: 500,
+      error,
+    });
+    sendError(res, 500, "Internal server error");
   }
 });
 

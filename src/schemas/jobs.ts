@@ -72,12 +72,35 @@ export const contractMilestoneParamsSchema = z.object({
   index: milestoneIndexSchema,
 });
 
+const buildTxArgSchema = z
+  .object({
+    type: z.string({ required_error: "arg type is required" }).min(1, "arg type cannot be empty"),
+    value: z.any(),
+  })
+  .passthrough()
+  .superRefine((arg, ctx) => {
+    if (arg.type === "address") {
+      const value = arg.value;
+      if (typeof value !== "string" || !isValidStellarAddress(value)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "address arguments must be valid Stellar account addresses (G...)",
+          path: ["value"],
+        });
+      }
+    }
+  });
+
 /** POST /build-tx body */
 export const buildTxBodySchema = z.object({
   contractId: contractIdSchema,
   method: z.string({ required_error: "method is required" }).min(1, "method cannot be empty"),
-  args: z.array(z.any()).optional().default([]),
-  sourceAddress: stellarAddressSchema,
+  args: z.array(buildTxArgSchema).optional().default([]),
+  sourceAddress: z
+    .string({ required_error: "sourceAddress is required" })
+    .refine((value) => StrKey.isValidEd25519PublicKey(value), {
+      message: "sourceAddress must be a valid Stellar account address (G…, 56 chars)",
+    }),
 });
 
 /** POST /submit body */

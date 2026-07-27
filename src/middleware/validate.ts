@@ -4,6 +4,20 @@ import { sendError } from "../utils/api-response.js";
 
 type Target = "params" | "body" | "query";
 
+function formatValidationError(error: ZodError): string {
+  const issues = error.errors;
+  if (issues.length === 1) {
+    return issues[0].message;
+  }
+
+  return issues
+    .map((issue) => {
+      const path = issue.path.length > 0 ? issue.path.join(".") : "value";
+      return `${path}: ${issue.message}`;
+    })
+    .join("; ");
+}
+
 export function validate(
   schema: ZodSchema,
   target: Target = "params",
@@ -13,8 +27,7 @@ export function validate(
     const result = schema.safeParse(req[target]);
     if (!result.success) {
       onReject?.(req);
-      const first = (result.error as ZodError).errors[0];
-      sendError(res, 400, first.message);
+      sendError(res, 400, formatValidationError(result.error as ZodError));
       return;
     }
     req[target] = result.data;
