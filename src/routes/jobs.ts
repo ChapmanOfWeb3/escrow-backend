@@ -61,6 +61,20 @@ export function resetWhitelistCache(): void {
   inFlightWhitelistRequests.clear();
 }
 
+const CLAIM_AUTO_RELEASE_TTL = parseInt(
+  process.env.CLAIM_AUTO_RELEASE_CACHE_TTL_S || "60",
+  10,
+);
+export const claimAutoReleaseCache = new NodeCache({
+  stdTTL: CLAIM_AUTO_RELEASE_TTL,
+  useClones: false,
+});
+const inFlightClaimAutoReleaseRequests = new Map<string, Promise<string>>();
+export function resetClaimAutoReleaseCache(): void {
+  claimAutoReleaseCache.flushAll();
+  inFlightClaimAutoReleaseRequests.clear();
+}
+
 // ---------------------------------------------------------------------------
 // Simulation error helpers  (#83)
 // ---------------------------------------------------------------------------
@@ -140,13 +154,13 @@ router.get(
   validate(byWalletQuerySchema, "query", (req) =>
     logger.warn("Invalid by-wallet query", { query: req.query }),
   ),
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
       const address = req.params.address as string;
       const { page, limit } = (req as RequestWithValidatedQuery)
         .validatedQuery as ByWalletQuery;
 
-      const result = getJobsByWallet(address, page, limit);
+      const result = await getJobsByWallet(address, page, limit);
       res.json({ success: true, ...result });
     } catch (err: any) {
       res.status(500).json({ success: false, error: "Internal server error" });
@@ -570,25 +584,63 @@ router.post(
       const contractId = req.params.contractId as string;
       const { index } = req.params;
       const { sourceAddress } = req.body;
-      const contract = new Contract(contractId);
-      const account = await server.getAccount(sourceAddress as string);
+      const cacheKey = `${contractId}:${index}:${sourceAddress}`;
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(
-          contract.call(
-            "claim_auto_release",
-            Address.fromString(sourceAddress).toScVal(),
-            nativeToScVal(Number(index), { type: "u32" }),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+      const cached = claimAutoReleaseCache.get<string>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Claim auto-release XDR served from cache", { contractId, index, sourceAddress });
+        res.json({ success: true, xdr: cached });
+        return;
+      }
 
-      const prepared = await server.prepareTransaction(tx);
-      res.json({ success: true, xdr: prepared.toXDR() });
+      const inFlight = inFlightClaimAutoReleaseRequests.get(cacheKey);
+      if (inFlight) {
+        const xdr = await inFlight;
+        logger.info("Claim auto-release XDR served from in-flight cache", {
+          contractId,
+          index,
+          sourceAddress,
+        });
+        res.json({ success: true, xdr });
+        return;
+      }
+
+      const requestPromise = (async (): Promise<string> => {
+        const contract = new Contract(contractId);
+        const account = await server.getAccount(sourceAddress as string);
+
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            contract.call(
+              "claim_auto_release",
+              Address.fromString(sourceAddress).toScVal(),
+              nativeToScVal(Number(index), { type: "u32" }),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        const prepared = await server.prepareTransaction(tx);
+        const xdr = prepared.toXDR();
+        claimAutoReleaseCache.set(cacheKey, xdr);
+        return xdr;
+      })();
+
+      inFlightClaimAutoReleaseRequests.set(cacheKey, requestPromise);
+      let xdr: string;
+      try {
+        xdr = await requestPromise;
+      } catch (err: any) {
+        claimAutoReleaseCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightClaimAutoReleaseRequests.delete(cacheKey);
+      }
+
+      res.json({ success: true, xdr });
     } catch (err: any) {
       logger.error("Failed to build claim-auto-release tx", { error: err?.message });
       res.status(500).json({ success: false, error: "Internal server error" });
