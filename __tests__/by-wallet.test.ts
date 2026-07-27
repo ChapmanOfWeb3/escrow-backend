@@ -493,4 +493,14 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
     );
     expect(res.status).not.toBe(400);
   });
+
+  it("returns 400 for address with valid length but bad checksum", async () => {
+    const badChecksum = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRY";
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${badChecksum}`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/address/i);
+  });
 });
