@@ -256,3 +256,96 @@ describe("POST /api/jobs/submit – rate limiting", () => {
     expect(res.body.success).toBe(true);
   });
 });
+
+describe("POST /api/jobs/submit – CORS and security headers", () => {
+  const ORIGINAL_ALLOWED = process.env.ALLOWED_ORIGINS;
+
+  beforeEach(() => {
+    process.env.ALLOWED_ORIGINS = "https://trusted.example.com";
+    mockSendTransaction.mockReset();
+    mockSendTransaction.mockResolvedValue({ id: "test-id" });
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_ALLOWED === undefined) {
+      delete process.env.ALLOWED_ORIGINS;
+    } else {
+      process.env.ALLOWED_ORIGINS = ORIGINAL_ALLOWED;
+    }
+  });
+
+  it("rejects requests from unauthorized origins with 403", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .set("Origin", "https://evil.example.com")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(403);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Origin not allowed by CORS policy",
+    });
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("allows trusted origins and sets CORS response headers", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .set("Origin", "https://trusted.example.com")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(res.headers["access-control-allow-origin"]).toBe(
+      "https://trusted.example.com"
+    );
+    expect(res.headers.vary).toContain("Origin");
+    expect(res.body.success).toBe(true);
+  });
+
+  it("applies security headers on POST /api/jobs/submit", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["x-frame-options"]).toBe("DENY");
+    expect(res.headers["referrer-policy"]).toBe("no-referrer");
+    expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
+  });
+
+  it("responds 204 on OPTIONS preflight from trusted origin", async () => {
+    const res = await request(buildApp())
+      .options("/api/jobs/submit")
+      .set("Origin", "https://trusted.example.com")
+      .set("Access-Control-Request-Method", "POST")
+      .expect(204);
+
+    expect(res.headers["access-control-allow-origin"]).toBe(
+      "https://trusted.example.com"
+    );
+    expect(res.headers["access-control-allow-methods"]).toContain("POST");
+  });
+
+  it("responds 403 on OPTIONS preflight from unauthorized origin", async () => {
+    const res = await request(buildApp())
+      .options("/api/jobs/submit")
+      .set("Origin", "https://evil.example.com")
+      .set("Access-Control-Request-Method", "POST")
+      .expect(403);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Origin not allowed by CORS policy",
+    });
+  });
+
+  it("allows request without origin header", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+});
