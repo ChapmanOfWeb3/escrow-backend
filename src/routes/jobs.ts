@@ -22,8 +22,8 @@ import {
   jobContractSecurityHeaders,
   createJobDraftCors,
   createJobDraftSecurityHeaders,
-  byWalletCors,
-  byWalletSecurityHeaders,
+  submitCors,
+  submitSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
@@ -681,8 +681,12 @@ router.post(
 // POST /api/jobs/submit – submit a signed transaction
 // Caches results by signedXdr to deduplicate concurrent identical submissions.
 // ---------------------------------------------------------------------------
+router.options("/submit", submitCors);
+
 router.post(
   "/submit",
+  submitCors,
+  submitSecurityHeaders,
   strictLimiter,
   validate(submitBodySchema, "body", (req) =>
     logger.warn("Invalid submit request body", {
