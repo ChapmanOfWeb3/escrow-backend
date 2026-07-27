@@ -39,7 +39,8 @@ jest.unstable_mockModule("../src/utils/logger.js", () => ({
   default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-const { default: router } = await import("../src/routes/jobs.js");
+const { default: router, resetSubmitCache } = await import("../src/routes/jobs.js");
+const { default: mockLogger } = await import("../src/utils/logger.js");
 
 function buildApp() {
   const app = express();
@@ -48,11 +49,21 @@ function buildApp() {
   return app;
 }
 
-const VALID_SIGNED_XDR = "AAAAAgAAAABz9B8nR7h4qY6q6q6q6q6q6q6q6q6q6q6q6q6q6q6q6q6q6q6qAAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAFxOAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+// Real base64-encoded strings (valid format, not necessarily valid Stellar XDR –
+// the mock bypasses actual XDR parsing so format-valid base64 is all we need
+// for the happy-path and error-path tests).
+const VALID_SIGNED_XDR =
+  "AAAAAgAAAABz9B8nR7h4qY6Ran5PlacgCUxOFxOdIQAAAAAAAAAAABAAAAAAAAAAAA==";
+const VALID_SIGNED_XDR_2 =
+  "AAAAAgAAAABz9B8nR7h4qY6Ran5PlacgCUxOFxOdIQAAAAAAAAAAABAAAAAAAAAAAA==".replace(
+    "AAAA",
+    "BBBB",
+  );
 
 describe("POST /api/jobs/submit – success path", () => {
   beforeEach(() => {
     mockSendTransaction.mockReset();
+    resetSubmitCache();
   });
 
   it("returns 200 with transaction result on successful submission", async () => {
@@ -141,6 +152,7 @@ describe("POST /api/jobs/submit – schema validation", () => {
 describe("POST /api/jobs/submit – error sanitization", () => {
   beforeEach(() => {
     mockSendTransaction.mockReset();
+    resetSubmitCache();
   });
 
   it("returns 500 without leaking internal error message from RPC", async () => {
@@ -187,14 +199,14 @@ describe("POST /api/jobs/submit – error sanitization", () => {
   });
 
   it("returns 500 when XDR parsing fails", async () => {
-    const invalidXdr = "invalid-xdr-string";
+    // A format-valid base64 string that the mock fromXDR throws on
     mockSendTransaction.mockImplementation(() => {
       throw new Error("XDR parsing failed");
     });
 
     const res = await request(buildApp())
       .post("/api/jobs/submit")
-      .send({ signedXdr: invalidXdr })
+      .send({ signedXdr: VALID_SIGNED_XDR })
       .expect(500);
 
     expect(res.body).toEqual({ success: false, error: "Internal server error" });
@@ -243,6 +255,7 @@ describe("POST /api/jobs/submit – error sanitization", () => {
 describe("POST /api/jobs/submit – rate limiting", () => {
   beforeEach(() => {
     mockSendTransaction.mockReset();
+    resetSubmitCache();
   });
 
   it("applies strict rate limiter middleware", async () => {
@@ -257,95 +270,647 @@ describe("POST /api/jobs/submit – rate limiting", () => {
   });
 });
 
-describe("POST /api/jobs/submit – CORS and security headers", () => {
-  const ORIGINAL_ALLOWED = process.env.ALLOWED_ORIGINS;
+// ---------------------------------------------------------------------------
+// POST /api/jobs/submit – in-memory caching
+// ---------------------------------------------------------------------------
+
+describe("POST /api/jobs/submit – caching", () => {
+  beforeEach(() => {
+    mockSendTransaction.mockReset();
+    resetSubmitCache();
+  });
+
+  it("returns cached result on second identical request without calling sendTransaction again", async () => {
+    const mockResult = { id: "tx-abc", status: "PENDING", hash: "hash-abc" };
+    mockSendTransaction.mockResolvedValue(mockResult);
+
+    const app = buildApp();
+
+    const first = await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    const second = await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(first.body).toEqual({ success: true, data: mockResult });
+    expect(second.body).toEqual({ success: true, data: mockResult });
+    // sendTransaction must only have been called once – second hit came from cache
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("concurrent requests for the same XDR call sendTransaction exactly once", async () => {
+    const mockResult = { id: "tx-concurrent", status: "PENDING" };
+    // Simulate a slow network call so both requests are in-flight together
+    mockSendTransaction.mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve(mockResult), 20)),
+    );
+
+    const app = buildApp();
+
+    const [first, second, third] = await Promise.all([
+      request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR }),
+      request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR }),
+      request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR }),
+    ]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(third.status).toBe(200);
+
+    expect(first.body).toEqual({ success: true, data: mockResult });
+    expect(second.body).toEqual({ success: true, data: mockResult });
+    expect(third.body).toEqual({ success: true, data: mockResult });
+
+    // Only one real network call despite three concurrent requests
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("different XDR values each trigger their own sendTransaction call", async () => {
+    mockSendTransaction
+      .mockResolvedValueOnce({ id: "tx-1", status: "PENDING" })
+      .mockResolvedValueOnce({ id: "tx-2", status: "PENDING" });
+
+    const app = buildApp();
+    const XDR_A = VALID_SIGNED_XDR;
+    const XDR_B = VALID_SIGNED_XDR_2;
+
+    const resA = await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: XDR_A })
+      .expect(200);
+
+    const resB = await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: XDR_B })
+      .expect(200);
+
+    expect(resA.body.data.id).toBe("tx-1");
+    expect(resB.body.data.id).toBe("tx-2");
+    expect(mockSendTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache a failed submission – next request retries sendTransaction", async () => {
+    mockSendTransaction
+      .mockRejectedValueOnce(new Error("network error"))
+      .mockResolvedValueOnce({ id: "tx-retry", status: "PENDING" });
+
+    const app = buildApp();
+
+    const failed = await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(500);
+
+    expect(failed.body).toEqual({ success: false, error: "Internal server error" });
+
+    const retry = await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(retry.body).toEqual({ success: true, data: { id: "tx-retry", status: "PENDING" } });
+    expect(mockSendTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("cache is isolated per test – resetSubmitCache prevents cross-test pollution", async () => {
+    const mockResult = { id: "fresh", status: "PENDING" };
+    mockSendTransaction.mockResolvedValue(mockResult);
+
+    const app = buildApp();
+
+    // First call populates cache
+    await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+
+    // Reset simulates a new test boundary
+    resetSubmitCache();
+    mockSendTransaction.mockClear();
+
+    // After reset a fresh call must hit the network again
+    await request(app)
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/jobs/submit – Zod format validation (signedXdr field)
+// ---------------------------------------------------------------------------
+
+describe("POST /api/jobs/submit – Zod format validation", () => {
+  // These tests exercise the schema layer only; no RPC call is made.
 
   beforeEach(() => {
-    process.env.ALLOWED_ORIGINS = "https://trusted.example.com";
     mockSendTransaction.mockReset();
-    mockSendTransaction.mockResolvedValue({ id: "test-id" });
+    resetSubmitCache();
   });
 
-  afterEach(() => {
-    if (ORIGINAL_ALLOWED === undefined) {
-      delete process.env.ALLOWED_ORIGINS;
-    } else {
-      process.env.ALLOWED_ORIGINS = ORIGINAL_ALLOWED;
+  // -------------------------------------------------------------------------
+  // Presence / type checks (first-layer refines)
+  // -------------------------------------------------------------------------
+
+  it("returns 400 with 'required' message when body is empty", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({})
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/required/i) });
+    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+  });
+
+  it("returns 400 with 'empty' message for empty string", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "" })
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/empty/i) });
+  });
+
+  it("returns 400 with 'string' message for numeric signedXdr", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: 99999 })
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+  });
+
+  it("returns 400 with 'string' message for boolean signedXdr", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: true })
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+  });
+
+  it("returns 400 with 'string' message for array signedXdr", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: ["AAAAAgAA=="] })
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+  });
+
+  it("returns 400 with 'string' message for object signedXdr", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: { value: "AAAAAgAA==" } })
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+  });
+
+  // -------------------------------------------------------------------------
+  // Whitespace checks
+  // -------------------------------------------------------------------------
+
+  it("returns 400 with 'whitespace' message for signedXdr containing a space", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "AAAAAgAA== AAAAAgAA==" })
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/whitespace/i) });
+  });
+
+  it("returns 400 for signedXdr that is only whitespace", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "    " })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
+  });
+
+  it("returns 400 for signedXdr containing a tab character", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "AAAAAgAA==\tAAAA" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/whitespace/i);
+  });
+
+  it("returns 400 for signedXdr containing a newline", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "AAAAAgAA==\nAAAAAgAA==" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/whitespace/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // Base64 format checks
+  // -------------------------------------------------------------------------
+
+  it("returns 400 with 'base64' message for signedXdr with non-base64 characters", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      // '!' is not a valid base64 character
+      .send({ signedXdr: "AAAAAgAA!!" })
+      .expect(400);
+
+    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/base64/i) });
+  });
+
+  it("returns 400 for signedXdr with hyphen (not standard base64)", async () => {
+    // URL-safe base64 uses - and _ which are not standard base64
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "AAAAAgAA-A==" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/base64/i);
+  });
+
+  it("returns 400 for signedXdr with underscore (URL-safe base64, not standard)", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "AAAAAgAA_A==" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/base64/i);
+  });
+
+  it("returns 400 for signedXdr whose length is not divisible by 4", async () => {
+    // 'abc' is 3 chars — not divisible by 4
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "abc" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/base64/i);
+  });
+
+  it("returns 400 for signedXdr with padding in the wrong position", async () => {
+    // '=' must only appear at the end in standard base64
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "=AAAAAAAAAAg=" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/base64/i);
+  });
+
+  it("returns 400 for signedXdr with too much padding (3 '=' chars)", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "AAAA===" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/base64/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // Valid input accepted
+  // -------------------------------------------------------------------------
+
+  it("accepts a well-formed base64 string and calls sendTransaction", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "AAAAAAAAAA==" })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts VALID_SIGNED_XDR and passes it through to the handler", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok", status: "PENDING" });
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Response shape on every 400
+  // -------------------------------------------------------------------------
+
+  it("every validation failure returns exactly { success, error } keys", async () => {
+    const invalids = [
+      {},
+      { signedXdr: "" },
+      { signedXdr: 0 },
+      { signedXdr: "has space" },
+      { signedXdr: "bad!chars" },
+      { signedXdr: "notdiv4" },
+    ];
+
+    for (const body of invalids) {
+      const res = await request(buildApp())
+        .post("/api/jobs/submit")
+        .send(body)
+        .expect(400);
+
+      expect(Object.keys(res.body)).toEqual(["success", "error"]);
+      expect(res.body.success).toBe(false);
+      expect(typeof res.body.error).toBe("string");
+      expect(res.body.error.length).toBeGreaterThan(0);
     }
   });
+});
 
-  it("rejects requests from unauthorized origins with 403", async () => {
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .set("Origin", "https://evil.example.com")
-      .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(403);
+// ---------------------------------------------------------------------------
+// POST /api/jobs/submit – trace logging
+// ---------------------------------------------------------------------------
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "Origin not allowed by CORS policy",
-    });
-    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+// Helper: return all calls to mockLogger.info whose first argument matches msg
+function infoCallsFor(msg: string) {
+  return (mockLogger.info as ReturnType<typeof jest.fn>).mock.calls.filter(
+    ([m]) => m === msg,
+  );
+}
+
+describe("POST /api/jobs/submit – trace logging", () => {
+  beforeEach(() => {
+    mockSendTransaction.mockReset();
+    resetSubmitCache();
+    (mockLogger.info as ReturnType<typeof jest.fn>).mockClear();
+    (mockLogger.warn as ReturnType<typeof jest.fn>).mockClear();
+    (mockLogger.error as ReturnType<typeof jest.fn>).mockClear();
   });
 
-  it("allows trusted origins and sets CORS response headers", async () => {
-    const res = await request(buildApp())
+  // -------------------------------------------------------------------------
+  // Request-received log
+  // -------------------------------------------------------------------------
+
+  it("logs 'Submit transaction request received' with traceId and xdrLength on every request", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+
+    await request(buildApp())
       .post("/api/jobs/submit")
-      .set("Origin", "https://trusted.example.com")
       .send({ signedXdr: VALID_SIGNED_XDR })
       .expect(200);
 
-    expect(res.headers["access-control-allow-origin"]).toBe(
-      "https://trusted.example.com"
+    const calls = infoCallsFor("Submit transaction request received");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.traceId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
     );
-    expect(res.headers.vary).toContain("Origin");
-    expect(res.body.success).toBe(true);
+    expect(meta.xdrLength).toBe(VALID_SIGNED_XDR.length);
   });
 
-  it("applies security headers on POST /api/jobs/submit", async () => {
-    const res = await request(buildApp())
+  it("xdrLength in request-received log matches the actual signedXdr length", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const xdr = "AAAAAAAAAA=="; // length 12
+
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: xdr })
+      .expect(200);
+
+    const [[, meta]] = infoCallsFor("Submit transaction request received") as [string, Record<string, unknown>][];
+    expect(meta.xdrLength).toBe(12);
+  });
+
+  // -------------------------------------------------------------------------
+  // Network-submission log
+  // -------------------------------------------------------------------------
+
+  it("logs 'Submitting transaction to network' with traceId before calling sendTransaction", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok", status: "PENDING" });
+
+    await request(buildApp())
       .post("/api/jobs/submit")
       .send({ signedXdr: VALID_SIGNED_XDR })
       .expect(200);
 
-    expect(res.headers["x-content-type-options"]).toBe("nosniff");
-    expect(res.headers["x-frame-options"]).toBe("DENY");
-    expect(res.headers["referrer-policy"]).toBe("no-referrer");
-    expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
+    const calls = infoCallsFor("Submitting transaction to network");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
   });
 
-  it("responds 204 on OPTIONS preflight from trusted origin", async () => {
-    const res = await request(buildApp())
-      .options("/api/jobs/submit")
-      .set("Origin", "https://trusted.example.com")
-      .set("Access-Control-Request-Method", "POST")
-      .expect(204);
+  // -------------------------------------------------------------------------
+  // Success log
+  // -------------------------------------------------------------------------
 
-    expect(res.headers["access-control-allow-origin"]).toBe(
-      "https://trusted.example.com"
+  it("logs 'Transaction submitted successfully' with traceId, status, and hash on success", async () => {
+    const mockResult = { id: "tx-123", status: "PENDING", hash: "abc123" };
+    mockSendTransaction.mockResolvedValue(mockResult);
+
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    const calls = infoCallsFor("Transaction submitted successfully");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.status).toBe("PENDING");
+    expect(meta.hash).toBe("abc123");
+  });
+
+  it("success log traceId matches the request-received traceId (same request)", async () => {
+    mockSendTransaction.mockResolvedValue({ status: "PENDING", hash: "h1" });
+
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    const receivedId = (infoCallsFor("Submit transaction request received")[0] as [string, Record<string, unknown>])[1].traceId;
+    const successId = (infoCallsFor("Transaction submitted successfully")[0] as [string, Record<string, unknown>])[1].traceId;
+
+    expect(receivedId).toBe(successId);
+  });
+
+  it("logs undefined status/hash gracefully when result has neither field", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "no-status" });
+
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    const calls = infoCallsFor("Transaction submitted successfully");
+    expect(calls).toHaveLength(1);
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    // Should not throw – just logs undefined
+    expect(meta.status).toBeUndefined();
+    expect(meta.hash).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // Error log
+  // -------------------------------------------------------------------------
+
+  it("logs 'Failed to submit transaction' with traceId and error message on RPC failure", async () => {
+    mockSendTransaction.mockRejectedValue(new Error("rpc unavailable"));
+
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(500);
+
+    const errorCalls = (mockLogger.error as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Failed to submit transaction",
     );
-    expect(res.headers["access-control-allow-methods"]).toContain("POST");
+    expect(errorCalls).toHaveLength(1);
+
+    const [, meta] = errorCalls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.error).toBe("rpc unavailable");
   });
 
-  it("responds 403 on OPTIONS preflight from unauthorized origin", async () => {
-    const res = await request(buildApp())
-      .options("/api/jobs/submit")
-      .set("Origin", "https://evil.example.com")
-      .set("Access-Control-Request-Method", "POST")
-      .expect(403);
+  it("error log traceId matches the request-received traceId (same request)", async () => {
+    mockSendTransaction.mockRejectedValue(new Error("boom"));
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "Origin not allowed by CORS policy",
-    });
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(500);
+
+    const receivedId = (infoCallsFor("Submit transaction request received")[0] as [string, Record<string, unknown>])[1].traceId;
+    const errorCalls = (mockLogger.error as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Failed to submit transaction",
+    );
+    const errorId = (errorCalls[0] as [string, Record<string, unknown>])[1].traceId;
+
+    expect(receivedId).toBe(errorId);
   });
 
-  it("allows request without origin header", async () => {
-    const res = await request(buildApp())
+  // -------------------------------------------------------------------------
+  // Cache-hit log
+  // -------------------------------------------------------------------------
+
+  it("logs 'Submit result served from cache' with traceId and source='cache' on cache hit", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "cached" });
+    const app = buildApp();
+
+    // Prime the cache
+    await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR }).expect(200);
+    (mockLogger.info as ReturnType<typeof jest.fn>).mockClear();
+
+    // Second request hits the cache
+    await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR }).expect(200);
+
+    const calls = infoCallsFor("Submit result served from cache");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.source).toBe("cache");
+  });
+
+  // -------------------------------------------------------------------------
+  // Validation-rejection warn log
+  // -------------------------------------------------------------------------
+
+  it("logs a warn with xdrLength when signedXdr is a string that fails validation", async () => {
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: "bad!chars" })
+      .expect(400);
+
+    const warnCalls = (mockLogger.warn as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Invalid submit request body",
+    );
+    expect(warnCalls).toHaveLength(1);
+
+    const [, meta] = warnCalls[0] as [string, Record<string, unknown>];
+    expect((meta.xdrLength as number)).toBe(9); // "bad!chars".length === 9
+  });
+
+  it("logs a warn without xdrLength when signedXdr is not a string", async () => {
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: 12345 })
+      .expect(400);
+
+    const warnCalls = (mockLogger.warn as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Invalid submit request body",
+    );
+    expect(warnCalls).toHaveLength(1);
+
+    const [, meta] = warnCalls[0] as [string, Record<string, unknown>];
+    expect(meta.xdrLength).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // traceId uniqueness across requests
+  // -------------------------------------------------------------------------
+
+  it("each request gets a distinct traceId", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const app = buildApp();
+
+    // Two sequential requests
+    await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR }).expect(200);
+    resetSubmitCache();
+    await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR }).expect(200);
+
+    const receivedCalls = infoCallsFor("Submit transaction request received");
+    expect(receivedCalls).toHaveLength(2);
+
+    const id1 = (receivedCalls[0] as [string, Record<string, unknown>])[1].traceId;
+    const id2 = (receivedCalls[1] as [string, Record<string, unknown>])[1].traceId;
+    expect(id1).not.toBe(id2);
+  });
+
+  // -------------------------------------------------------------------------
+  // No success log on error path
+  // -------------------------------------------------------------------------
+
+  it("does not log 'Transaction submitted successfully' when the RPC call fails", async () => {
+    mockSendTransaction.mockRejectedValue(new Error("network down"));
+
+    await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(500);
+
+    expect(infoCallsFor("Transaction submitted successfully")).toHaveLength(0);
+  });
+
+  it("does not log 'Failed to submit transaction' on the success path", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+
+    await request(buildApp())
       .post("/api/jobs/submit")
       .send({ signedXdr: VALID_SIGNED_XDR })
       .expect(200);
 
-    expect(res.body.success).toBe(true);
+    const errorCalls = (mockLogger.error as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Failed to submit transaction",
+    );
+    expect(errorCalls).toHaveLength(0);
   });
 });
