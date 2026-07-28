@@ -72,6 +72,16 @@ export const contractMilestoneParamsSchema = z.object({
   index: milestoneIndexSchema,
 });
 
+/**
+ * Named Stellar account field (G…) with field-specific error messages.
+ */
+const stellarAccountField = (field: string) =>
+  z
+    .string({ required_error: `${field} is required` })
+    .refine(isValidStellarAddress, {
+      message: `${field} must be a valid Stellar account address (G...)`,
+    });
+
 /** POST /build-tx body */
 export const buildTxBodySchema = z.object({
   contractId: contractIdSchema,
@@ -95,17 +105,8 @@ export const submitBodySchema = z.object({
       },
       { message: "signedXdr must be a valid base64-encoded XDR string" },
     ),
+  sourceAddress: stellarAccountField("sourceAddress").optional(),
 });
-
-/**
- * Named Stellar account field (G…) with field-specific error messages.
- */
-const stellarAccountField = (field: string) =>
-  z
-    .string({ required_error: `${field} is required` })
-    .refine(isValidStellarAddress, {
-      message: `${field} must be a valid Stellar account address (G...)`,
-    });
 
 /**
  * POST /:contractId/milestones/:index/partial-release body.

@@ -690,13 +690,14 @@ router.post(
     }),
   ),
   async (req: Request, res: Response) => {
-    const { signedXdr } = req.body as { signedXdr: string };
+    const { signedXdr, sourceAddress } = req.body as { signedXdr: string; sourceAddress?: string };
     const cacheKey = signedXdr;
     const traceId = randomUUID();
 
     logger.info("Submit transaction request received", {
       traceId,
       xdrLength: signedXdr.length,
+      ...(sourceAddress && { sourceAddress }),
     });
 
     try {
