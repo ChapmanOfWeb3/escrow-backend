@@ -30,6 +30,7 @@ import type { RequestWithValidatedQuery } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
   contractMilestoneParamsSchema,
+  // Schema for building transaction requests
   buildTxBodySchema,
   submitBodySchema,
   partialReleaseBodySchema,
@@ -453,6 +454,7 @@ router.get(
 router.post(
   "/build-tx",
   strictLimiter,
+  // Schema validation for POST /api/jobs/build-tx payload
   validate(buildTxBodySchema, "body", (req) =>
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
