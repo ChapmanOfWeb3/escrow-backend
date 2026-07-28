@@ -29,6 +29,7 @@ const VALID_BODY = { sourceAddress: VALID_ADDRESS };
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () => {
   beforeEach(() => {
+    delete process.env.API_KEY;
     resetClaimAutoReleaseCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
@@ -103,6 +104,145 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
 
     expect(res.body.success).toBe(false);
     expect(res.body.error).toMatch(/sourceAddress/i);
+  });
+
+  it("returns 401 when API_KEY is configured but no key provided", async () => {
+    process.env.API_KEY = "test-secret-key";
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(401);
+
+    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+    expect(mockGetAccount).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when API_KEY is configured but wrong key provided", async () => {
+    process.env.API_KEY = "test-secret-key";
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("x-api-key", "wrong-key")
+      .send(VALID_BODY)
+      .expect(401);
+
+    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+    expect(mockGetAccount).not.toHaveBeenCalled();
+  });
+
+  it("returns 200 when API_KEY is configured and correct key provided", async () => {
+    process.env.API_KEY = "test-secret-key";
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("x-api-key", "test-secret-key")
+      .send(VALID_BODY)
+      .expect(200);
+
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("returns 404 when source account is not found on the network", async () => {
+    mockGetAccount.mockRejectedValue(new Error("account not found: G..."));
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(404);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Source account not found on network",
+    });
+  });
+
+  it("returns 404 when contract is not found via prepareTransaction error", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("contract not found on network"));
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(404);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Contract not found on network",
+    });
+  });
+
+  it("returns 404 for NotFound variant with capitalization", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("NotFound: contract does not exist"));
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(404);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("Contract not found on network");
+  });
+
+  it("returns 422 when contract execution reverts with error code", async () => {
+    mockPrepareTransaction.mockRejectedValue(
+      new Error("transaction simulation failed: contract error #5")
+    );
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(422);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Contract execution reverted (error code 5)",
+    });
+  });
+
+  it("returns 422 when contract execution reverts with revert/assert message", async () => {
+    mockPrepareTransaction.mockRejectedValue(
+      new Error("simulation failed: panic: assertion failed")
+    );
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(422);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Contract execution reverted",
+    });
+  });
+
+  it("returns 500 for unexpected internal errors", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("something went very wrong"));
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(500);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Internal server error",
+    });
+  });
+
+  it("returns 500 and hides raw error message for network/RPC failures", async () => {
+    mockGetAccount.mockRejectedValue(new Error("ECONNREFUSED connection timeout to rpc"));
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(500);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Internal server error",
+    });
+    expect(res.body.error).not.toMatch(/ECONNREFUSED/);
   });
 
   it("returns 200 with XDR on valid input", async () => {

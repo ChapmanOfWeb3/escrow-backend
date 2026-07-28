@@ -608,6 +608,17 @@ router.post(
       const contractId = req.params.contractId as string;
       const { index } = req.params;
       const { sourceAddress } = req.body;
+
+      const requiredApiKey = process.env.API_KEY;
+      if (requiredApiKey) {
+        const providedKey = req.header("x-api-key");
+        if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized claim-auto-release request", { contractId, index });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+      }
+
       const cacheKey = `${contractId}:${index}:${sourceAddress}`;
 
       const cached = claimAutoReleaseCache.get<string>(cacheKey);
@@ -666,8 +677,52 @@ router.post(
 
       res.json({ success: true, xdr });
     } catch (err: any) {
-      logger.error("Failed to build claim-auto-release tx", { error: err?.message });
-      res.status(500).json({ success: false, error: "Internal server error" });
+      const rawMessage = err?.message ?? String(err);
+      const contractId = req.params?.contractId as string | undefined;
+      const index = req.params?.index;
+      const sourceAddress = req.body?.sourceAddress;
+
+      if (
+        /not found|NotFound/i.test(rawMessage) &&
+        /account/i.test(rawMessage)
+      ) {
+        logger.warn("Source account not found for claim-auto-release", {
+          contractId,
+          index,
+          sourceAddress,
+        });
+        sendError(res, 404, "Source account not found on network");
+        return;
+      }
+
+      const { status, message } = classifySimError(rawMessage);
+      if (status === 404) {
+        logger.warn("Contract not found for claim-auto-release", {
+          contractId,
+          index,
+          sourceAddress,
+        });
+        sendError(res, 404, "Contract not found on network");
+        return;
+      }
+      if (status === 422) {
+        logger.warn("Contract reverted for claim-auto-release", {
+          contractId,
+          index,
+          sourceAddress,
+          error: rawMessage,
+        });
+        sendError(res, 422, message);
+        return;
+      }
+
+      logger.error("Failed to build claim-auto-release tx", {
+        contractId,
+        index,
+        sourceAddress,
+        error: rawMessage,
+      });
+      sendError(res, 500, "Internal server error");
     }
   },
 );
