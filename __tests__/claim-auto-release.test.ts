@@ -290,4 +290,168 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockPrepareTransaction).not.toHaveBeenCalled();
   });
+
+  it("returns 400 for a negative index", async () => {
+    const res = await request(buildApp())
+      .post(`/api/jobs/${VALID_CONTRACT}/milestones/-1/claim-auto-release`)
+      .send(VALID_BODY)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/index/i);
+  });
+
+  it("returns 404 when prepareTransaction throws 'missing account'", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("missing account on chain"));
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(404);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Source account not found on network",
+    });
+  });
+
+  it("returns 404 with account message when prepareTransaction throws 'account not found'", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("account not found during sim"));
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(404);
+
+    expect(res.body.error).toBe("Source account not found on network");
+  });
+
+  it("always returns Content-Type: application/json on 400 errors", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send({ sourceAddress: "bad" });
+
+    expect(res.headers["content-type"]).toMatch(/json/);
+    expect(res.status).toBe(400);
+  });
+
+  it("always returns Content-Type: application/json on 401 errors", async () => {
+    process.env.API_KEY = "secret";
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY);
+    expect(res.headers["content-type"]).toMatch(/json/);
+    expect(res.status).toBe(401);
+  });
+
+  it("always returns Content-Type: application/json on 404 errors", async () => {
+    mockGetAccount.mockRejectedValue(new Error("account not found"));
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY);
+    expect(res.headers["content-type"]).toMatch(/json/);
+    expect(res.status).toBe(404);
+  });
+
+  it("always returns Content-Type: application/json on 422 errors", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("contract error #3"));
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY);
+    expect(res.headers["content-type"]).toMatch(/json/);
+    expect(res.status).toBe(422);
+  });
+
+  it("always returns Content-Type: application/json on 500 errors", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("oops"));
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY);
+    expect(res.headers["content-type"]).toMatch(/json/);
+    expect(res.status).toBe(500);
+  });
+
+  it("always returns Content-Type: application/json on success", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY);
+    expect(res.headers["content-type"]).toMatch(/json/);
+    expect(res.status).toBe(200);
+  });
+
+  it("error responses contain only `success` and `error` keys (no leak)", async () => {
+    mockPrepareTransaction.mockRejectedValue(
+      new Error("DB: postgres://user:pw@localhost/db")
+    );
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(500);
+
+    expect(Object.keys(res.body).sort()).toEqual(["error", "success"]);
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
+    expect(JSON.stringify(res.body)).not.toContain("postgres");
+    expect(JSON.stringify(res.body)).not.toContain("user:pw");
+  });
+
+  it("400 validation error contains only `success` and `error` keys", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send({})
+      .expect(400);
+
+    expect(Object.keys(res.body).sort()).toEqual(["error", "success"]);
+  });
+
+  it("401 error contains only `success` and `error` keys", async () => {
+    process.env.API_KEY = "secret";
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(401);
+
+    expect(Object.keys(res.body).sort()).toEqual(["error", "success"]);
+  });
+
+  it("404 error contains only `success` and `error` keys", async () => {
+    mockGetAccount.mockRejectedValue(new Error("account not found"));
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(404);
+
+    expect(Object.keys(res.body).sort()).toEqual(["error", "success"]);
+  });
+
+  it("422 error contains only `success` and `error` keys", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("panic: something"));
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(422);
+
+    expect(Object.keys(res.body).sort()).toEqual(["error", "success"]);
+  });
+
+  it("success response contains only `success` and `xdr` keys", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(200);
+
+    expect(Object.keys(res.body).sort()).toEqual(["success", "xdr"]);
+    expect(res.body.success).toBe(true);
+    expect(typeof res.body.xdr).toBe("string");
+  });
+
+  it("500 error does not include stack trace or internal details", async () => {
+    const err = new Error("RPC timeout");
+    (err as any).code = "ETIMEDOUT";
+    (err as any).stack = "at /src/rpc.ts:123:45\nat handler (index.js:10)";
+    mockPrepareTransaction.mockRejectedValue(err);
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(500);
+
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toContain("ETIMEDOUT");
+    expect(bodyStr).not.toContain("rpc.ts");
+    expect(bodyStr).not.toMatch(/at \w+/);
+    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+  });
 });

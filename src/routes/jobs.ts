@@ -97,15 +97,20 @@ export function resetSubmitCache(): void {
  * code plus a client-safe message.
  *
  * Mappings:
- *  - Missing / unregistered contract → 404
+ *  - Missing / unregistered contract → 404 (Contract not found)
+ *  - Missing source account → 404 (Account not found)
  *  - Contract assertion / revert (error codes) → 422
  *  - Everything else → 500
  */
 function classifySimError(rawError: string): { status: number; message: string } {
-  // 404 – contract or account not found on the network
+  // 404 – source account missing on the network
+  if (/missing account|account not found/i.test(rawError)) {
+    return { status: 404, message: "Source account not found on network" };
+  }
+
+  // 404 – contract missing / unregistered on the network
   if (
     /not found|NotFound|contract not found/i.test(rawError) ||
-    /missing account|account not found/i.test(rawError) ||
     /contract error #1\b/i.test(rawError)
   ) {
     return { status: 404, message: "Contract not found on network" };
@@ -682,10 +687,9 @@ router.post(
       const index = req.params?.index;
       const sourceAddress = req.body?.sourceAddress;
 
-      if (
-        /not found|NotFound/i.test(rawMessage) &&
-        /account/i.test(rawMessage)
-      ) {
+      const { status, message } = classifySimError(rawMessage);
+
+      if (status === 404 && /missing account|account not found/i.test(rawMessage)) {
         logger.warn("Source account not found for claim-auto-release", {
           contractId,
           index,
@@ -695,7 +699,6 @@ router.post(
         return;
       }
 
-      const { status, message } = classifySimError(rawMessage);
       if (status === 404) {
         logger.warn("Contract not found for claim-auto-release", {
           contractId,
