@@ -188,22 +188,102 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
 
   // ── error path ────────────────────────────────────────────────────────────
 
-  it("returns 500 when getAccount throws", async () => {
+  it("returns 404 when getAccount throws account not found", async () => {
     mockGetAccount.mockRejectedValue(new Error("account not found"));
     const res = await request(buildApp())
       .post(ENDPOINT)
       .send(VALID_BODY)
-      .expect(500);
-    expect(res.body.success).toBe(false);
+      .expect(404);
+    expect(res.body).toEqual({
+      success: false,
+      error: "Contract not found on network",
+    });
   });
 
-  it("returns 500 when prepareTransaction throws", async () => {
-    mockPrepareTransaction.mockRejectedValue(new Error("RPC failure"));
+  it("returns 500 when getAccount throws a generic internal error", async () => {
+    mockGetAccount.mockRejectedValue(new Error("Database connection timeout"));
     const res = await request(buildApp())
       .post(ENDPOINT)
       .send(VALID_BODY)
       .expect(500);
-    expect(res.body.success).toBe(false);
+    expect(res.body).toEqual({
+      success: false,
+      error: "Internal server error",
+    });
+  });
+
+  it("returns 422 when prepareTransaction throws contract execution reverted", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("contract error #101"));
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(422);
+    expect(res.body).toEqual({
+      success: false,
+      error: "Contract execution reverted (error code 101)",
+    });
+  });
+
+  it("returns 500 when prepareTransaction throws a generic internal error", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("Database connection timeout"));
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(500);
+    expect(res.body).toEqual({
+      success: false,
+      error: "Internal server error",
+    });
+  });
+
+  // ── API_KEY gate ──────────────────────────────────────────────────────────
+
+  describe("API_KEY gate", () => {
+    const originalApiKey = process.env.API_KEY;
+
+    beforeEach(() => {
+      process.env.API_KEY = "secret-test-key";
+      mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    });
+
+    afterEach(() => {
+      process.env.API_KEY = originalApiKey;
+    });
+
+    it("returns 401 when API_KEY is set and no key is provided", async () => {
+      const res = await request(buildApp())
+        .post(ENDPOINT)
+        .send(VALID_BODY)
+        .expect(401);
+      expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+    });
+
+    it("returns 401 when API_KEY is set and wrong key is provided", async () => {
+      const res = await request(buildApp())
+        .post(ENDPOINT)
+        .set("x-api-key", "wrong-key")
+        .send(VALID_BODY)
+        .expect(401);
+      expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+    });
+
+    it("returns 200 when API_KEY is set and correct key is provided", async () => {
+      const res = await request(buildApp())
+        .post(ENDPOINT)
+        .set("x-api-key", "secret-test-key")
+        .send(VALID_BODY)
+        .expect(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it("returns 200 (no gate) when API_KEY is not set", async () => {
+      delete process.env.API_KEY;
+      const res = await request(buildApp())
+        .post(ENDPOINT)
+        .send(VALID_BODY)
+        .expect(200);
+      expect(res.body.success).toBe(true);
+    });
   });
 
   // ── rate limiting ─────────────────────────────────────────────────────────
