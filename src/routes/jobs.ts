@@ -15,6 +15,7 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  submitRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
@@ -682,7 +683,7 @@ router.post(
   "/submit",
   submitCors,
   submitSecurityHeaders,
-  strictLimiter,
+  submitRateLimit,
   validate(submitBodySchema, "body", (req) =>
     logger.warn("Invalid submit request body", {
       body: req.body,
