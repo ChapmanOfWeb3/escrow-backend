@@ -21,9 +21,7 @@ jest.unstable_mockModule("../src/utils/logger.js", () => ({
   default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-jest.unstable_mockModule("../src/middleware/rateLimiter.js", () => ({
-  strictLimiter: (_req: any, _res: any, next: any) => next(),
-  generalLimiter: (_req: any, _res: any, next: any) => next(),
+
 jest.unstable_mockModule("@stellar/stellar-sdk", () => ({
   TransactionBuilder: {
     fromXDR: jest.fn(() => mockTx),
