@@ -468,10 +468,16 @@ router.post(
         const tokenArg = args.find((a: any) => a.type === "address" && a.value && a !== adminArg);
 
         if (!adminArg || !tokenArg) {
-          return res.status(400).json({
-            success: false,
-            error: "Both admin (address) and token (address) arguments are required for whitelist management methods",
+          logger.warn("Missing admin/token args for whitelist management", {
+            contractId,
+            method,
           });
+          sendError(
+            res,
+            400,
+            "Both admin (address) and token (address) arguments are required for whitelist management methods",
+          );
+          return;
         }
       }
 
@@ -505,7 +511,7 @@ router.post(
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
       logger.error("Failed to build transaction", { error: err?.message });
-      res.status(500).json({ success: false, error: "Internal server error" });
+      sendError(res, 500, "Internal server error");
     }
   },
 );
@@ -516,12 +522,24 @@ router.post(
 router.post(
   "/:contractId/milestones/:index/partial-release",
   partialReleaseRateLimit,
-  validate(contractMilestoneParamsSchema, "params"),
-  validate(partialReleaseBodySchema, "body"),
+  validate(contractMilestoneParamsSchema, "params", (req) =>
+    logger.warn("Invalid params for partial-release", { params: req.params }),
+  ),
+  validate(partialReleaseBodySchema, "body", (req) =>
+    logger.warn("Invalid body for partial-release", { body: req.body }),
+  ),
   async (req: Request, res: Response) => {
     try {
       const { contractId, index } = req.params;
       const { amount, sourceAddress } = req.body;
+
+      logger.info("Processing partial-release", {
+        contractId,
+        index,
+        amount,
+        sourceAddress,
+      });
+
       const contract = new Contract(contractId as string);
       const account = await server.getAccount(sourceAddress as string);
       const amountNum = BigInt(amount);
@@ -540,9 +558,23 @@ router.post(
         .build();
 
       const prepared = await server.prepareTransaction(tx);
+
+      logger.info("Partial-release transaction built", {
+        contractId,
+        index,
+        amount,
+        sourceAddress,
+      });
+
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      const { contractId, index } = req.params;
+      logger.error("Failed to build partial-release transaction", {
+        contractId,
+        index,
+        error: err?.message,
+      });
+      sendError(res, 500, "Internal server error");
     }
   }
 );
