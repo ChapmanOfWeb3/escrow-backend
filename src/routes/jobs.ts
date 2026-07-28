@@ -22,8 +22,8 @@ import {
   jobContractSecurityHeaders,
   createJobDraftCors,
   createJobDraftSecurityHeaders,
-  byWalletCors,
-  byWalletSecurityHeaders,
+  submitCors,
+  submitSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
@@ -73,6 +73,20 @@ const inFlightClaimAutoReleaseRequests = new Map<string, Promise<string>>();
 export function resetClaimAutoReleaseCache(): void {
   claimAutoReleaseCache.flushAll();
   inFlightClaimAutoReleaseRequests.clear();
+}
+
+const SUBMIT_CACHE_TTL = parseInt(
+  process.env.SUBMIT_CACHE_TTL_S || "30",
+  10,
+);
+export const submitCache = new NodeCache({
+  stdTTL: SUBMIT_CACHE_TTL,
+  useClones: false,
+});
+const inFlightSubmitRequests = new Map<string, Promise<unknown>>();
+export function resetSubmitCache(): void {
+  submitCache.flushAll();
+  inFlightSubmitRequests.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -155,15 +169,30 @@ router.get(
     logger.warn("Invalid by-wallet query", { query: req.query }),
   ),
   async (req: Request, res: Response) => {
+    const address = req.params.address as string;
+
+    // Optional API-key gate (same pattern as GET /:contractId)
+    const requiredApiKey = process.env.API_KEY;
+    if (requiredApiKey) {
+      const providedKey = req.header("x-api-key");
+      if (providedKey !== requiredApiKey) {
+        logger.warn("Unauthorized by-wallet request", { address });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+    }
+
     try {
-      const address = req.params.address as string;
       const { page, limit } = (req as RequestWithValidatedQuery)
         .validatedQuery as ByWalletQuery;
 
+      logger.info("Fetching jobs by wallet", { address, page, limit });
       const result = await getJobsByWallet(address, page, limit);
-      res.json({ success: true, ...result });
-    } catch (err: any) {
-      res.status(500).json({ success: false, error: "Internal server error" });
+      sendSuccess(res, result);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to fetch jobs by wallet", { address, error: message });
+      sendError(res, 500, "Internal server error");
     }
   },
 );
@@ -650,14 +679,31 @@ router.post(
 
 // ---------------------------------------------------------------------------
 // POST /api/jobs/submit – submit a signed transaction
+// Caches results by signedXdr to deduplicate concurrent identical submissions.
 // ---------------------------------------------------------------------------
+router.options("/submit", submitCors);
+
 router.post(
   "/submit",
+  submitCors,
+  submitSecurityHeaders,
   strictLimiter,
   validate(submitBodySchema, "body", (req) =>
-    logger.warn("Invalid submit request body", { body: req.body }),
+    logger.warn("Invalid submit request body", {
+      body: req.body,
+      xdrLength: typeof req.body?.signedXdr === "string" ? req.body.signedXdr.length : undefined,
+    }),
   ),
   async (req: Request, res: Response) => {
+    const { signedXdr } = req.body as { signedXdr: string };
+    const cacheKey = signedXdr;
+    const traceId = randomUUID();
+
+    logger.info("Submit transaction request received", {
+      traceId,
+      xdrLength: signedXdr.length,
+    });
+
     try {
       const { signedXdr } = req.body;
       const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
@@ -667,6 +713,54 @@ router.post(
     } catch (err: any) {
       logger.error("Failed to submit transaction", { error: err?.message });
       sendError(res, 500, "Internal server error");
+      const cached = submitCache.get<unknown>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Submit result served from cache", { traceId, source: "cache" });
+        res.json({ success: true, data: cached });
+        return;
+      }
+
+      const inFlight = inFlightSubmitRequests.get(cacheKey);
+      if (inFlight) {
+        logger.info("Submit result served from in-flight cache", { traceId, source: "in-flight" });
+        const result = await inFlight;
+        res.json({ success: true, data: result });
+        return;
+      }
+
+      logger.info("Submitting transaction to network", { traceId });
+
+      const requestPromise = (async (): Promise<unknown> => {
+        const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
+        const tx = TB.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+        const result = await server.sendTransaction(tx);
+        submitCache.set(cacheKey, result);
+        return result;
+      })();
+
+      inFlightSubmitRequests.set(cacheKey, requestPromise);
+      let result: unknown;
+      try {
+        result = await requestPromise;
+      } catch (err: unknown) {
+        submitCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightSubmitRequests.delete(cacheKey);
+      }
+
+      const txResult = result as Record<string, unknown>;
+      logger.info("Transaction submitted successfully", {
+        traceId,
+        status: txResult?.status,
+        hash: txResult?.hash,
+      });
+
+      res.json({ success: true, data: result });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to submit transaction", { traceId, error: message });
+      res.status(500).json({ success: false, error: "Internal server error" });
     }
   },
 );

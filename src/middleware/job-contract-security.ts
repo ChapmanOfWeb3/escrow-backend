@@ -106,8 +106,8 @@ export function createJobDraftCors(
 /** Security headers applied to POST /api/jobs/create-job-draft responses. */
 export const createJobDraftSecurityHeaders = jobContractSecurityHeaders;
 
-/** Strict CORS gate for GET /api/jobs/by-wallet/:address. */
-export function byWalletCors(
+/** Strict CORS gate for POST /api/jobs/submit. */
+export function submitCors(
   req: Request,
   res: Response,
   next: NextFunction
@@ -127,7 +127,7 @@ export function byWalletCors(
   if (allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Content-Type, Authorization, X-API-Key"
@@ -146,5 +146,5 @@ export function byWalletCors(
   });
 }
 
-/** Security headers applied to GET /api/jobs/by-wallet/:address responses. */
-export const byWalletSecurityHeaders = jobContractSecurityHeaders;
+/** Security headers applied to POST /api/jobs/submit responses. */
+export const submitSecurityHeaders = jobContractSecurityHeaders;
