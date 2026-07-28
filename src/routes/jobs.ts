@@ -15,6 +15,7 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  claimAutoReleaseRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
@@ -597,6 +598,7 @@ router.get(
 // ---------------------------------------------------------------------------
 router.post(
   "/:contractId/milestones/:index/claim-auto-release",
+  claimAutoReleaseRateLimit,
   validate(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for claim-auto-release", { params: req.params }),
   ),

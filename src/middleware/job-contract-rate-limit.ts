@@ -157,3 +157,54 @@ export function jobWhitelistRateLimit(
 
   next();
 }
+
+const claimAutoReleaseBuckets = new Map<string, RateBucket>();
+
+export function resetClaimAutoReleaseRateLimitBuckets(): void {
+  claimAutoReleaseBuckets.clear();
+}
+
+function resolveClaimAutoReleaseWindowMs(): number {
+  const configured = Number(process.env.CLAIM_AUTO_RELEASE_RATE_WINDOW_MS ?? "60000");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60000;
+}
+
+function resolveClaimAutoReleaseMaxRequests(): number {
+  const configured = Number(process.env.CLAIM_AUTO_RELEASE_RATE_MAX ?? "10");
+  return Number.isFinite(configured) && configured > 0 ? configured : 10;
+}
+
+/** Dedicated rate limiter for POST /api/jobs/:contractId/milestones/:index/claim-auto-release. */
+export function claimAutoReleaseRateLimit(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const windowMs = resolveClaimAutoReleaseWindowMs();
+  const maxRequests = resolveClaimAutoReleaseMaxRequests();
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+
+  let bucket = claimAutoReleaseBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + windowMs };
+    claimAutoReleaseBuckets.set(key, bucket);
+  }
+
+  bucket.count += 1;
+
+  const remaining = Math.max(0, maxRequests - bucket.count);
+  res.setHeader("X-RateLimit-Limit", String(maxRequests));
+  res.setHeader("X-RateLimit-Remaining", String(remaining));
+  res.setHeader("X-RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+
+  if (bucket.count > maxRequests) {
+    res.status(429).json({
+      success: false,
+      error: "Too many requests, please try again later",
+    });
+    return;
+  }
+
+  next();
+}

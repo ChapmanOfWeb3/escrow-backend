@@ -16,6 +16,9 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
 }));
 
 const { default: router, resetClaimAutoReleaseCache } = await import("../src/routes/jobs.js");
+const { resetClaimAutoReleaseRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -30,6 +33,7 @@ const VALID_BODY = { sourceAddress: VALID_ADDRESS };
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () => {
   beforeEach(() => {
     resetClaimAutoReleaseCache();
+    resetClaimAutoReleaseRateLimitBuckets();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
 
@@ -149,5 +153,114 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
 
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockPrepareTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – rate limiting", () => {
+  const originalMax = process.env.CLAIM_AUTO_RELEASE_RATE_MAX;
+  const originalWindow = process.env.CLAIM_AUTO_RELEASE_RATE_WINDOW_MS;
+
+  beforeEach(() => {
+    resetClaimAutoReleaseRateLimitBuckets();
+    process.env.CLAIM_AUTO_RELEASE_RATE_MAX = "3";
+    process.env.CLAIM_AUTO_RELEASE_RATE_WINDOW_MS = "60000";
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+  });
+
+  afterEach(() => {
+    resetClaimAutoReleaseRateLimitBuckets();
+    if (originalMax === undefined) delete process.env.CLAIM_AUTO_RELEASE_RATE_MAX;
+    else process.env.CLAIM_AUTO_RELEASE_RATE_MAX = originalMax;
+    if (originalWindow === undefined) delete process.env.CLAIM_AUTO_RELEASE_RATE_WINDOW_MS;
+    else process.env.CLAIM_AUTO_RELEASE_RATE_WINDOW_MS = originalWindow;
+  });
+
+  it("allows requests up to the configured threshold", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 3; i++) {
+      const res = await request(app).post(ENDPOINT).send(VALID_BODY);
+      expect(res.status).not.toBe(429);
+      expect(res.headers["x-ratelimit-limit"]).toBe("3");
+    }
+  });
+
+  it("returns 429 once the threshold is exceeded", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 3; i++) {
+      await request(app).post(ENDPOINT).send(VALID_BODY);
+    }
+    const res = await request(app).post(ENDPOINT).send(VALID_BODY).expect(429);
+    expect(res.body).toEqual({
+      success: false,
+      error: "Too many requests, please try again later",
+    });
+    expect(res.headers["x-ratelimit-remaining"]).toBe("0");
+  });
+
+  it("sets rate limit headers on each response", async () => {
+    const app = buildApp();
+    const res = await request(app).post(ENDPOINT).send(VALID_BODY);
+    expect(res.headers["x-ratelimit-limit"]).toBe("3");
+    expect(res.headers["x-ratelimit-remaining"]).toBe("2");
+    expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+  });
+
+  it("returns 429 for every request beyond the threshold", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 3; i++) {
+      await request(app).post(ENDPOINT).send(VALID_BODY);
+    }
+    const extras = await Promise.all([
+      request(app).post(ENDPOINT).send(VALID_BODY),
+      request(app).post(ENDPOINT).send(VALID_BODY),
+    ]);
+    expect(extras[0].status).toBe(429);
+    expect(extras[1].status).toBe(429);
+    expect(extras[0].body.success).toBe(false);
+    expect(extras[1].body.success).toBe(false);
+  });
+
+  it("returns Content-Type: application/json on the 429 response", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 3; i++) {
+      await request(app).post(ENDPOINT).send(VALID_BODY);
+    }
+    const res = await request(app).post(ENDPOINT).send(VALID_BODY);
+    expect(res.status).toBe(429);
+    expect(res.headers["content-type"]).toMatch(/json/);
+  });
+
+  it("counts validation errors (400) against the rate limit bucket", async () => {
+    const app = buildApp();
+    await request(app).post(ENDPOINT).send({ sourceAddress: "bad" });
+    await request(app).post(ENDPOINT).send({ sourceAddress: "bad" });
+    await request(app).post(ENDPOINT).send({ sourceAddress: "bad" });
+    const res = await request(app).post(ENDPOINT).send(VALID_BODY).expect(429);
+    expect(res.headers["x-ratelimit-limit"]).toBe("3");
+  });
+
+  it("has independent buckets per IP address (uses req.ip)", async () => {
+    const app = express();
+    app.set("trust proxy", true);
+    app.use(express.json());
+    app.use("/api/jobs", router);
+
+    for (let i = 0; i < 3; i++) {
+      await request(app)
+        .post(ENDPOINT)
+        .set("X-Forwarded-For", "10.0.0.1")
+        .send(VALID_BODY);
+    }
+    const blocked = await request(app)
+      .post(ENDPOINT)
+      .set("X-Forwarded-For", "10.0.0.1")
+      .send(VALID_BODY);
+    const allowed = await request(app)
+      .post(ENDPOINT)
+      .set("X-Forwarded-For", "10.0.0.2")
+      .send(VALID_BODY);
+    expect(blocked.status).toBe(429);
+    expect(allowed.status).toBe(200);
+    expect(allowed.headers["x-ratelimit-remaining"]).toBe("2");
   });
 });
