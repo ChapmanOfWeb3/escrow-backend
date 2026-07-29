@@ -585,12 +585,13 @@ router.post(
 
 // ---------------------------------------------------------------------------
 // GET /api/jobs/:contractId/milestones/:index/time-remaining
+// Validates route parameters using contractMilestoneParamsSchema.
 // ---------------------------------------------------------------------------
 router.get(
   "/:contractId/milestones/:index/time-remaining",
-  validate(contractMilestoneParamsSchema, "params", (req) =>
-    logger.warn("Invalid params for time-remaining", { params: req.params }),
-  ),
+  validate(contractMilestoneParamsSchema, "params", (req) => {
+    logger.warn("Invalid params for time-remaining", { params: req.params });
+  }),
   async (req: Request, res: Response) => {
     try {
       const contractId = req.params.contractId as string;
