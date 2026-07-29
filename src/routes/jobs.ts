@@ -89,6 +89,42 @@ export function resetSubmitCache(): void {
   inFlightSubmitRequests.clear();
 }
 
+const BUILD_TX_CACHE_TTL = parseInt(
+  process.env.BUILD_TX_CACHE_TTL_S || "30",
+  10,
+);
+export const buildTxCache = new NodeCache({
+  stdTTL: BUILD_TX_CACHE_TTL,
+  useClones: false,
+});
+const inFlightBuildTxRequests = new Map<string, Promise<string>>();
+export function resetBuildTxCache(): void {
+  buildTxCache.flushAll();
+  inFlightBuildTxRequests.clear();
+}
+function buildTxCacheKey(
+  contractId: string,
+  method: string,
+  sourceAddress: string,
+  args: unknown[],
+): string {
+  return `${contractId}:${method}:${sourceAddress}:${JSON.stringify(args)}`;
+}
+
+const TIME_REMAINING_CACHE_TTL = parseInt(
+  process.env.TIME_REMAINING_CACHE_TTL_S || "15",
+  10,
+);
+export const timeRemainingCache = new NodeCache({
+  stdTTL: TIME_REMAINING_CACHE_TTL,
+  useClones: false,
+});
+const inFlightTimeRemainingRequests = new Map<string, Promise<number>>();
+export function resetTimeRemainingCache(): void {
+  timeRemainingCache.flushAll();
+  inFlightTimeRemainingRequests.clear();
+}
+
 // ---------------------------------------------------------------------------
 // Simulation error helpers  (#83)
 // ---------------------------------------------------------------------------
@@ -126,6 +162,18 @@ function classifySimError(rawError: string): { status: number; message: string }
 
   // 500 – everything else (never forward the raw error to the client)
   return { status: 500, message: "Internal server error" };
+}
+
+/**
+ * Carries an HTTP status + client-safe message out of an async cache/dedup
+ * block so the outer catch can respond correctly without re-classifying.
+ */
+class SimError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,8 +509,6 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const { contractId, method, args, sourceAddress } = req.body;
-      const contract = new Contract(contractId as string);
-      const account = await server.getAccount(sourceAddress as string);
 
       // Validate for whitelist management methods
       if (method === "add_whitelisted_token" || method === "remove_whitelisted_token") {
@@ -477,34 +523,72 @@ router.post(
         }
       }
 
-      const scArgs = (args || []).map((a: any) => {
-        if (a.type === "address") return Address.fromString(a.value).toScVal();
-        if (a.type === "i128") return nativeToScVal(BigInt(a.value), { type: "i128" });
-        if (a.type === "u32") return nativeToScVal(a.value, { type: "u32" });
-        if (a.type === "u64") return nativeToScVal(BigInt(a.value), { type: "u64" });
-        if (a.type === "bool") return nativeToScVal(a.value, { type: "bool" });
-        if (a.type === "vec") {
-          const vecElements = a.value.map((item: any) => {
-            if (item.type === "i128") return nativeToScVal(BigInt(item.value), { type: "i128" });
-            if (item.type === "u32") return nativeToScVal(item.value, { type: "u32" });
-            if (item.type === "u64") return nativeToScVal(BigInt(item.value), { type: "u64" });
-            return nativeToScVal(item.value);
+      const cacheKey = buildTxCacheKey(contractId, method, sourceAddress, args || []);
+
+      const cached = buildTxCache.get<string>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Build-tx XDR served from cache", { contractId, method });
+        res.json({ success: true, xdr: cached });
+        return;
+      }
+
+      let requestPromise = inFlightBuildTxRequests.get(cacheKey);
+      const servedFromInFlight = Boolean(requestPromise);
+
+      if (!requestPromise) {
+        requestPromise = (async (): Promise<string> => {
+          const contract = new Contract(contractId as string);
+          const account = await server.getAccount(sourceAddress as string);
+
+          const scArgs = (args || []).map((a: any) => {
+            if (a.type === "address") return Address.fromString(a.value).toScVal();
+            if (a.type === "i128") return nativeToScVal(BigInt(a.value), { type: "i128" });
+            if (a.type === "u32") return nativeToScVal(a.value, { type: "u32" });
+            if (a.type === "u64") return nativeToScVal(BigInt(a.value), { type: "u64" });
+            if (a.type === "bool") return nativeToScVal(a.value, { type: "bool" });
+            if (a.type === "vec") {
+              const vecElements = a.value.map((item: any) => {
+                if (item.type === "i128") return nativeToScVal(BigInt(item.value), { type: "i128" });
+                if (item.type === "u32") return nativeToScVal(item.value, { type: "u32" });
+                if (item.type === "u64") return nativeToScVal(BigInt(item.value), { type: "u64" });
+                return nativeToScVal(item.value);
+              });
+              return nativeToScVal(vecElements);
+            }
+            return nativeToScVal(a.value);
           });
-          return nativeToScVal(vecElements);
-        }
-        return nativeToScVal(a.value);
-      });
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(contract.call(method, ...scArgs))
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASE,
+          })
+            .addOperation(contract.call(method, ...scArgs))
+            .setTimeout(30)
+            .build();
 
-      const prepared = await server.prepareTransaction(tx);
-      res.json({ success: true, xdr: prepared.toXDR() });
+          const prepared = await server.prepareTransaction(tx);
+          const xdr = prepared.toXDR();
+          buildTxCache.set(cacheKey, xdr);
+          return xdr;
+        })();
+
+        inFlightBuildTxRequests.set(cacheKey, requestPromise);
+      }
+
+      let xdr: string;
+      try {
+        xdr = await requestPromise;
+      } catch (err: any) {
+        buildTxCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightBuildTxRequests.delete(cacheKey);
+      }
+
+      if (servedFromInFlight) {
+        logger.info("Build-tx XDR served from in-flight cache", { contractId, method });
+      }
+      res.json({ success: true, xdr });
     } catch (err: any) {
       logger.error("Failed to build transaction", { error: err?.message });
       res.status(500).json({ success: false, error: "Internal server error" });
@@ -592,37 +676,88 @@ router.get(
     logger.warn("Invalid params for time-remaining", { params: req.params }),
   ),
   async (req: Request, res: Response) => {
-    try {
-      const contractId = req.params.contractId as string;
-      const { index } = req.params;
-      const contract = new Contract(contractId);
-      const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(
-          contract.call(
-            "time_until_auto_release",
-            nativeToScVal(Number(index), { type: "u32" }),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+    const contractId = req.params.contractId as string;
+    const { index } = req.params;
 
-      const result = await server.simulateTransaction(tx);
-      if ("error" in result) {
-        const { status, message } = classifySimError(String(result.error));
-        logger.warn("Simulation error for time-remaining", { contractId, index, status });
-        sendError(res, status, message);
-      } else if ("result" in result && result.result?.retval) {
-        const secondsRemaining = Number(result.result.retval);
-        res.json({ success: true, secondsRemaining });
-      } else {
-        sendError(res, 500, "Internal server error");
+    const requiredApiKey = process.env.API_KEY;
+    if (requiredApiKey) {
+      const providedKey = req.header("x-api-key");
+      if (providedKey !== requiredApiKey) {
+        logger.warn("Unauthorized request", { contractId, index });
+        sendError(res, 401, "Unauthorized");
+        return;
       }
+    }
+
+    const cacheKey = `${contractId}:${index}`;
+
+    try {
+      const cached = timeRemainingCache.get<number>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Time remaining served from cache", { contractId, index });
+        sendSuccess(res, { secondsRemaining: cached });
+        return;
+      }
+
+      let requestPromise = inFlightTimeRemainingRequests.get(cacheKey);
+      const servedFromInFlight = Boolean(requestPromise);
+
+      if (!requestPromise) {
+        requestPromise = (async (): Promise<number> => {
+          const contract = new Contract(contractId);
+          const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASE,
+          })
+            .addOperation(
+              contract.call(
+                "time_until_auto_release",
+                nativeToScVal(Number(index), { type: "u32" }),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const result = await server.simulateTransaction(tx);
+
+          if ("error" in result) {
+            const { status, message } = classifySimError(String(result.error));
+            throw new SimError(status, message);
+          }
+          if ("result" in result && result.result?.retval) {
+            const secondsRemaining = Number(result.result.retval);
+            timeRemainingCache.set(cacheKey, secondsRemaining);
+            return secondsRemaining;
+          }
+          throw new SimError(500, "Internal server error");
+        })();
+
+        inFlightTimeRemainingRequests.set(cacheKey, requestPromise);
+      }
+
+      let secondsRemaining: number;
+      try {
+        secondsRemaining = await requestPromise;
+      } finally {
+        inFlightTimeRemainingRequests.delete(cacheKey);
+      }
+
+      if (servedFromInFlight) {
+        logger.info("Time remaining served from in-flight cache", { contractId, index });
+      }
+      sendSuccess(res, { secondsRemaining });
     } catch (err: any) {
-      logger.error("Failed to get time remaining", { error: err?.message });
+      if (err instanceof SimError) {
+        logger.warn("Simulation error for time-remaining", { contractId, index, status: err.status });
+        if (err.status === 404) {
+          sendError(res, 404, "Job not found");
+        } else {
+          sendError(res, err.status, err.message);
+        }
+        return;
+      }
+      logger.error("Failed to get time remaining", { contractId, index, error: err?.message });
       sendError(res, 500, "Internal server error");
     }
   },

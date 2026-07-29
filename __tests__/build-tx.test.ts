@@ -21,7 +21,7 @@ jest.unstable_mockModule("../src/utils/logger.js", () => ({
   default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-const { default: router } = await import("../src/routes/jobs.js");
+const { default: router, resetBuildTxCache } = await import("../src/routes/jobs.js");
 
 const app = express();
 app.use(express.json());
@@ -34,8 +34,12 @@ const VALID_BODY = {
   sourceAddress: "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX",
 };
 
+const VALID_ADDRESS = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
+const SECOND_ADDRESS = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H";
+
 describe("POST /api/jobs/build-tx — error sanitization (#70)", () => {
   beforeEach(() => {
+    resetBuildTxCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
 
@@ -170,5 +174,222 @@ describe("POST /api/jobs/build-tx — request payload schema validation (#101)",
     const res = await request(app).post("/api/jobs/build-tx").send(body as any).expect(400);
     expect(res.body.success).toBe(false);
     expect(res.body.error).toContain("Expected string, received boolean");
+  });
+});
+
+describe("POST /api/jobs/build-tx — whitelist management argument validation", () => {
+  beforeEach(() => {
+    resetBuildTxCache();
+    mockGetAccount.mockReset();
+    mockPrepareTransaction.mockReset();
+
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_BODY.sourceAddress,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+  });
+
+  it("returns 400 for add_whitelisted_token when no address args are provided", async () => {
+    const body = { ...VALID_BODY, method: "add_whitelisted_token", args: [] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error:
+        "Both admin (address) and token (address) arguments are required for whitelist management methods",
+    });
+    expect(mockPrepareTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for add_whitelisted_token when only one address arg is provided", async () => {
+    const body = {
+      ...VALID_BODY,
+      method: "add_whitelisted_token",
+      args: [{ type: "address", value: VALID_ADDRESS }],
+    };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("whitelist management methods");
+  });
+
+  it("returns 400 for remove_whitelisted_token when address args are missing", async () => {
+    const body = { ...VALID_BODY, method: "remove_whitelisted_token", args: [] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("whitelist management methods");
+  });
+
+  it("returns 200 for add_whitelisted_token when both admin and token address args are provided", async () => {
+    const body = {
+      ...VALID_BODY,
+      method: "add_whitelisted_token",
+      args: [
+        { type: "address", value: VALID_ADDRESS },
+        { type: "address", value: SECOND_ADDRESS },
+      ],
+    };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("returns 200 for remove_whitelisted_token when both admin and token address args are provided", async () => {
+    const body = {
+      ...VALID_BODY,
+      method: "remove_whitelisted_token",
+      args: [
+        { type: "address", value: VALID_ADDRESS },
+        { type: "address", value: SECOND_ADDRESS },
+      ],
+    };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+});
+
+describe("POST /api/jobs/build-tx — contract argument type mapping", () => {
+  beforeEach(() => {
+    resetBuildTxCache();
+    mockGetAccount.mockReset();
+    mockPrepareTransaction.mockReset();
+
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_BODY.sourceAddress,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+  });
+
+  it("builds a tx for an address-typed argument", async () => {
+    const body = { ...VALID_BODY, args: [{ type: "address", value: VALID_ADDRESS }] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("builds a tx for an i128-typed argument", async () => {
+    const body = { ...VALID_BODY, args: [{ type: "i128", value: "1000000000" }] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("builds a tx for a u32-typed argument", async () => {
+    const body = { ...VALID_BODY, args: [{ type: "u32", value: 5 }] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("builds a tx for a u64-typed argument", async () => {
+    const body = { ...VALID_BODY, args: [{ type: "u64", value: "123456789" }] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("builds a tx for a bool-typed argument", async () => {
+    const body = { ...VALID_BODY, args: [{ type: "bool", value: true }] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("builds a tx for a vec argument containing i128/u32/u64/default elements", async () => {
+    const body = {
+      ...VALID_BODY,
+      args: [
+        {
+          type: "vec",
+          value: [
+            { type: "i128", value: "100" },
+            { type: "u32", value: 2 },
+            { type: "u64", value: "300" },
+            { type: "bool", value: false },
+          ],
+        },
+      ],
+    };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+
+  it("builds a tx for an untyped/default argument", async () => {
+    const body = { ...VALID_BODY, args: [{ type: "string", value: "hello" }] };
+    const res = await request(app).post("/api/jobs/build-tx").send(body).expect(200);
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+  });
+});
+
+describe("POST /api/jobs/build-tx — in-memory caching (duplicate network hits)", () => {
+  beforeEach(() => {
+    resetBuildTxCache();
+    mockGetAccount.mockReset();
+    mockPrepareTransaction.mockReset();
+
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_BODY.sourceAddress,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+  });
+
+  it("serves a second identical request from cache without hitting the RPC again", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(app).post("/api/jobs/build-tx").send(VALID_BODY).expect(200);
+    const second = await request(app).post("/api/jobs/build-tx").send(VALID_BODY).expect(200);
+
+    expect(second.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+    expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates concurrent identical requests into a single RPC round-trip", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const results = await Promise.all([
+      request(app).post("/api/jobs/build-tx").send(VALID_BODY),
+      request(app).post("/api/jobs/build-tx").send(VALID_BODY),
+      request(app).post("/api/jobs/build-tx").send(VALID_BODY),
+    ]);
+
+    for (const res of results) {
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+    }
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+    expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats requests with different method/args/sourceAddress as distinct cache entries", async () => {
+    mockPrepareTransaction
+      .mockResolvedValueOnce({ toXDR: () => "AAAA_FIRST" })
+      .mockResolvedValueOnce({ toXDR: () => "AAAA_SECOND" });
+
+    const first = await request(app).post("/api/jobs/build-tx").send(VALID_BODY).expect(200);
+    const second = await request(app)
+      .post("/api/jobs/build-tx")
+      .send({ ...VALID_BODY, method: "release_milestone" })
+      .expect(200);
+
+    expect(first.body.xdr).toBe("AAAA_FIRST");
+    expect(second.body.xdr).toBe("AAAA_SECOND");
+    expect(mockPrepareTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache a failed build, so the next identical request retries the RPC", async () => {
+    mockPrepareTransaction
+      .mockRejectedValueOnce(new Error("simulation failed"))
+      .mockResolvedValueOnce({ toXDR: () => "AAAAAQ==" });
+
+    const first = await request(app).post("/api/jobs/build-tx").send(VALID_BODY).expect(500);
+    expect(first.body).toEqual({ success: false, error: "Internal server error" });
+
+    const second = await request(app).post("/api/jobs/build-tx").send(VALID_BODY).expect(200);
+    expect(second.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+
+    expect(mockPrepareTransaction).toHaveBeenCalledTimes(2);
   });
 });
