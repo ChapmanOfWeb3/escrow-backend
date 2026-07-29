@@ -351,6 +351,7 @@ router.get(
     const contractId = req.params.contractId as string;
 
     try {
+      // Check API key authorization
       const requiredApiKey = process.env.API_KEY;
       if (requiredApiKey) {
         const providedKey = req.header("x-api-key");
@@ -361,6 +362,7 @@ router.get(
         }
       }
 
+      // Check cache
       const cached = whitelistCache.get<string[]>(contractId);
       if (cached !== undefined) {
         logger.info("Whitelisted tokens served from cache", { contractId, tokenCount: cached.length });
@@ -368,6 +370,7 @@ router.get(
         return;
       }
 
+      // Check in-flight requests
       const inFlight = inFlightWhitelistRequests.get(contractId);
       if (inFlight) {
         const tokens = await inFlight;
@@ -376,49 +379,70 @@ router.get(
         return;
       }
 
+      // Fetch whitelisted tokens from contract
       const requestPromise = (async (): Promise<string[]> => {
-        const contract = new Contract(contractId as string);
-        const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
-        const tx = new TransactionBuilder(account, {
-          fee: BASE_FEE,
-          networkPassphrase: NETWORK_PASSPHRASE,
-        })
-          .addOperation(contract.call("get_whitelisted_tokens"))
-          .setTimeout(30)
-          .build();
+        try {
+          const contract = new Contract(contractId as string);
+          const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASE,
+          })
+            .addOperation(contract.call("get_whitelisted_tokens"))
+            .setTimeout(30)
+            .build();
 
-        const result = await server.simulateTransaction(tx);
+          const result = await server.simulateTransaction(tx);
 
-        if ("error" in result) {
-          const errorMsg = String(result.error);
-          if (errorMsg.includes("contract error #2") || errorMsg.includes("NotInitialized")) {
-            whitelistCache.set(contractId, []);
-            logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: 0 });
-            return [];
+          // Handle simulation error
+          if ("error" in result) {
+            const errorMsg = String(result.error);
+            // Contract not initialized: return empty token list
+            if (errorMsg.includes("contract error #2") || errorMsg.includes("NotInitialized")) {
+              whitelistCache.set(contractId, []);
+              logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: 0 });
+              return [];
+            }
+            // Contract not found on network
+            if (
+              /not found|NotFound|contract not found/i.test(errorMsg) ||
+              /contract error #1\b/i.test(errorMsg)
+            ) {
+              throw new Error("not found");
+            }
+            // Unexpected simulation error: log details server-side, throw generic error
+            logger.error("Failed to fetch whitelisted tokens: simulation error", { contractId, error: errorMsg });
+            throw new Error("InternalServerError");
           }
-          if (
-            /not found|NotFound|contract not found/i.test(errorMsg) ||
-            /contract error #1\b/i.test(errorMsg)
-          ) {
-            throw new Error("not found");
+
+          // Parse successful result
+          if ("result" in result && result.result?.retval) {
+            const tokens: string[] = [];
+            const vec = result.result.retval as any;
+            if (typeof vec.forEach === "function") {
+              vec.forEach((token: any) => tokens.push(token.toString()));
+            }
+            whitelistCache.set(contractId, tokens);
+            logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: tokens.length });
+            return tokens;
           }
-          logger.error("Failed to fetch whitelisted tokens", { contractId, error: errorMsg });
+
+          // Unexpected result structure
+          logger.error("Failed to fetch whitelisted tokens: unexpected retval structure", { contractId });
+          throw new Error("InternalServerError");
+        } catch (promiseErr: any) {
+          const errMsg = promiseErr?.message ?? String(promiseErr);
+          // Re-throw known errors to be caught by outer handler
+          if (errMsg === "not found" || errMsg === "InternalServerError") {
+            throw promiseErr;
+          }
+          // Log unexpected errors server-side without leaking details to client
+          logger.error("Failed to fetch whitelisted tokens: unexpected error", {
+            contractId,
+            error: errMsg,
+          });
           throw new Error("InternalServerError");
         }
-
-        if ("result" in result && result.result?.retval) {
-          const tokens: string[] = [];
-          const vec = result.result.retval as any;
-          if (typeof vec.forEach === "function") {
-            vec.forEach((token: any) => tokens.push(token.toString()));
-          }
-          whitelistCache.set(contractId, tokens);
-          logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: tokens.length });
-          return tokens;
-        }
-
-        logger.error("Failed to fetch whitelisted tokens", { contractId, error: "unexpected empty retval" });
-        throw new Error("InternalServerError");
       })();
 
       inFlightWhitelistRequests.set(contractId, requestPromise);
@@ -431,18 +455,21 @@ router.get(
 
       sendSuccess(res, { tokens });
     } catch (err: any) {
+      // Robust error handling with no stack trace leakage
       const message = err?.message ?? "Internal server error";
-      if (/unauthorized|401/i.test(message)) {
-        logger.error("Failed to fetch whitelisted tokens", { contractId, error: message });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-      if (/not found|404/i.test(message)) {
+
+      // 404: Contract not found
+      if (/not found/i.test(message)) {
         logger.warn("Job not found", { contractId });
         sendError(res, 404, "Job not found");
         return;
       }
-      logger.error("Failed to fetch whitelisted tokens", { contractId, error: message });
+
+      // 500: All unexpected errors (InternalServerError or anything else)
+      logger.error("Failed to fetch whitelisted tokens: unexpected error", {
+        contractId,
+        error: message,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
