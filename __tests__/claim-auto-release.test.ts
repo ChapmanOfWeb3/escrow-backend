@@ -71,6 +71,18 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
     expect(res.body.error).toMatch(/index/i);
   });
 
+  it("returns 400 for a negative index", async () => {
+    const res = await request(buildApp())
+      .post(`/api/jobs/${VALID_CONTRACT}/milestones/-1/claim-auto-release`)
+      .send(VALID_BODY)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "index must be a non-negative integer",
+    });
+  });
+
   it("returns 400 when sourceAddress is missing", async () => {
     const res = await request(buildApp())
       .post(ENDPOINT)
@@ -103,6 +115,16 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
 
     expect(res.body.success).toBe(false);
     expect(res.body.error).toMatch(/sourceAddress/i);
+  });
+
+  it("returns 400 when the request body contains extra fields", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send({ sourceAddress: VALID_ADDRESS, extraField: "not-allowed" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/unrecognized key/i);
   });
 
   it("returns 200 with XDR on valid input", async () => {
