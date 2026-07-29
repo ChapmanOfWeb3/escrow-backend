@@ -31,6 +31,7 @@ import type { RequestWithValidatedQuery } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
   contractMilestoneParamsSchema,
+  // Schema for building transaction requests
   buildTxBodySchema,
   submitBodySchema,
   partialReleaseBodySchema,
@@ -459,6 +460,9 @@ router.post(
   "/build-tx",
   buildTxRateLimit,
   validateWithFields(buildTxBodySchema, "body", (req) =>
+  strictLimiter,
+  // Schema validation for POST /api/jobs/build-tx payload
+  validate(buildTxBodySchema, "body", (req) =>
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
@@ -526,9 +530,31 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const { contractId, index } = req.params;
+
+      const requiredApiKey = process.env.API_KEY;
+      if (requiredApiKey) {
+        const providedKey = req.header("x-api-key");
+        if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized request", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+      }
+
       const { amount, sourceAddress } = req.body;
       const contract = new Contract(contractId as string);
-      const account = await server.getAccount(sourceAddress as string);
+
+      let account;
+      try {
+        account = await server.getAccount(sourceAddress as string);
+      } catch (err: any) {
+        const errMsg = String(err?.message || err);
+        const { status, message } = classifySimError(errMsg);
+        logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+        sendError(res, status, message);
+        return;
+      }
+
       const amountNum = BigInt(amount);
 
       const tx = new TransactionBuilder(account, {
@@ -544,10 +570,22 @@ router.post(
         .setTimeout(30)
         .build();
 
-      const prepared = await server.prepareTransaction(tx);
+      let prepared;
+      try {
+        prepared = await server.prepareTransaction(tx);
+      } catch (err: any) {
+        const errMsg = String(err?.message || err);
+        const { status, message } = classifySimError(errMsg);
+        logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+        sendError(res, status, message);
+        return;
+      }
+
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      const errMsg = String(err?.message || err);
+      logger.error("Unexpected error in partial release", { error: errMsg });
+      sendError(res, 500, "Internal server error");
     }
   }
 );
