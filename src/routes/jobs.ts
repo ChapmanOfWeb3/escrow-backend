@@ -15,6 +15,7 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  timeRemainingRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
@@ -23,6 +24,8 @@ import {
   createJobDraftSecurityHeaders,
   submitCors,
   submitSecurityHeaders,
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate } from "../middleware/validate.js";
@@ -30,6 +33,7 @@ import type { RequestWithValidatedQuery } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
   contractMilestoneParamsSchema,
+  // Schema for building transaction requests
   buildTxBodySchema,
   submitBodySchema,
   partialReleaseBodySchema,
@@ -453,6 +457,7 @@ router.get(
 router.post(
   "/build-tx",
   strictLimiter,
+  // Schema validation for POST /api/jobs/build-tx payload
   validate(buildTxBodySchema, "body", (req) =>
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
@@ -521,9 +526,31 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const { contractId, index } = req.params;
+
+      const requiredApiKey = process.env.API_KEY;
+      if (requiredApiKey) {
+        const providedKey = req.header("x-api-key");
+        if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized request", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+      }
+
       const { amount, sourceAddress } = req.body;
       const contract = new Contract(contractId as string);
-      const account = await server.getAccount(sourceAddress as string);
+
+      let account;
+      try {
+        account = await server.getAccount(sourceAddress as string);
+      } catch (err: any) {
+        const errMsg = String(err?.message || err);
+        const { status, message } = classifySimError(errMsg);
+        logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+        sendError(res, status, message);
+        return;
+      }
+
       const amountNum = BigInt(amount);
 
       const tx = new TransactionBuilder(account, {
@@ -539,19 +566,35 @@ router.post(
         .setTimeout(30)
         .build();
 
-      const prepared = await server.prepareTransaction(tx);
+      let prepared;
+      try {
+        prepared = await server.prepareTransaction(tx);
+      } catch (err: any) {
+        const errMsg = String(err?.message || err);
+        const { status, message } = classifySimError(errMsg);
+        logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+        sendError(res, status, message);
+        return;
+      }
+
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      const errMsg = String(err?.message || err);
+      logger.error("Unexpected error in partial release", { error: errMsg });
+      sendError(res, 500, "Internal server error");
     }
   }
 );
 
 // ---------------------------------------------------------------------------
 // GET /api/jobs/:contractId/milestones/:index/time-remaining
+// Validates route parameters using contractMilestoneParamsSchema.
 // ---------------------------------------------------------------------------
 router.get(
   "/:contractId/milestones/:index/time-remaining",
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
+  timeRemainingRateLimit,
   validate(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for time-remaining", { params: req.params }),
   ),
@@ -559,6 +602,14 @@ router.get(
     try {
       const contractId = req.params.contractId as string;
       const { index } = req.params;
+
+      logger.debug("GET time-remaining request", {
+        contractId,
+        index,
+        ip: req.ip ?? req.socket?.remoteAddress,
+        requestId: (req as any).requestId,
+      });
+
       const contract = new Contract(contractId);
       const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
       const tx = new TransactionBuilder(account, {
@@ -577,16 +628,40 @@ router.get(
       const result = await server.simulateTransaction(tx);
       if ("error" in result) {
         const { status, message } = classifySimError(String(result.error));
-        logger.warn("Simulation error for time-remaining", { contractId, index, status });
+        logger.warn("Simulation error for time-remaining", {
+          contractId,
+          index,
+          status,
+          error: String(result.error),
+          requestId: (req as any).requestId,
+        });
         sendError(res, status, message);
       } else if ("result" in result && result.result?.retval) {
         const secondsRemaining = Number(result.result.retval);
+        logger.info("Time-remaining retrieved successfully", {
+          contractId,
+          index,
+          secondsRemaining,
+          requestId: (req as any).requestId,
+        });
         res.json({ success: true, secondsRemaining });
       } else {
+        logger.warn("Unexpected simulation result for time-remaining", {
+          contractId,
+          index,
+          result: JSON.stringify(result),
+          requestId: (req as any).requestId,
+        });
         sendError(res, 500, "Internal server error");
       }
     } catch (err: any) {
-      logger.error("Failed to get time remaining", { error: err?.message });
+      logger.error("Failed to get time remaining", {
+        error: err?.message,
+        contractId: req.params.contractId,
+        index: req.params.index,
+        stack: err?.stack,
+        requestId: (req as any).requestId,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
