@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { TransactionBuilder } from "@stellar/stellar-sdk";
 
 const mockSendTransaction = jest.fn<() => Promise<unknown>>();
 const mockTx = { toXDR: () => "mock-xdr" };
@@ -15,6 +16,11 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
     sendTransaction = mockSendTransaction;
   },
 }));
+
+jest.unstable_mockModule("../src/utils/logger.js", () => ({
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+}));
+
 
 jest.unstable_mockModule("@stellar/stellar-sdk", () => ({
   TransactionBuilder: {
