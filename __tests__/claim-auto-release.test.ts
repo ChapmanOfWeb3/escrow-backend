@@ -15,10 +15,12 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
   },
 }));
 
+jest.unstable_mockModule("../src/utils/logger.js", () => ({
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+}));
+
 const { default: router, resetClaimAutoReleaseCache } = await import("../src/routes/jobs.js");
-const { resetClaimAutoReleaseRateLimitBuckets } = await import(
-  "../src/middleware/job-contract-rate-limit.js"
-);
+const { default: mockLogger } = await import("../src/utils/logger.js");
 
 function buildApp() {
   const app = express();
@@ -59,10 +61,8 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .send(VALID_BODY)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "index must be a non-negative integer",
-    });
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("index must be a non-negative integer");
   });
 
   it("returns 400 for a decimal index", async () => {
@@ -72,7 +72,19 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/index/i);
+    expect(res.body.error).toBe("ValidationError");
+  });
+
+  it("returns 400 for a negative index", async () => {
+    const res = await request(buildApp())
+      .post(`/api/jobs/${VALID_CONTRACT}/milestones/-1/claim-auto-release`)
+      .send(VALID_BODY)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "index must be a non-negative integer",
+    });
   });
 
   it("returns 400 when sourceAddress is missing", async () => {
@@ -81,10 +93,8 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .send({})
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "sourceAddress is required",
-    });
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("sourceAddress is required");
   });
 
   it("returns 400 when sourceAddress is not a valid Stellar account address", async () => {
@@ -93,10 +103,8 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .send({ sourceAddress: "not-a-stellar-address" })
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "sourceAddress must be a valid Stellar account address (G...)",
-    });
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar account address/i);
   });
 
   it("returns 400 when sourceAddress is a contract address (C...)", async () => {
@@ -106,7 +114,17 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/sourceAddress/i);
+    expect(res.body.error).toBe("ValidationError");
+  });
+
+  it("returns 400 when the request body contains extra fields", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send({ sourceAddress: VALID_ADDRESS, extraField: "not-allowed" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/unrecognized key/i);
   });
 
   it("returns 200 with XDR on valid input", async () => {
@@ -153,6 +171,559 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
 
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockPrepareTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when sourceAddress is a muxed (M...) address", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send({ sourceAddress: "MA7QYNF7SOWQ3GLR2BGMZEHXAVSVJHF3G7SPMYRRLZDDZY6E5CTXJHXAAAAAAAAAAAAAAJLNU" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/sourceAddress/i);
+  });
+
+  // ── unhandled exception path (try/catch wrapper, #134) ───────────────────
+
+  it("returns sanitized 500 when getAccount throws (no leak)", async () => {
+    mockGetAccount.mockRejectedValue(new Error("connection refused - detail"));
+
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+    expect(res.text).not.toContain("connection refused");
+    expect(res.text).not.toContain("stack");
+  });
+
+  it("returns sanitized 500 when prepareTransaction throws (no leak)", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("Database connection timeout"));
+
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+    expect(res.text).not.toContain("Database connection timeout");
+  });
+
+  it("never includes stack traces in 500 responses", async () => {
+    const stackError = new Error("boom");
+    stackError.stack = "Error: boom\n    at Object.<anonymous> (/app/src/file.ts:1:1)";
+    mockGetAccount.mockRejectedValue(stackError);
+
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+    expect(res.text).not.toContain("/app/src");
+    expect(res.text).not.toContain("file.ts");
+    expect(res.text).not.toContain("at ");
+  });
+
+  it("evicts the cache entry and allows retry after a failed request", async () => {
+    mockPrepareTransaction.mockRejectedValueOnce(new Error("temporary RPC failure"));
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    mockPrepareTransaction.mockResolvedValueOnce({ toXDR: () => "AAAAAQ==" });
+    const res = await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+    expect(mockPrepareTransaction).toHaveBeenCalledTimes(2);
+  });
+});
+
+function infoCallsFor(msg: string) {
+  return (mockLogger.info as ReturnType<typeof jest.fn>).mock.calls.filter(
+    ([m]) => m === msg,
+  );
+}
+
+function debugCallsFor(msg: string) {
+  return (mockLogger.debug as ReturnType<typeof jest.fn>).mock.calls.filter(
+    ([m]) => m === msg,
+  );
+}
+
+describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – trace logging", () => {
+  beforeEach(() => {
+    resetClaimAutoReleaseCache();
+    mockGetAccount.mockReset();
+    mockPrepareTransaction.mockReset();
+    (mockLogger.info as ReturnType<typeof jest.fn>).mockClear();
+    (mockLogger.warn as ReturnType<typeof jest.fn>).mockClear();
+    (mockLogger.error as ReturnType<typeof jest.fn>).mockClear();
+    (mockLogger.debug as ReturnType<typeof jest.fn>).mockClear();
+
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_ADDRESS,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+  });
+
+  it("logs request received with path vars (contractId, index, sourceAddress) and traceId", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = infoCallsFor("Claim auto-release request received");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+  });
+
+  it("logs response sent with status=200 on success (RPC-built XDR) and includes all path vars + success", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = infoCallsFor("Claim auto-release response sent");
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+
+    const last = calls[calls.length - 1] as [string, Record<string, unknown>];
+    const [, meta] = last;
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.status).toBe(200);
+    expect(meta.success).toBe(true);
+    expect(meta.cached).toBe(false);
+    expect(meta.xdrLength).toBe("AAAAAQ==".length);
+    expect(meta.error).toBeUndefined();
+  });
+
+  it("logs XDR built successfully on RPC build path with xdrLength + path vars", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = infoCallsFor("Claim auto-release XDR built successfully");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.xdrLength).toBe("AAAAAQ==".length);
+  });
+
+  it("logs Fetching XDR from Stellar RPC before each RPC call", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = infoCallsFor("Fetching claim auto-release XDR from Stellar RPC");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+  });
+
+  it("logs cache-hit served with source=cache, xdrLength, and traceId", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    const app = buildApp();
+
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+    (mockLogger.info as ReturnType<typeof jest.fn>).mockClear();
+
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = infoCallsFor("Claim auto-release XDR served from cache");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.source).toBe("cache");
+    expect(meta.xdrLength).toBe("AAAAAQ==".length);
+  });
+
+  it("logs response sent with cached=true on cache hit and includes all path vars + success", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    const app = buildApp();
+
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+    (mockLogger.info as ReturnType<typeof jest.fn>).mockClear();
+
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const sent = infoCallsFor("Claim auto-release response sent");
+    expect(sent).toHaveLength(1);
+
+    const [, meta] = sent[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.status).toBe(200);
+    expect(meta.success).toBe(true);
+    expect(meta.cached).toBe(true);
+    expect(meta.xdrLength).toBe("AAAAAQ==".length);
+  });
+
+  it("logs in-flight hit with source=in-flight on concurrent dedup", async () => {
+    mockPrepareTransaction.mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve({ toXDR: () => "AAAAAQ==" }), 20)),
+    );
+    const app = buildApp();
+
+    await Promise.all([
+      request(app).post(ENDPOINT).send(VALID_BODY),
+      request(app).post(ENDPOINT).send(VALID_BODY),
+    ]);
+
+    const calls = infoCallsFor("Claim auto-release XDR served from in-flight cache");
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.source).toBe("in-flight");
+    expect(meta.xdrLength).toBe("AAAAAQ==".length);
+  });
+
+  it("logs Failed with traceId, path vars, and error message on RPC failure", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("rpc boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const errCalls = (mockLogger.error as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Failed to build claim-auto-release tx",
+    );
+    expect(errCalls).toHaveLength(1);
+
+    const [, meta] = errCalls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.error).toBe("rpc boom");
+  });
+
+  it("logs response sent with status=500 + error on RPC failure and includes all path vars + success=false", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("rpc boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const calls = infoCallsFor("Claim auto-release response sent");
+    const last = calls[calls.length - 1] as [string, Record<string, unknown>];
+    const [, meta] = last;
+
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.status).toBe(500);
+    expect(meta.success).toBe(false);
+    expect(meta.error).toBe("rpc boom");
+  });
+
+  it("traceId on request received matches traceId on built-successfully log", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const receivedId = (infoCallsFor("Claim auto-release request received")[0] as [string, Record<string, unknown>])[1].traceId;
+    const successId = (infoCallsFor("Claim auto-release XDR built successfully")[0] as [string, Record<string, unknown>])[1].traceId;
+
+    expect(typeof receivedId).toBe("string");
+    expect(receivedId).toBe(successId);
+  });
+
+  it("traceId on request received matches traceId on error log (same request)", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const receivedId = (infoCallsFor("Claim auto-release request received")[0] as [string, Record<string, unknown>])[1].traceId;
+    const errCalls = (mockLogger.error as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Failed to build claim-auto-release tx",
+    );
+    const errorId = (errCalls[0] as [string, Record<string, unknown>])[1].traceId;
+
+    expect(receivedId).toBe(errorId);
+  });
+
+  it("traceId on request received matches traceId on response-sent log", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const receivedId = (infoCallsFor("Claim auto-release request received")[0] as [string, Record<string, unknown>])[1].traceId;
+    const sent = infoCallsFor("Claim auto-release response sent");
+    const lastSent = sent[sent.length - 1] as [string, Record<string, unknown>];
+
+    expect(lastSent[1].traceId).toBe(receivedId);
+  });
+
+  it("does not log XDR built successfully on RPC failure", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("network down"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    expect(infoCallsFor("Claim auto-release XDR built successfully")).toHaveLength(0);
+  });
+
+  it("does not log Failed to build on success path", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const errCalls = (mockLogger.error as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Failed to build claim-auto-release tx",
+    );
+    expect(errCalls).toHaveLength(0);
+  });
+
+  it("uses non-negative xdrLength for every success-path info call meta", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    const app = buildApp();
+
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const msgs = [
+      "Claim auto-release request received",
+      "Fetching claim auto-release XDR from Stellar RPC",
+      "Claim auto-release XDR built successfully",
+      "Claim auto-release XDR served from cache",
+      "Claim auto-release response sent",
+    ];
+
+    for (const msg of msgs) {
+      for (const call of infoCallsFor(msg)) {
+        const meta = call[1] as Record<string, unknown>;
+        const id = meta.traceId as string;
+        expect(typeof id).toBe("string");
+        expect(id.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("warn validation log contains the invalid params on bad contractId", async () => {
+    await request(buildApp())
+      .post("/api/jobs/not-a-valid-contract/milestones/0/claim-auto-release")
+      .send(VALID_BODY)
+      .expect(400);
+
+    const warnCalls = (mockLogger.warn as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Invalid params for claim-auto-release",
+    );
+    expect(warnCalls).toHaveLength(1);
+    const [, meta] = warnCalls[0] as [string, Record<string, unknown>];
+    expect((meta.params as Record<string, unknown>).contractId).toBe("not-a-valid-contract");
+  });
+
+  it("warn validation log contains invalid body on bad sourceAddress", async () => {
+    const badBody = { sourceAddress: "bad" };
+    await request(buildApp()).post(ENDPOINT).send(badBody).expect(400);
+
+    const warnCalls = (mockLogger.warn as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Invalid body for claim-auto-release",
+    );
+    expect(warnCalls).toHaveLength(1);
+    const [, meta] = warnCalls[0] as [string, Record<string, unknown>];
+    expect(meta.body).toEqual(badBody);
+  });
+
+  it("trace: logs handler entered with path vars and params", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = debugCallsFor("Claim auto-release handler entered");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect((meta.params as Record<string, unknown>).contractId).toBe(VALID_CONTRACT);
+    expect(Array.isArray(meta.bodyKeys)).toBe(true);
+    expect((meta.bodyKeys as string[]).includes("sourceAddress")).toBe(true);
+  });
+
+  it("trace: logs cache check with cacheKey on every request", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = debugCallsFor("Checking claim auto-release cache");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(typeof meta.cacheKey).toBe("string");
+    expect(meta.cacheKey).toBe(`${VALID_CONTRACT}:0:${VALID_ADDRESS}`);
+  });
+
+  it("trace: logs response body prepared with success and xdrLength on RPC success", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = debugCallsFor("Claim auto-release response body prepared");
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+
+    const last = calls[calls.length - 1] as [string, Record<string, unknown>];
+    const [, meta] = last;
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.success).toBe(true);
+    expect(meta.xdrLength).toBe("AAAAAQ==".length);
+  });
+
+  it("trace: logs response body prepared with success + xdrLength on cache hit", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    const app = buildApp();
+
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+    (mockLogger.debug as ReturnType<typeof jest.fn>).mockClear();
+
+    await request(app).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const calls = debugCallsFor("Claim auto-release response body prepared");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.success).toBe(true);
+    expect(meta.xdrLength).toBe("AAAAAQ==".length);
+  });
+
+  it("trace: logs in-flight check and register/unregister around RPC call", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    expect(debugCallsFor("Checking in-flight claim auto-release requests")).toHaveLength(1);
+    expect(debugCallsFor("In-flight promise registered")).toHaveLength(1);
+    expect(debugCallsFor("In-flight promise unregistered")).toHaveLength(1);
+
+    const reg = debugCallsFor("In-flight promise registered")[0] as [string, Record<string, unknown>];
+    expect(reg[1].contractId).toBe(VALID_CONTRACT);
+    expect(reg[1].index).toBe(0);
+    expect(reg[1].sourceAddress).toBe(VALID_ADDRESS);
+    expect(typeof reg[1].cacheKey).toBe("string");
+  });
+
+  it("trace: logs building transaction steps during RPC build", async () => {
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(200);
+
+    const buildCalls = debugCallsFor("Building Stellar transaction for claim auto-release");
+    expect(buildCalls).toHaveLength(1);
+    const [, buildMeta] = buildCalls[0] as [string, Record<string, unknown>];
+    expect(buildMeta.contractId).toBe(VALID_CONTRACT);
+    expect(buildMeta.index).toBe(0);
+    expect(buildMeta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(buildMeta.fee).toBeDefined();
+    expect(buildMeta.timeout).toBe(30);
+
+    expect(debugCallsFor("Fetching Stellar account")).toHaveLength(1);
+    expect(debugCallsFor("Stellar account fetched")).toHaveLength(1);
+    expect(debugCallsFor("Calling prepareTransaction on Stellar RPC")).toHaveLength(1);
+    expect(debugCallsFor("Storing claim auto-release XDR in cache")).toHaveLength(1);
+
+    const storeCalls = debugCallsFor("Storing claim auto-release XDR in cache");
+    const [, storeMeta] = storeCalls[0] as [string, Record<string, unknown>];
+    expect(storeMeta.xdrLength).toBe("AAAAAQ==".length);
+    expect(typeof storeMeta.ttlSeconds).toBe("number");
+  });
+
+  it("trace: logs error caught with stack + path vars on RPC failure", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("rpc boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const calls = debugCallsFor("Claim auto-release error caught");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(typeof meta.traceId).toBe("string");
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.error).toBe("rpc boom");
+    expect(typeof meta.stack).toBe("string");
+  });
+
+  it("trace: logs RPC promise rejected with cache clear on failure", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("rpc boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const calls = debugCallsFor("RPC promise rejected, clearing cache entry");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.error).toBe("rpc boom");
+  });
+
+  it("trace: logs error response body prepared with success=false + client message", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("rpc boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const calls = debugCallsFor("Claim auto-release error response body prepared");
+    expect(calls).toHaveLength(1);
+
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.success).toBe(false);
+    expect(meta.clientError).toBe("Internal server error");
+  });
+
+  it("trace: error log includes stack trace alongside message and path vars", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("rpc boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const errCalls = (mockLogger.error as ReturnType<typeof jest.fn>).mock.calls.filter(
+      ([m]) => m === "Failed to build claim-auto-release tx",
+    );
+    expect(errCalls).toHaveLength(1);
+
+    const [, meta] = errCalls[0] as [string, Record<string, unknown>];
+    expect(meta.contractId).toBe(VALID_CONTRACT);
+    expect(meta.index).toBe(0);
+    expect(meta.sourceAddress).toBe(VALID_ADDRESS);
+    expect(meta.error).toBe("rpc boom");
+    expect(typeof meta.stack).toBe("string");
+    expect((meta.stack as string).includes("Error: rpc boom")).toBe(true);
+  });
+
+  it("trace: traceId on handler entry matches traceId on error caught", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("boom"));
+
+    await request(buildApp()).post(ENDPOINT).send(VALID_BODY).expect(500);
+
+    const entryId = (debugCallsFor("Claim auto-release handler entered")[0] as [string, Record<string, unknown>])[1].traceId;
+    const errCatchId = (debugCallsFor("Claim auto-release error caught")[0] as [string, Record<string, unknown>])[1].traceId;
+
+    expect(typeof entryId).toBe("string");
+    expect(entryId).toBe(errCatchId);
   });
 });
 
