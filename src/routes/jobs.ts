@@ -588,6 +588,7 @@ router.post(
 
 // ---------------------------------------------------------------------------
 // GET /api/jobs/:contractId/milestones/:index/time-remaining
+// Validates route parameters using contractMilestoneParamsSchema.
 // ---------------------------------------------------------------------------
 router.get(
   "/:contractId/milestones/:index/time-remaining",
