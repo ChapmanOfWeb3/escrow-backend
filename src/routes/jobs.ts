@@ -27,6 +27,8 @@ import {
   submitSecurityHeaders,
   timeRemainingCors,
   timeRemainingSecurityHeaders,
+  byWalletCors,
+  byWalletSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
@@ -389,68 +391,55 @@ router.get(
 
       // Fetch whitelisted tokens from contract
       const requestPromise = (async (): Promise<string[]> => {
-        try {
-          const contract = new Contract(contractId as string);
-          const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
-          const tx = new TransactionBuilder(account, {
-            fee: BASE_FEE,
-            networkPassphrase: NETWORK_PASSPHRASE,
-          })
-            .addOperation(contract.call("get_whitelisted_tokens"))
-            .setTimeout(30)
-            .build();
+        const contract = new Contract(contractId as string);
+        const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(contract.call("get_whitelisted_tokens"))
+          .setTimeout(30)
+          .build();
 
-          const result = await server.simulateTransaction(tx);
+        const result = await server.simulateTransaction(tx);
 
-          // Handle simulation error
-          if ("error" in result) {
-            const errorMsg = String(result.error);
-            // Contract not initialized: return empty token list
-            if (errorMsg.includes("contract error #2") || errorMsg.includes("NotInitialized")) {
-              whitelistCache.set(contractId, []);
-              logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: 0 });
-              return [];
-            }
-            // Contract not found on network
-            if (
-              /not found|NotFound|contract not found/i.test(errorMsg) ||
-              /contract error #1\b/i.test(errorMsg)
-            ) {
-              throw new Error("not found");
-            }
-            // Unexpected simulation error: log details server-side, throw generic error
-            logger.error("Failed to fetch whitelisted tokens: simulation error", { contractId, error: errorMsg });
-            throw new Error("InternalServerError");
+        // Handle simulation error
+        if ("error" in result) {
+          const errorMsg = String(result.error);
+          // Contract not initialized: return empty token list
+          if (errorMsg.includes("contract error #2") || errorMsg.includes("NotInitialized")) {
+            whitelistCache.set(contractId, []);
+            logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: 0 });
+            return [];
           }
-
-          // Parse successful result
-          if ("result" in result && result.result?.retval) {
-            const tokens: string[] = [];
-            const vec = result.result.retval as any;
-            if (typeof vec.forEach === "function") {
-              vec.forEach((token: any) => tokens.push(token.toString()));
-            }
-            whitelistCache.set(contractId, tokens);
-            logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: tokens.length });
-            return tokens;
+          // Contract not found on network
+          if (
+            /not found|NotFound|contract not found/i.test(errorMsg) ||
+            /contract error #1\b/i.test(errorMsg)
+          ) {
+            throw new Error("not found");
           }
-
-          // Unexpected result structure
-          logger.error("Failed to fetch whitelisted tokens: unexpected retval structure", { contractId });
-          throw new Error("InternalServerError");
-        } catch (promiseErr: any) {
-          const errMsg = promiseErr?.message ?? String(promiseErr);
-          // Re-throw known errors to be caught by outer handler
-          if (errMsg === "not found" || errMsg === "InternalServerError") {
-            throw promiseErr;
-          }
-          // Log unexpected errors server-side without leaking details to client
-          logger.error("Failed to fetch whitelisted tokens: unexpected error", {
-            contractId,
-            error: errMsg,
-          });
-          throw new Error("InternalServerError");
+          // Unexpected simulation error: log the detail server-side, then
+          // propagate it so the outer handler can classify and log it too.
+          logger.error("Failed to fetch whitelisted tokens: simulation error", { contractId, error: errorMsg });
+          throw new Error(errorMsg);
         }
+
+        // Parse successful result
+        if ("result" in result && result.result?.retval) {
+          const tokens: string[] = [];
+          const vec = result.result.retval as any;
+          if (typeof vec.forEach === "function") {
+            vec.forEach((token: any) => tokens.push(token.toString()));
+          }
+          whitelistCache.set(contractId, tokens);
+          logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: tokens.length });
+          return tokens;
+        }
+
+        // Unexpected result structure
+        logger.error("Failed to fetch whitelisted tokens: unexpected retval structure", { contractId });
+        throw new Error("unexpected empty retval");
       })();
 
       inFlightWhitelistRequests.set(contractId, requestPromise);
@@ -463,18 +452,29 @@ router.get(
 
       sendSuccess(res, { tokens });
     } catch (err: any) {
-      // Robust error handling with no stack trace leakage
+      // Robust error handling with no stack trace leakage. Errors keep their
+      // original message so they can be classified here rather than collapsed
+      // into a single generic failure.
       const message = err?.message ?? "Internal server error";
 
-      // 404: Contract not found
-      if (/not found/i.test(message)) {
+      // 401: authentication rejected by the RPC layer
+      if (/unauthorized|invalid authentication/i.test(message)) {
+        logger.warn("Unauthorized request", { contractId });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+
+      // 404: the contract itself is missing. A missing *account* is a
+      // server-side misconfiguration (the deployer account we simulate from),
+      // so it falls through to the 500 branch instead.
+      if (/not found/i.test(message) && !/account not found/i.test(message)) {
         logger.warn("Job not found", { contractId });
         sendError(res, 404, "Job not found");
         return;
       }
 
-      // 500: All unexpected errors (InternalServerError or anything else)
-      logger.error("Failed to fetch whitelisted tokens: unexpected error", {
+      // 500: everything else — full detail server-side, generic body to client
+      logger.error("Failed to fetch whitelisted tokens", {
         contractId,
         error: message,
       });
@@ -488,11 +488,10 @@ router.get(
 // ---------------------------------------------------------------------------
 router.post(
   "/build-tx",
+  // buildTxRateLimit supersedes the generic strictLimiter for this route.
   buildTxRateLimit,
-  validateWithFields(buildTxBodySchema, "body", (req) =>
-  strictLimiter,
   // Schema validation for POST /api/jobs/build-tx payload
-  validate(buildTxBodySchema, "body", (req) =>
+  validateWithFields(buildTxBodySchema, "body", (req) =>
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
@@ -957,14 +956,6 @@ router.post(
     });
 
     try {
-      const { signedXdr } = req.body;
-      const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
-      const tx = TB.fromXDR(signedXdr as string, NETWORK_PASSPHRASE);
-      const result = await server.sendTransaction(tx);
-      sendSuccess(res, result);
-    } catch (err: any) {
-      logger.error("Failed to submit transaction", { error: err?.message });
-      sendError(res, 500, "Internal server error");
       const cached = submitCache.get<unknown>(cacheKey);
       if (cached !== undefined) {
         logger.info("Submit result served from cache", { traceId, source: "cache" });

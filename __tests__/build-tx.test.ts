@@ -125,6 +125,9 @@ describe("POST /api/jobs/build-tx — validation", () => {
     expect(res.body.success).toBe(false);
     expect(res.body.fields).toBeDefined();
     expect(res.body.fields.method).toMatch(/method is required/i);
+  });
+});
+
 describe("POST /api/jobs/build-tx — request payload schema validation (#101)", () => {
   it("returns 400 when contractId is missing", async () => {
     const body = { ...VALID_BODY, contractId: undefined };

@@ -80,10 +80,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .send(VALID_BODY)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "index must be a non-negative integer",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("index must be a non-negative integer");
   });
 
   it("returns 400 when sourceAddress is missing", async () => {
@@ -123,7 +122,7 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/unrecognized key/i);
+    expect(res.body.details[0].message).toMatch(/unrecognized key/i);
   });
 
   it("returns 200 with XDR on valid input", async () => {
@@ -179,7 +178,7 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/sourceAddress/i);
+    expect(res.body.details[0].message).toMatch(/sourceAddress/i);
   });
 
   // ── unhandled exception path (try/catch wrapper, #134) ───────────────────
