@@ -72,21 +72,15 @@ export const contractMilestoneParamsSchema = z.object({
   index: milestoneIndexSchema,
 });
 
-/**
- * Named Stellar account field (G…) with field-specific error messages.
- */
-const stellarAccountField = (field: string) =>
-  z
-    .string({ required_error: `${field} is required` })
-    .refine(isValidStellarAddress, {
-      message: `${field} must be a valid Stellar account address (G...)`,
-    });
-
-/** POST /build-tx body */
+/** POST /build-tx body schema validation */
 export const buildTxBodySchema = z.object({
+  // Must be a valid Soroban contract ID
   contractId: contractIdSchema,
+  // The contract method name to call
   method: z.string({ required_error: "method is required" }).min(1, "method cannot be empty"),
+  // Optional arguments for the method, defaults to an empty array
   args: z.array(z.any()).optional().default([]),
+  // The Stellar address of the transaction source account
   sourceAddress: stellarAddressSchema,
 });
 
@@ -137,7 +131,7 @@ export const partialReleaseBodySchema = z.object({
 /** POST /:contractId/milestones/:index/claim-auto-release body */
 export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
-});
+}).strict();
 
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
