@@ -445,10 +445,10 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=0`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "page must be a positive integer",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("page");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 when page is not numeric", async () => {
@@ -466,10 +466,10 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=101`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "limit must be between 1 and 100",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("limit");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
   it("returns 400 when limit is less than 1", async () => {
@@ -477,10 +477,10 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=0`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "limit must be between 1 and 100",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("limit");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
   it("error body has ValidationError format", async () => {
@@ -507,7 +507,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 });
 
