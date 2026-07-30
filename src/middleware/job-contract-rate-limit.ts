@@ -158,37 +158,37 @@ export function jobWhitelistRateLimit(
   next();
 }
 
-const buildTxBuckets = new Map<string, RateBucket>();
+const timeRemainingBuckets = new Map<string, RateBucket>();
 
-export function resetBuildTxRateLimitBuckets(): void {
-  buildTxBuckets.clear();
+export function resetTimeRemainingRateLimitBuckets(): void {
+  timeRemainingBuckets.clear();
 }
 
-function resolveBuildTxWindowMs(): number {
-  const configured = Number(process.env.BUILD_TX_RATE_WINDOW_MS ?? "60000");
+function resolveTimeRemainingWindowMs(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_WINDOW_MS ?? "60000");
   return Number.isFinite(configured) && configured > 0 ? configured : 60000;
 }
 
-function resolveBuildTxMaxRequests(): number {
-  const configured = Number(process.env.BUILD_TX_RATE_MAX ?? "10");
-  return Number.isFinite(configured) && configured > 0 ? configured : 10;
+function resolveTimeRemainingMaxRequests(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_MAX ?? "60");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60;
 }
 
-/** Dedicated rate limiter for POST /api/jobs/build-tx. */
-export function buildTxRateLimit(
+/** Dedicated rate limiter for GET /api/jobs/:contractId/milestones/:index/time-remaining. */
+export function timeRemainingRateLimit(
   req: Request,
   res: Response,
   next: NextFunction
 ): void {
-  const windowMs = resolveBuildTxWindowMs();
-  const maxRequests = resolveBuildTxMaxRequests();
+  const windowMs = resolveTimeRemainingWindowMs();
+  const maxRequests = resolveTimeRemainingMaxRequests();
   const key = req.ip || req.socket.remoteAddress || "unknown";
   const now = Date.now();
 
-  let bucket = buildTxBuckets.get(key);
+  let bucket = timeRemainingBuckets.get(key);
   if (!bucket || now >= bucket.resetAt) {
     bucket = { count: 0, resetAt: now + windowMs };
-    buildTxBuckets.set(key, bucket);
+    timeRemainingBuckets.set(key, bucket);
   }
 
   bucket.count += 1;
