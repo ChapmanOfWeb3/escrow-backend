@@ -15,6 +15,7 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  timeRemainingRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
@@ -23,6 +24,8 @@ import {
   createJobDraftSecurityHeaders,
   submitCors,
   submitSecurityHeaders,
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate } from "../middleware/validate.js";
@@ -672,6 +675,9 @@ router.post(
 // ---------------------------------------------------------------------------
 router.get(
   "/:contractId/milestones/:index/time-remaining",
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
+  timeRemainingRateLimit,
   validate(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for time-remaining", { params: req.params }),
   ),
@@ -692,48 +698,59 @@ router.get(
     const cacheKey = `${contractId}:${index}`;
 
     try {
-      const cached = timeRemainingCache.get<number>(cacheKey);
-      if (cached !== undefined) {
-        logger.info("Time remaining served from cache", { contractId, index });
-        sendSuccess(res, { secondsRemaining: cached });
-        return;
-      }
+      const contractId = req.params.contractId as string;
+      const { index } = req.params;
 
-      let requestPromise = inFlightTimeRemainingRequests.get(cacheKey);
-      const servedFromInFlight = Boolean(requestPromise);
+      logger.debug("GET time-remaining request", {
+        contractId,
+        index,
+        ip: req.ip ?? req.socket?.remoteAddress,
+        requestId: (req as any).requestId,
+      });
 
-      if (!requestPromise) {
-        requestPromise = (async (): Promise<number> => {
-          const contract = new Contract(contractId);
-          const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
-          const tx = new TransactionBuilder(account, {
-            fee: BASE_FEE,
-            networkPassphrase: NETWORK_PASSPHRASE,
-          })
-            .addOperation(
-              contract.call(
-                "time_until_auto_release",
-                nativeToScVal(Number(index), { type: "u32" }),
-              ),
-            )
-            .setTimeout(30)
-            .build();
+      const contract = new Contract(contractId);
+      const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(
+          contract.call(
+            "time_until_auto_release",
+            nativeToScVal(Number(index), { type: "u32" }),
+          ),
+        )
+        .setTimeout(30)
+        .build();
 
-          const result = await server.simulateTransaction(tx);
-
-          if ("error" in result) {
-            const { status, message } = classifySimError(String(result.error));
-            throw new SimError(status, message);
-          }
-          if ("result" in result && result.result?.retval) {
-            const secondsRemaining = Number(result.result.retval);
-            timeRemainingCache.set(cacheKey, secondsRemaining);
-            return secondsRemaining;
-          }
-          throw new SimError(500, "Internal server error");
-        })();
-
-        inFlightTimeRemainingRequests.set(cacheKey, requestPromise);
+      const result = await server.simulateTransaction(tx);
+      if ("error" in result) {
+        const { status, message } = classifySimError(String(result.error));
+        logger.warn("Simulation error for time-remaining", {
+          contractId,
+          index,
+          status,
+          error: String(result.error),
+          requestId: (req as any).requestId,
+        });
+        sendError(res, status, message);
+      } else if ("result" in result && result.result?.retval) {
+        const secondsRemaining = Number(result.result.retval);
+        logger.info("Time-remaining retrieved successfully", {
+          contractId,
+          index,
+          secondsRemaining,
+          requestId: (req as any).requestId,
+        });
+        res.json({ success: true, secondsRemaining });
+      } else {
+        logger.warn("Unexpected simulation result for time-remaining", {
+          contractId,
+          index,
+          result: JSON.stringify(result),
+          requestId: (req as any).requestId,
+        });
+        sendError(res, 500, "Internal server error");
       }
 
       let secondsRemaining: number;
@@ -748,16 +765,13 @@ router.get(
       }
       sendSuccess(res, { secondsRemaining });
     } catch (err: any) {
-      if (err instanceof SimError) {
-        logger.warn("Simulation error for time-remaining", { contractId, index, status: err.status });
-        if (err.status === 404) {
-          sendError(res, 404, "Job not found");
-        } else {
-          sendError(res, err.status, err.message);
-        }
-        return;
-      }
-      logger.error("Failed to get time remaining", { contractId, index, error: err?.message });
+      logger.error("Failed to get time remaining", {
+        error: err?.message,
+        contractId: req.params.contractId,
+        index: req.params.index,
+        stack: err?.stack,
+        requestId: (req as any).requestId,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
