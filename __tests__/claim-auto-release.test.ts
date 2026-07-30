@@ -55,10 +55,8 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .send(VALID_BODY)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "index must be a non-negative integer",
-    });
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("index must be a non-negative integer");
   });
 
   it("returns 400 for a decimal index", async () => {
@@ -68,7 +66,19 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/index/i);
+    expect(res.body.error).toBe("ValidationError");
+  });
+
+  it("returns 400 for a negative index", async () => {
+    const res = await request(buildApp())
+      .post(`/api/jobs/${VALID_CONTRACT}/milestones/-1/claim-auto-release`)
+      .send(VALID_BODY)
+      .expect(400);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "index must be a non-negative integer",
+    });
   });
 
   it("returns 400 when sourceAddress is missing", async () => {
@@ -77,10 +87,8 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .send({})
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "sourceAddress is required",
-    });
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("sourceAddress is required");
   });
 
   it("returns 400 when sourceAddress is not a valid Stellar account address", async () => {
@@ -89,10 +97,8 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .send({ sourceAddress: "not-a-stellar-address" })
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "sourceAddress must be a valid Stellar account address (G...)",
-    });
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar account address/i);
   });
 
   it("returns 400 when sourceAddress is a contract address (C...)", async () => {
@@ -102,7 +108,17 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release", () =
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/sourceAddress/i);
+    expect(res.body.error).toBe("ValidationError");
+  });
+
+  it("returns 400 when the request body contains extra fields", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send({ sourceAddress: VALID_ADDRESS, extraField: "not-allowed" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/unrecognized key/i);
   });
 
   it("returns 200 with XDR on valid input", async () => {

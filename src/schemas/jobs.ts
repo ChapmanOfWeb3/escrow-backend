@@ -140,7 +140,7 @@ export const partialReleaseBodySchema = z.object({
 /** POST /:contractId/milestones/:index/claim-auto-release body */
 export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
-});
+}).strict();
 
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
