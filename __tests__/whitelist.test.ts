@@ -109,7 +109,8 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
         .expect(400);
 
       expect(res.body.success).toBe(false);
-      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+      expect(res.body.error).toBe("ValidationError");
+      expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     });
 
     it("returns 400 for a contractId that is too short", async () => {
@@ -119,7 +120,8 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
         .expect(400);
 
       expect(res.body.success).toBe(false);
-      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+      expect(res.body.error).toBe("ValidationError");
+      expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     });
 
     it("returns 400 for a contractId that is too long", async () => {
@@ -129,7 +131,8 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
         .expect(400);
 
       expect(res.body.success).toBe(false);
-      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+      expect(res.body.error).toBe("ValidationError");
+      expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     });
 
     it("returns standardised error shape for all invalid contractId inputs", async () => {

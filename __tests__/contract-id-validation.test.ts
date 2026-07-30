@@ -139,7 +139,8 @@ describe("GET /api/jobs/:contractId – address validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 404 for an empty contractId route (no route matched)", async () => {
@@ -155,7 +156,8 @@ describe("GET /api/jobs/:contractId – address validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 400 for a contractId that is too long", async () => {
@@ -165,7 +167,8 @@ describe("GET /api/jobs/:contractId – address validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("does not return 400 for a syntactically valid contractId", async () => {

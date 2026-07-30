@@ -413,8 +413,9 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
-    expect(res.body.error).toMatch(/valid Stellar account address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
+    expect(res.body.details[0].message).toMatch(/valid Stellar account address/i);
   });
 
   it("returns 400 for a contract address (C…) used as wallet", async () => {
@@ -425,7 +426,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 
   it("returns 400 for an address that is too short", async () => {
@@ -434,7 +436,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 
   it("returns 400 when page is not a positive integer", async () => {
@@ -454,7 +457,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/page/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 when limit is greater than 100", async () => {
@@ -479,14 +483,14 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
     });
   });
 
-  it("error body has exactly {success, error} keys", async () => {
+  it("error body has ValidationError format", async () => {
     const res = await request(app)
       .get("/api/jobs/by-wallet/bad-address")
       .expect(400);
 
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
     expect(res.body.success).toBe(false);
-    expect(typeof res.body.error).toBe("string");
+    expect(res.body.error).toBe("ValidationError");
+    expect(Array.isArray(res.body.details)).toBe(true);
   });
 
   it("does not return 400 for a valid address and query", async () => {
@@ -577,8 +581,9 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
       .get("/api/jobs/by-wallet/not-valid")
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.any(String) });
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(Array.isArray(res.body.details)).toBe(true);
   });
 
   it("returns 400 for invalid page query param", async () => {
@@ -587,7 +592,8 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/page/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 for invalid limit query param", async () => {
@@ -596,7 +602,8 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/limit/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
   // -------------------------------------------------------------------------
