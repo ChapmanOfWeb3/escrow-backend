@@ -183,12 +183,20 @@ export function getLastIndexedLedger(): number {
   return row ? parseInt((row as any).value, 10) : 0;
 }
 
+/**
+ * Atomically update the last indexed ledger inside a transaction.
+ * This ensures data consistency when multiple operations need to coordinate
+ * on the ledger pointer update.
+ */
 export function setLastIndexedLedger(seq: number) {
   const db = getDb();
-  const stmt = db.prepare(
-    "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'"
-  );
-  stmt.run(seq.toString());
+  const updateTransaction = db.transaction(() => {
+    const stmt = db.prepare(
+      "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'"
+    );
+    stmt.run(seq.toString());
+  });
+  updateTransaction();
 }
 
 // ---------------------------------------------------------------------------
