@@ -72,19 +72,33 @@ export const contractMilestoneParamsSchema = z.object({
   index: milestoneIndexSchema,
 });
 
-/** POST /build-tx body */
+/** POST /build-tx body schema validation */
 export const buildTxBodySchema = z.object({
+  // Must be a valid Soroban contract ID
   contractId: contractIdSchema,
+  // The contract method name to call
   method: z.string({ required_error: "method is required" }).min(1, "method cannot be empty"),
+  // Optional arguments for the method, defaults to an empty array
   args: z.array(z.any()).optional().default([]),
+  // The Stellar address of the transaction source account
   sourceAddress: stellarAddressSchema,
 });
 
 /** POST /submit body */
 export const submitBodySchema = z.object({
   signedXdr: z
-    .string({ required_error: "signedXdr is required" })
-    .min(1, "signedXdr cannot be empty"),
+    .string({ required_error: "signedXdr is required", invalid_type_error: "signedXdr must be a string" })
+    .min(1, "signedXdr cannot be empty")
+    .refine((v) => !/\s/.test(v), {
+      message: "signedXdr must not contain whitespace",
+    })
+    .refine(
+      (v) => {
+        // Valid base64: only A-Z a-z 0-9 + / = characters, length divisible by 4
+        return /^[A-Za-z0-9+/]*={0,2}$/.test(v) && v.length % 4 === 0;
+      },
+      { message: "signedXdr must be a valid base64-encoded XDR string" },
+    ),
 });
 
 /**
@@ -126,7 +140,7 @@ export const partialReleaseBodySchema = z.object({
 /** POST /:contractId/milestones/:index/claim-auto-release body */
 export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
-});
+}).strict();
 
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({

@@ -278,6 +278,8 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
     // Dynamically import the router AFTER setDb() so it uses the in-memory DB
     const { default: router } = await import("../src/routes/jobs.js");
     app = express();
+    // Ensure no API_KEY gate is active for the baseline HTTP suite
+    delete process.env.API_KEY;
     app.use(express.json());
     app.use("/api/jobs", router);
   });
@@ -297,10 +299,10 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       .expect(200);
 
     expect(res.body.success).toBe(true);
-    expect(Array.isArray(res.body.jobs)).toBe(true);
-    expect(res.body.total).toBeDefined();
-    expect(res.body.page).toBeDefined();
-    expect(res.body.limit).toBeDefined();
+    expect(Array.isArray(res.body.data.jobs)).toBe(true);
+    expect(res.body.data.total).toBeDefined();
+    expect(res.body.data.page).toBeDefined();
+    expect(res.body.data.limit).toBeDefined();
   });
 
   it("returns empty jobs array for unknown address", async () => {
@@ -309,8 +311,8 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       .expect(200);
 
     expect(res.body.success).toBe(true);
-    expect(res.body.jobs).toHaveLength(0);
-    expect(res.body.total).toBe(0);
+    expect(res.body.data.jobs).toHaveLength(0);
+    expect(res.body.data.total).toBe(0);
   });
 
   it("respects ?page=1&limit=2 query params", async () => {
@@ -330,10 +332,10 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       .expect(200);
 
     expect(res.body.success).toBe(true);
-    expect(res.body.jobs).toHaveLength(2);
-    expect(res.body.total).toBe(4);
-    expect(res.body.page).toBe(1);
-    expect(res.body.limit).toBe(2);
+    expect(res.body.data.jobs).toHaveLength(2);
+    expect(res.body.data.total).toBe(4);
+    expect(res.body.data.page).toBe(1);
+    expect(res.body.data.limit).toBe(2);
   });
 
   it("each job entry has the expected shape", async () => {
@@ -350,7 +352,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       .get(`/api/jobs/by-wallet/${addr}`)
       .expect(200);
 
-    const job = res.body.jobs[0];
+    const job = res.body.data.jobs[0];
     expect(job).toMatchObject({
       contract_id: expect.any(String),
       role: expect.stringMatching(/^(client|freelancer|arbiter)$/),
@@ -385,8 +387,8 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
 
     expect(first.body.success).toBe(true);
     expect(second.body.success).toBe(true);
-    expect(first.body.jobs).toHaveLength(1);
-    expect(second.body.jobs).toHaveLength(1);
+    expect(first.body.data.jobs).toHaveLength(1);
+    expect(second.body.data.jobs).toHaveLength(1);
     expect(prepareCalls).toBeGreaterThan(0);
   });
 });
@@ -411,8 +413,9 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
-    expect(res.body.error).toMatch(/valid Stellar account address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
+    expect(res.body.details[0].message).toMatch(/valid Stellar account address/i);
   });
 
   it("returns 400 for a contract address (C…) used as wallet", async () => {
@@ -423,7 +426,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 
   it("returns 400 for an address that is too short", async () => {
@@ -432,7 +436,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 
   it("returns 400 when page is not a positive integer", async () => {
@@ -440,10 +445,10 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=0`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "page must be a positive integer",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("page");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 when page is not numeric", async () => {
@@ -452,7 +457,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/page/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 when limit is greater than 100", async () => {
@@ -460,10 +466,10 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=101`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "limit must be between 1 and 100",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("limit");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
   it("returns 400 when limit is less than 1", async () => {
@@ -471,20 +477,20 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=0`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "limit must be between 1 and 100",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("limit");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
-  it("error body has exactly {success, error} keys", async () => {
+  it("error body has ValidationError format", async () => {
     const res = await request(app)
       .get("/api/jobs/by-wallet/bad-address")
       .expect(400);
 
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
     expect(res.body.success).toBe(false);
-    expect(typeof res.body.error).toBe("string");
+    expect(res.body.error).toBe("ValidationError");
+    expect(Array.isArray(res.body.details)).toBe(true);
   });
 
   it("does not return 400 for a valid address and query", async () => {
@@ -492,5 +498,182 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       `/api/jobs/by-wallet/${VALID_WALLET}?page=1&limit=10`,
     );
     expect(res.status).not.toBe(400);
+  });
+
+  it("returns 400 for address with valid length but bad checksum", async () => {
+    const badChecksum = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRY";
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${badChecksum}`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HTTP status code tests: accurate 401 / 500 handling
+// ---------------------------------------------------------------------------
+
+describe("GET /api/jobs/by-wallet/:address – status codes", () => {
+  let app: express.Express;
+
+  beforeAll(async () => {
+    const { default: router } = await import("../src/routes/jobs.js");
+    app = express();
+    app.use(express.json());
+    app.use("/api/jobs", router);
+  });
+
+  afterEach(() => {
+    delete process.env.API_KEY;
+    resetJobsByWalletCache();
+  });
+
+  // -------------------------------------------------------------------------
+  // 200 – success
+  // -------------------------------------------------------------------------
+
+  it("returns 200 with { success: true, data: { jobs, total, page, limit } }", async () => {
+    const addr = VALID_WALLET;
+    seedEvent(testDb, {
+      contractId: "SC-200",
+      eventType: "initialized",
+      ledger: 1,
+      timestamp: 100,
+      dataJson: JSON.stringify({ client: addr }),
+    });
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${addr}`)
+      .expect(200);
+
+    expect(res.body).toMatchObject({
+      success: true,
+      data: {
+        jobs: expect.any(Array),
+        total: expect.any(Number),
+        page: expect.any(Number),
+        limit: expect.any(Number),
+      },
+    });
+    // Top-level must NOT contain raw pagination fields
+    expect(res.body.jobs).toBeUndefined();
+    expect(res.body.total).toBeUndefined();
+  });
+
+  it("returns 200 with empty jobs array when address has no indexed jobs", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET_2}`)
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.jobs).toHaveLength(0);
+    expect(res.body.data.total).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // 400 – invalid input
+  // -------------------------------------------------------------------------
+
+  it("returns 400 with { success: false, error } for an invalid address", async () => {
+    const res = await request(app)
+      .get("/api/jobs/by-wallet/not-valid")
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(Array.isArray(res.body.details)).toBe(true);
+  });
+
+  it("returns 400 for invalid page query param", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=-1`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/page/i);
+  });
+
+  it("returns 400 for invalid limit query param", async () => {
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=9999`)
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/limit/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // 401 – missing or wrong API key when API_KEY env var is set
+  // -------------------------------------------------------------------------
+
+  it("returns 401 when API_KEY is set and no key is provided", async () => {
+    process.env.API_KEY = "secret-test-key";
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .expect(401);
+
+    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+  });
+
+  it("returns 401 when API_KEY is set and wrong key is provided", async () => {
+    process.env.API_KEY = "secret-test-key";
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .set("x-api-key", "wrong-key")
+      .expect(401);
+
+    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+  });
+
+  it("returns 200 when API_KEY is set and correct key is provided", async () => {
+    process.env.API_KEY = "secret-test-key";
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .set("x-api-key", "secret-test-key")
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it("returns 200 (no gate) when API_KEY env var is not set", async () => {
+    delete process.env.API_KEY;
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // 500 – internal server error
+  // -------------------------------------------------------------------------
+
+  it("returns 500 with { success: false, error: 'Internal server error' } on DB failure", async () => {
+    // Force a DB error by swapping in a closed database instance
+    const brokenDb = new Database(":memory:");
+    setDb(brokenDb);
+    brokenDb.close();
+    resetJobsByWalletCache();
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .expect(500);
+
+    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+
+    // Restore a healthy in-memory DB for subsequent tests
+    const freshDb = new Database(":memory:");
+    setDb(freshDb);
+    initSchema();
+    resetJobsByWalletCache();
   });
 });

@@ -178,21 +178,37 @@ export function jobWhitelistRateLimit(
   next();
 }
 
-/** Dedicated rate limiter for POST /api/jobs/create-job-draft. */
-export function createJobDraftRateLimit(
+const timeRemainingBuckets = new Map<string, RateBucket>();
+
+export function resetTimeRemainingRateLimitBuckets(): void {
+  timeRemainingBuckets.clear();
+}
+
+function resolveTimeRemainingWindowMs(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_WINDOW_MS ?? "60000");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60000;
+}
+
+function resolveTimeRemainingMaxRequests(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_MAX ?? "60");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60;
+}
+
+/** Dedicated rate limiter for GET /api/jobs/:contractId/milestones/:index/time-remaining. */
+export function timeRemainingRateLimit(
   req: Request,
   res: Response,
   next: NextFunction
 ): void {
-  const windowMs = resolveCreateJobDraftWindowMs();
-  const maxRequests = resolveCreateJobDraftMaxRequests();
+  const windowMs = resolveTimeRemainingWindowMs();
+  const maxRequests = resolveTimeRemainingMaxRequests();
   const key = req.ip || req.socket.remoteAddress || "unknown";
   const now = Date.now();
 
-  let bucket = createJobDraftBuckets.get(key);
+  let bucket = timeRemainingBuckets.get(key);
   if (!bucket || now >= bucket.resetAt) {
     bucket = { count: 0, resetAt: now + windowMs };
-    createJobDraftBuckets.set(key, bucket);
+    timeRemainingBuckets.set(key, bucket);
   }
 
   bucket.count += 1;
@@ -212,3 +228,4 @@ export function createJobDraftRateLimit(
 
   next();
 }
+
