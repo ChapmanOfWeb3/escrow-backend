@@ -158,37 +158,37 @@ export function jobWhitelistRateLimit(
   next();
 }
 
-const submitBuckets = new Map<string, RateBucket>();
+const timeRemainingBuckets = new Map<string, RateBucket>();
 
-export function resetSubmitRateLimitBuckets(): void {
-  submitBuckets.clear();
+export function resetTimeRemainingRateLimitBuckets(): void {
+  timeRemainingBuckets.clear();
 }
 
-function resolveSubmitWindowMs(): number {
-  const configured = Number(process.env.SUBMIT_RATE_WINDOW_MS ?? "60000");
+function resolveTimeRemainingWindowMs(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_WINDOW_MS ?? "60000");
   return Number.isFinite(configured) && configured > 0 ? configured : 60000;
 }
 
-function resolveSubmitMaxRequests(): number {
-  const configured = Number(process.env.SUBMIT_RATE_MAX ?? "5");
-  return Number.isFinite(configured) && configured > 0 ? configured : 5;
+function resolveTimeRemainingMaxRequests(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_MAX ?? "60");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60;
 }
 
-/** Dedicated rate limiter for POST /api/jobs/submit. */
-export function submitRateLimit(
+/** Dedicated rate limiter for GET /api/jobs/:contractId/milestones/:index/time-remaining. */
+export function timeRemainingRateLimit(
   req: Request,
   res: Response,
   next: NextFunction
 ): void {
-  const windowMs = resolveSubmitWindowMs();
-  const maxRequests = resolveSubmitMaxRequests();
+  const windowMs = resolveTimeRemainingWindowMs();
+  const maxRequests = resolveTimeRemainingMaxRequests();
   const key = req.ip || req.socket.remoteAddress || "unknown";
   const now = Date.now();
 
-  let bucket = submitBuckets.get(key);
+  let bucket = timeRemainingBuckets.get(key);
   if (!bucket || now >= bucket.resetAt) {
     bucket = { count: 0, resetAt: now + windowMs };
-    submitBuckets.set(key, bucket);
+    timeRemainingBuckets.set(key, bucket);
   }
 
   bucket.count += 1;
