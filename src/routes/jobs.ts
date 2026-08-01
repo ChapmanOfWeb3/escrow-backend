@@ -15,19 +15,28 @@ import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
   partialReleaseRateLimit,
+  buildTxRateLimit,
+  timeRemainingRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
   jobContractSecurityHeaders,
   createJobDraftCors,
   createJobDraftSecurityHeaders,
+  submitCors,
+  submitSecurityHeaders,
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
+  byWalletCors,
+  byWalletSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
-import { validate } from "../middleware/validate.js";
+import { validate, validateWithFields } from "../middleware/validate.js";
 import type { RequestWithValidatedQuery } from "../middleware/validate.js";
 import {
   contractIdParamsSchema,
   contractMilestoneParamsSchema,
+  // Schema for building transaction requests
   buildTxBodySchema,
   submitBodySchema,
   partialReleaseBodySchema,
@@ -56,6 +65,34 @@ const inFlightWhitelistRequests = new Map<string, Promise<string[]>>();
 export function resetWhitelistCache(): void {
   whitelistCache.flushAll();
   inFlightWhitelistRequests.clear();
+}
+
+const CLAIM_AUTO_RELEASE_TTL = parseInt(
+  process.env.CLAIM_AUTO_RELEASE_CACHE_TTL_S || "60",
+  10,
+);
+export const claimAutoReleaseCache = new NodeCache({
+  stdTTL: CLAIM_AUTO_RELEASE_TTL,
+  useClones: false,
+});
+const inFlightClaimAutoReleaseRequests = new Map<string, Promise<string>>();
+export function resetClaimAutoReleaseCache(): void {
+  claimAutoReleaseCache.flushAll();
+  inFlightClaimAutoReleaseRequests.clear();
+}
+
+const SUBMIT_CACHE_TTL = parseInt(
+  process.env.SUBMIT_CACHE_TTL_S || "30",
+  10,
+);
+export const submitCache = new NodeCache({
+  stdTTL: SUBMIT_CACHE_TTL,
+  useClones: false,
+});
+const inFlightSubmitRequests = new Map<string, Promise<unknown>>();
+export function resetSubmitCache(): void {
+  submitCache.flushAll();
+  inFlightSubmitRequests.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -125,24 +162,43 @@ const parseJobFromResult = (result: any, contractId: string) => {
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
+router.options("/by-wallet/:address", byWalletCors);
+
 router.get(
   "/by-wallet/:address",
+  byWalletCors,
+  byWalletSecurityHeaders,
   validate(byWalletParamsSchema, "params", (req) =>
     logger.warn("Invalid by-wallet address", { address: req.params.address }),
   ),
   validate(byWalletQuerySchema, "query", (req) =>
     logger.warn("Invalid by-wallet query", { query: req.query }),
   ),
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
+    const address = req.params.address as string;
+
+    // Optional API-key gate (same pattern as GET /:contractId)
+    const requiredApiKey = process.env.API_KEY;
+    if (requiredApiKey) {
+      const providedKey = req.header("x-api-key");
+      if (providedKey !== requiredApiKey) {
+        logger.warn("Unauthorized by-wallet request", { address });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+    }
+
     try {
-      const address = req.params.address as string;
       const { page, limit } = (req as RequestWithValidatedQuery)
         .validatedQuery as ByWalletQuery;
 
-      const result = getJobsByWallet(address, page, limit);
-      res.json({ success: true, ...result });
-    } catch (err: any) {
-      res.status(500).json({ success: false, error: "Internal server error" });
+      logger.info("Fetching jobs by wallet", { address, page, limit });
+      const result = await getJobsByWallet(address, page, limit);
+      sendSuccess(res, result);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to fetch jobs by wallet", { address, error: message });
+      sendError(res, 500, "Internal server error");
     }
   },
 );
@@ -305,6 +361,7 @@ router.get(
     const contractId = req.params.contractId as string;
 
     try {
+      // Check API key authorization
       const requiredApiKey = process.env.API_KEY;
       if (requiredApiKey) {
         const providedKey = req.header("x-api-key");
@@ -315,6 +372,7 @@ router.get(
         }
       }
 
+      // Check cache
       const cached = whitelistCache.get<string[]>(contractId);
       if (cached !== undefined) {
         logger.info("Whitelisted tokens served from cache", { contractId, tokenCount: cached.length });
@@ -322,6 +380,7 @@ router.get(
         return;
       }
 
+      // Check in-flight requests
       const inFlight = inFlightWhitelistRequests.get(contractId);
       if (inFlight) {
         const tokens = await inFlight;
@@ -330,6 +389,7 @@ router.get(
         return;
       }
 
+      // Fetch whitelisted tokens from contract
       const requestPromise = (async (): Promise<string[]> => {
         const contract = new Contract(contractId as string);
         const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
@@ -343,23 +403,29 @@ router.get(
 
         const result = await server.simulateTransaction(tx);
 
+        // Handle simulation error
         if ("error" in result) {
           const errorMsg = String(result.error);
+          // Contract not initialized: return empty token list
           if (errorMsg.includes("contract error #2") || errorMsg.includes("NotInitialized")) {
             whitelistCache.set(contractId, []);
             logger.info("Whitelisted tokens fetched successfully", { contractId, tokenCount: 0 });
             return [];
           }
+          // Contract not found on network
           if (
             /not found|NotFound|contract not found/i.test(errorMsg) ||
             /contract error #1\b/i.test(errorMsg)
           ) {
             throw new Error("not found");
           }
-          logger.error("Failed to fetch whitelisted tokens", { contractId, error: errorMsg });
-          throw new Error("InternalServerError");
+          // Unexpected simulation error: log the detail server-side, then
+          // propagate it so the outer handler can classify and log it too.
+          logger.error("Failed to fetch whitelisted tokens: simulation error", { contractId, error: errorMsg });
+          throw new Error(errorMsg);
         }
 
+        // Parse successful result
         if ("result" in result && result.result?.retval) {
           const tokens: string[] = [];
           const vec = result.result.retval as any;
@@ -371,8 +437,9 @@ router.get(
           return tokens;
         }
 
-        logger.error("Failed to fetch whitelisted tokens", { contractId, error: "unexpected empty retval" });
-        throw new Error("InternalServerError");
+        // Unexpected result structure
+        logger.error("Failed to fetch whitelisted tokens: unexpected retval structure", { contractId });
+        throw new Error("unexpected empty retval");
       })();
 
       inFlightWhitelistRequests.set(contractId, requestPromise);
@@ -385,18 +452,32 @@ router.get(
 
       sendSuccess(res, { tokens });
     } catch (err: any) {
+      // Robust error handling with no stack trace leakage. Errors keep their
+      // original message so they can be classified here rather than collapsed
+      // into a single generic failure.
       const message = err?.message ?? "Internal server error";
-      if (/unauthorized|401/i.test(message)) {
-        logger.error("Failed to fetch whitelisted tokens", { contractId, error: message });
+
+      // 401: authentication rejected by the RPC layer
+      if (/unauthorized|invalid authentication/i.test(message)) {
+        logger.warn("Unauthorized request", { contractId });
         sendError(res, 401, "Unauthorized");
         return;
       }
-      if (/not found|404/i.test(message)) {
+
+      // 404: the contract itself is missing. A missing *account* is a
+      // server-side misconfiguration (the deployer account we simulate from),
+      // so it falls through to the 500 branch instead.
+      if (/not found/i.test(message) && !/account not found/i.test(message)) {
         logger.warn("Job not found", { contractId });
         sendError(res, 404, "Job not found");
         return;
       }
-      logger.error("Failed to fetch whitelisted tokens", { contractId, error: message });
+
+      // 500: everything else — full detail server-side, generic body to client
+      logger.error("Failed to fetch whitelisted tokens", {
+        contractId,
+        error: message,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
@@ -407,8 +488,10 @@ router.get(
 // ---------------------------------------------------------------------------
 router.post(
   "/build-tx",
-  strictLimiter,
-  validate(buildTxBodySchema, "body", (req) =>
+  // buildTxRateLimit supersedes the generic strictLimiter for this route.
+  buildTxRateLimit,
+  // Schema validation for POST /api/jobs/build-tx payload
+  validateWithFields(buildTxBodySchema, "body", (req) =>
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
@@ -423,10 +506,16 @@ router.post(
         const tokenArg = args.find((a: any) => a.type === "address" && a.value && a !== adminArg);
 
         if (!adminArg || !tokenArg) {
-          return res.status(400).json({
-            success: false,
-            error: "Both admin (address) and token (address) arguments are required for whitelist management methods",
+          logger.warn("Missing admin/token args for whitelist management", {
+            contractId,
+            method,
           });
+          sendError(
+            res,
+            400,
+            "Both admin (address) and token (address) arguments are required for whitelist management methods",
+          );
+          return;
         }
       }
 
@@ -460,7 +549,7 @@ router.post(
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
       logger.error("Failed to build transaction", { error: err?.message });
-      res.status(500).json({ success: false, error: "Internal server error" });
+      sendError(res, 500, "Internal server error");
     }
   },
 );
@@ -471,14 +560,48 @@ router.post(
 router.post(
   "/:contractId/milestones/:index/partial-release",
   partialReleaseRateLimit,
-  validate(contractMilestoneParamsSchema, "params"),
-  validate(partialReleaseBodySchema, "body"),
+  validate(contractMilestoneParamsSchema, "params", (req) =>
+    logger.warn("Invalid params for partial-release", { params: req.params }),
+  ),
+  validate(partialReleaseBodySchema, "body", (req) =>
+    logger.warn("Invalid body for partial-release", { body: req.body }),
+  ),
   async (req: Request, res: Response) => {
     try {
       const { contractId, index } = req.params;
+
+      const requiredApiKey = process.env.API_KEY;
+      if (requiredApiKey) {
+        const providedKey = req.header("x-api-key");
+        if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized request", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+      }
+
       const { amount, sourceAddress } = req.body;
+
+      logger.info("Processing partial-release", {
+        contractId,
+        index,
+        amount,
+        sourceAddress,
+      });
+
       const contract = new Contract(contractId as string);
-      const account = await server.getAccount(sourceAddress as string);
+
+      let account;
+      try {
+        account = await server.getAccount(sourceAddress as string);
+      } catch (err: any) {
+        const errMsg = String(err?.message || err);
+        const { status, message } = classifySimError(errMsg);
+        logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+        sendError(res, status, message);
+        return;
+      }
+
       const amountNum = BigInt(amount);
 
       const tx = new TransactionBuilder(account, {
@@ -494,19 +617,35 @@ router.post(
         .setTimeout(30)
         .build();
 
-      const prepared = await server.prepareTransaction(tx);
+      let prepared;
+      try {
+        prepared = await server.prepareTransaction(tx);
+      } catch (err: any) {
+        const errMsg = String(err?.message || err);
+        const { status, message } = classifySimError(errMsg);
+        logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+        sendError(res, status, message);
+        return;
+      }
+
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      const errMsg = String(err?.message || err);
+      logger.error("Unexpected error in partial release", { error: errMsg });
+      sendError(res, 500, "Internal server error");
     }
   }
 );
 
 // ---------------------------------------------------------------------------
 // GET /api/jobs/:contractId/milestones/:index/time-remaining
+// Validates route parameters using contractMilestoneParamsSchema.
 // ---------------------------------------------------------------------------
 router.get(
   "/:contractId/milestones/:index/time-remaining",
+  timeRemainingCors,
+  timeRemainingSecurityHeaders,
+  timeRemainingRateLimit,
   validate(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for time-remaining", { params: req.params }),
   ),
@@ -514,6 +653,14 @@ router.get(
     try {
       const contractId = req.params.contractId as string;
       const { index } = req.params;
+
+      logger.debug("GET time-remaining request", {
+        contractId,
+        index,
+        ip: req.ip ?? req.socket?.remoteAddress,
+        requestId: (req as any).requestId,
+      });
+
       const contract = new Contract(contractId);
       const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
       const tx = new TransactionBuilder(account, {
@@ -532,16 +679,40 @@ router.get(
       const result = await server.simulateTransaction(tx);
       if ("error" in result) {
         const { status, message } = classifySimError(String(result.error));
-        logger.warn("Simulation error for time-remaining", { contractId, index, status });
+        logger.warn("Simulation error for time-remaining", {
+          contractId,
+          index,
+          status,
+          error: String(result.error),
+          requestId: (req as any).requestId,
+        });
         sendError(res, status, message);
       } else if ("result" in result && result.result?.retval) {
         const secondsRemaining = Number(result.result.retval);
+        logger.info("Time-remaining retrieved successfully", {
+          contractId,
+          index,
+          secondsRemaining,
+          requestId: (req as any).requestId,
+        });
         res.json({ success: true, secondsRemaining });
       } else {
+        logger.warn("Unexpected simulation result for time-remaining", {
+          contractId,
+          index,
+          result: JSON.stringify(result),
+          requestId: (req as any).requestId,
+        });
         sendError(res, 500, "Internal server error");
       }
     } catch (err: any) {
-      logger.error("Failed to get time remaining", { error: err?.message });
+      logger.error("Failed to get time remaining", {
+        error: err?.message,
+        contractId: req.params.contractId,
+        index: req.params.index,
+        stack: err?.stack,
+        requestId: (req as any).requestId,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
@@ -559,54 +730,279 @@ router.post(
     logger.warn("Invalid body for claim-auto-release", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
+    const contractId = req.params.contractId as string;
+    const { index } = req.params;
+    const { sourceAddress } = req.body;
+    const cacheKey = `${contractId}:${index}:${sourceAddress}`;
+    const traceId = randomUUID();
+    const pathVars = { contractId, index, sourceAddress };
+
+    logger.debug("Claim auto-release handler entered", {
+      traceId,
+      ...pathVars,
+      params: req.params,
+      bodyKeys: Object.keys(req.body),
+    });
+
+    logger.info("Claim auto-release request received", {
+      traceId,
+      ...pathVars,
+    });
+
     try {
-      const contractId = req.params.contractId as string;
-      const { index } = req.params;
-      const { sourceAddress } = req.body;
-      const contract = new Contract(contractId);
-      const account = await server.getAccount(sourceAddress as string);
+      logger.debug("Checking claim auto-release cache", { traceId, ...pathVars, cacheKey });
+      const cached = claimAutoReleaseCache.get<string>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Claim auto-release XDR served from cache", {
+          traceId,
+          ...pathVars,
+          source: "cache",
+          xdrLength: cached.length,
+        });
+        const responseBody = { success: true, xdr: cached };
+        logger.debug("Claim auto-release response body prepared", {
+          traceId,
+          ...pathVars,
+          success: responseBody.success,
+          xdrLength: responseBody.xdr.length,
+        });
+        logger.info("Claim auto-release response sent", {
+          traceId,
+          ...pathVars,
+          status: 200,
+          success: true,
+          cached: true,
+          xdrLength: cached.length,
+        });
+        res.json(responseBody);
+        return;
+      }
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(
-          contract.call(
-            "claim_auto_release",
-            Address.fromString(sourceAddress).toScVal(),
-            nativeToScVal(Number(index), { type: "u32" }),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+      logger.debug("Checking in-flight claim auto-release requests", { traceId, ...pathVars, cacheKey });
+      const inFlight = inFlightClaimAutoReleaseRequests.get(cacheKey);
+      if (inFlight) {
+        const xdr = await inFlight;
+        logger.info("Claim auto-release XDR served from in-flight cache", {
+          traceId,
+          ...pathVars,
+          source: "in-flight",
+          xdrLength: xdr.length,
+        });
+        const responseBody = { success: true, xdr };
+        logger.debug("Claim auto-release response body prepared", {
+          traceId,
+          ...pathVars,
+          success: responseBody.success,
+          xdrLength: responseBody.xdr.length,
+        });
+        logger.info("Claim auto-release response sent", {
+          traceId,
+          ...pathVars,
+          status: 200,
+          success: true,
+          cached: true,
+          inFlight: true,
+          xdrLength: xdr.length,
+        });
+        res.json(responseBody);
+        return;
+      }
 
-      const prepared = await server.prepareTransaction(tx);
-      res.json({ success: true, xdr: prepared.toXDR() });
+      logger.info("Fetching claim auto-release XDR from Stellar RPC", {
+        traceId,
+        ...pathVars,
+      });
+
+      const requestPromise = (async (): Promise<string> => {
+        logger.debug("Building Stellar transaction for claim auto-release", {
+          traceId,
+          ...pathVars,
+          fee: BASE_FEE,
+          timeout: 30,
+        });
+        const contract = new Contract(contractId);
+        logger.debug("Fetching Stellar account", { traceId, ...pathVars });
+        const account = await server.getAccount(sourceAddress as string);
+        logger.debug("Stellar account fetched", { traceId, ...pathVars });
+
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            contract.call(
+              "claim_auto_release",
+              Address.fromString(sourceAddress).toScVal(),
+              nativeToScVal(Number(index), { type: "u32" }),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        logger.debug("Calling prepareTransaction on Stellar RPC", { traceId, ...pathVars });
+        const prepared = await server.prepareTransaction(tx);
+        const xdr = prepared.toXDR();
+        logger.debug("Storing claim auto-release XDR in cache", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+          xdrLength: xdr.length,
+          ttlSeconds: CLAIM_AUTO_RELEASE_TTL,
+        });
+        claimAutoReleaseCache.set(cacheKey, xdr);
+        return xdr;
+      })();
+
+      inFlightClaimAutoReleaseRequests.set(cacheKey, requestPromise);
+      logger.debug("In-flight promise registered", { traceId, ...pathVars, cacheKey });
+      let xdr: string;
+      try {
+        xdr = await requestPromise;
+      } catch (err: any) {
+        logger.debug("RPC promise rejected, clearing cache entry", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+          error: err?.message ?? String(err),
+        });
+        claimAutoReleaseCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightClaimAutoReleaseRequests.delete(cacheKey);
+        logger.debug("In-flight promise unregistered", { traceId, ...pathVars, cacheKey });
+      }
+
+      logger.info("Claim auto-release XDR built successfully", {
+        traceId,
+        ...pathVars,
+        xdrLength: xdr.length,
+      });
+      const responseBody = { success: true, xdr };
+      logger.debug("Claim auto-release response body prepared", {
+        traceId,
+        ...pathVars,
+        success: responseBody.success,
+        xdrLength: responseBody.xdr.length,
+      });
+      logger.info("Claim auto-release response sent", {
+        traceId,
+        ...pathVars,
+        status: 200,
+        success: true,
+        cached: false,
+        xdrLength: xdr.length,
+      });
+
+      res.json(responseBody);
     } catch (err: any) {
-      logger.error("Failed to build claim-auto-release tx", { error: err?.message });
-      res.status(500).json({ success: false, error: "Internal server error" });
+      const message = err?.message ?? String(err);
+      const stack = err?.stack;
+      logger.debug("Claim auto-release error caught", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack,
+      });
+      logger.error("Failed to build claim-auto-release tx", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack,
+      });
+      const responseBody = { success: false, error: "Internal server error" };
+      logger.debug("Claim auto-release error response body prepared", {
+        traceId,
+        ...pathVars,
+        success: responseBody.success,
+        clientError: responseBody.error,
+      });
+      logger.info("Claim auto-release response sent", {
+        traceId,
+        ...pathVars,
+        status: 500,
+        success: false,
+        error: message,
+      });
+      res.status(500).json(responseBody);
     }
   },
 );
 
 // ---------------------------------------------------------------------------
 // POST /api/jobs/submit – submit a signed transaction
+// Caches results by signedXdr to deduplicate concurrent identical submissions.
 // ---------------------------------------------------------------------------
+router.options("/submit", submitCors);
+
 router.post(
   "/submit",
+  submitCors,
+  submitSecurityHeaders,
   strictLimiter,
   validate(submitBodySchema, "body", (req) =>
-    logger.warn("Invalid submit request body", { body: req.body }),
+    logger.warn("Invalid submit request body", {
+      body: req.body,
+      xdrLength: typeof req.body?.signedXdr === "string" ? req.body.signedXdr.length : undefined,
+    }),
   ),
   async (req: Request, res: Response) => {
+    const { signedXdr } = req.body as { signedXdr: string };
+    const cacheKey = signedXdr;
+    const traceId = randomUUID();
+
+    logger.info("Submit transaction request received", {
+      traceId,
+      xdrLength: signedXdr.length,
+    });
+
     try {
-      const { signedXdr } = req.body;
-      const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
-      const tx = TB.fromXDR(signedXdr as string, NETWORK_PASSPHRASE);
-      const result = await server.sendTransaction(tx);
+      const cached = submitCache.get<unknown>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Submit result served from cache", { traceId, source: "cache" });
+        res.json({ success: true, data: cached });
+        return;
+      }
+
+      const inFlight = inFlightSubmitRequests.get(cacheKey);
+      if (inFlight) {
+        logger.info("Submit result served from in-flight cache", { traceId, source: "in-flight" });
+        const result = await inFlight;
+        res.json({ success: true, data: result });
+        return;
+      }
+
+      logger.info("Submitting transaction to network", { traceId });
+
+      const requestPromise = (async (): Promise<unknown> => {
+        const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
+        const tx = TB.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+        const result = await server.sendTransaction(tx);
+        submitCache.set(cacheKey, result);
+        return result;
+      })();
+
+      inFlightSubmitRequests.set(cacheKey, requestPromise);
+      let result: unknown;
+      try {
+        result = await requestPromise;
+      } catch (err: unknown) {
+        submitCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightSubmitRequests.delete(cacheKey);
+      }
+
+      const txResult = result as Record<string, unknown>;
+      logger.info("Transaction submitted successfully", {
+        traceId,
+        status: txResult?.status,
+        hash: txResult?.hash,
+      });
+
       res.json({ success: true, data: result });
-    } catch (err: any) {
-      logger.error("Failed to submit transaction", { error: err?.message });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to submit transaction", { traceId, error: message });
       res.status(500).json({ success: false, error: "Internal server error" });
     }
   },

@@ -43,10 +43,8 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
     const res = await request(buildApp())
       .get("/api/jobs/not-a-valid-contract-id")
       .expect(400);
-    expect(res.body).toEqual({
-      success: false,
-      error: "contractId must be a valid Stellar contract address (C...)",
-    });
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("contractId must be a valid Stellar contract address (C...)");
   });
 
   it("returns 400 for a Stellar account address (G...)", async () => {
@@ -54,7 +52,8 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
       .get("/api/jobs/GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX")
       .expect(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 400 for a contractId that is too short", async () => {
@@ -62,7 +61,8 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
       .get(`/api/jobs/${"C" + "A".repeat(40)}`)
       .expect(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 400 for a contractId that is too long", async () => {
@@ -70,7 +70,8 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
       .get(`/api/jobs/${"C" + "A".repeat(60)}`)
       .expect(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 400 for a contractId with special characters", async () => {
@@ -78,6 +79,7 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
       .get(`/api/jobs/${VALID_CONTRACT}!`)
       .expect(400);
     expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
   });
 
   it("returns 400 for a single-char contractId", async () => {
@@ -85,7 +87,8 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
       .get("/api/jobs/C")
       .expect(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 400 for a non-string contractId value", () => {
