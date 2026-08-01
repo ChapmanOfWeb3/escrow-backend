@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { TransactionBuilder } from "@stellar/stellar-sdk";
 
 const mockSendTransaction = jest.fn<() => Promise<unknown>>();
 const mockTx = { toXDR: () => "mock-xdr" };
@@ -15,6 +16,11 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
     sendTransaction = mockSendTransaction;
   },
 }));
+
+jest.unstable_mockModule("../src/utils/logger.js", () => ({
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+}));
+
 
 jest.unstable_mockModule("@stellar/stellar-sdk", () => ({
   TransactionBuilder: {
@@ -104,7 +110,8 @@ describe("POST /api/jobs/submit – schema validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/required/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/required/i);
   });
 
   it("returns 400 when signedXdr is an empty string", async () => {
@@ -114,7 +121,8 @@ describe("POST /api/jobs/submit – schema validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/empty/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/empty/i);
   });
 
   it("returns 400 when signedXdr is not a string", async () => {
@@ -124,7 +132,8 @@ describe("POST /api/jobs/submit – schema validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/string/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/string/i);
   });
 
   it("returns 400 when signedXdr is null", async () => {
@@ -134,18 +143,20 @@ describe("POST /api/jobs/submit – schema validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/string/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/string/i);
   });
 
-  it("error body has exactly {success, error} keys on validation failure", async () => {
+  it("error body has ValidationError format on validation failure", async () => {
     const res = await request(buildApp())
       .post("/api/jobs/submit")
       .send({})
       .expect(400);
 
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
     expect(res.body.success).toBe(false);
-    expect(typeof res.body.error).toBe("string");
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.message).toBe("Invalid request parameters");
+    expect(Array.isArray(res.body.details)).toBe(true);
   });
 });
 
@@ -426,8 +437,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({})
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/required/i) });
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/required/i);
   });
 
   it("returns 400 with 'empty' message for empty string", async () => {
@@ -436,7 +448,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({ signedXdr: "" })
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/empty/i) });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/empty/i);
   });
 
   it("returns 400 with 'string' message for numeric signedXdr", async () => {
@@ -445,7 +459,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({ signedXdr: 99999 })
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/string/i);
   });
 
   it("returns 400 with 'string' message for boolean signedXdr", async () => {
@@ -454,7 +470,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({ signedXdr: true })
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/string/i);
   });
 
   it("returns 400 with 'string' message for array signedXdr", async () => {
@@ -463,7 +481,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({ signedXdr: ["AAAAAgAA=="] })
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/string/i);
   });
 
   it("returns 400 with 'string' message for object signedXdr", async () => {
@@ -472,7 +492,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({ signedXdr: { value: "AAAAAgAA==" } })
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/string/i) });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/string/i);
   });
 
   // -------------------------------------------------------------------------
@@ -485,7 +507,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({ signedXdr: "AAAAAgAA== AAAAAgAA==" })
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/whitespace/i) });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/whitespace/i);
   });
 
   it("returns 400 for signedXdr that is only whitespace", async () => {
@@ -495,7 +519,7 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(typeof res.body.error).toBe("string");
+    expect(res.body.error).toBe("ValidationError");
   });
 
   it("returns 400 for signedXdr containing a tab character", async () => {
@@ -505,7 +529,8 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/whitespace/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/whitespace/i);
   });
 
   it("returns 400 for signedXdr containing a newline", async () => {
@@ -515,7 +540,8 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/whitespace/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/whitespace/i);
   });
 
   // -------------------------------------------------------------------------
@@ -529,7 +555,9 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .send({ signedXdr: "AAAAAgAA!!" })
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.stringMatching(/base64/i) });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/base64/i);
   });
 
   it("returns 400 for signedXdr with hyphen (not standard base64)", async () => {
@@ -540,7 +568,8 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/base64/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/base64/i);
   });
 
   it("returns 400 for signedXdr with underscore (URL-safe base64, not standard)", async () => {
@@ -550,7 +579,8 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/base64/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/base64/i);
   });
 
   it("returns 400 for signedXdr whose length is not divisible by 4", async () => {
@@ -561,7 +591,8 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/base64/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/base64/i);
   });
 
   it("returns 400 for signedXdr with padding in the wrong position", async () => {
@@ -572,7 +603,8 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/base64/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/base64/i);
   });
 
   it("returns 400 for signedXdr with too much padding (3 '=' chars)", async () => {
@@ -582,7 +614,8 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/base64/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/base64/i);
   });
 
   // -------------------------------------------------------------------------
@@ -617,7 +650,7 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
   // Response shape on every 400
   // -------------------------------------------------------------------------
 
-  it("every validation failure returns exactly { success, error } keys", async () => {
+  it("every validation failure returns ValidationError format", async () => {
     const invalids = [
       {},
       { signedXdr: "" },
@@ -633,10 +666,11 @@ describe("POST /api/jobs/submit – Zod format validation", () => {
         .send(body)
         .expect(400);
 
-      expect(Object.keys(res.body)).toEqual(["success", "error"]);
       expect(res.body.success).toBe(false);
-      expect(typeof res.body.error).toBe("string");
-      expect(res.body.error.length).toBeGreaterThan(0);
+      expect(res.body.error).toBe("ValidationError");
+      expect(res.body.message).toBe("Invalid request parameters");
+      expect(Array.isArray(res.body.details)).toBe(true);
+      expect(res.body.details.length).toBeGreaterThan(0);
     }
   });
 });
