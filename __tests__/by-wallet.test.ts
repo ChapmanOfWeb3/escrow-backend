@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import request from "supertest";
 import express from "express";
+import type { Request, Response } from "express";
 import {
   initSchema,
   insertEvent,
@@ -8,6 +9,17 @@ import {
   getJobsByWallet,
   resetJobsByWalletCache,
 } from "../src/indexer/db.js";
+
+// ---------------------------------------------------------------------------
+// Valid 56-char Stellar G-addresses (pass StrKey.isValidEd25519PublicKey).
+// Used in HTTP integration tests where the Zod param schema now validates them.
+// GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX is the well-known
+// valid address already used across the entire test suite.
+// ---------------------------------------------------------------------------
+
+/** The single well-known valid Stellar account address used project-wide. */
+const VALID_G_ADDR = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
+
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -314,11 +326,11 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       eventType: "initialized",
       ledger: 1,
       timestamp: 100,
-      dataJson: JSON.stringify({ client: addr }),
+      dataJson: JSON.stringify({ client: VALID_G_ADDR }),
     });
 
     const res = await request(app)
-      .get(`/api/jobs/by-wallet/${addr}`)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}`)
       .expect(200);
 
     expect(res.body.success).toBe(true);
@@ -360,7 +372,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       eventType: "funded",
       ledger: 50,
       timestamp: 5000,
-      dataJson: JSON.stringify({ freelancer: addr }),
+      dataJson: JSON.stringify({ freelancer: VALID_G_ADDR }),
     });
   });
 
