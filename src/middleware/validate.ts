@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { ZodSchema, ZodError } from "zod";
 import { sendError } from "../utils/api-response.js";
+import { formatValidationError } from "../utils/validation.js";
 
 type Target = "params" | "body" | "query";
 
