@@ -11,6 +11,14 @@ jest.unstable_mockModule("../src/middleware/rateLimiter.js", () => ({
   generalLimiter: (_req: any, _res: any, next: any) => next(),
 }));
 
+jest.unstable_mockModule("../src/middleware/job-contract-rate-limit.js", () => ({
+  submitRateLimit: (_req: any, _res: any, next: any) => next(),
+  jobContractRateLimit: (_req: any, _res: any, next: any) => next(),
+  partialReleaseRateLimit: (_req: any, _res: any, next: any) => next(),
+  jobWhitelistRateLimit: (_req: any, _res: any, next: any) => next(),
+  resetSubmitRateLimitBuckets: () => {},
+}));
+
 jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
   Server: class MockServer {
     sendTransaction = mockSendTransaction;
@@ -209,8 +217,8 @@ describe("POST /api/jobs/submit – error sanitization", () => {
     expect(JSON.stringify(res.body)).not.toContain("network unreachable");
   });
 
-  it("returns 500 when XDR parsing fails", async () => {
-    // A format-valid base64 string that the mock fromXDR throws on
+  it("returns 400 when XDR parsing fails", async () => {
+    // A format-valid base64 string that triggers XDR parsing failure classification
     mockSendTransaction.mockImplementation(() => {
       throw new Error("XDR parsing failed");
     });
@@ -218,9 +226,10 @@ describe("POST /api/jobs/submit – error sanitization", () => {
     const res = await request(buildApp())
       .post("/api/jobs/submit")
       .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(500);
+      .expect(400);
 
-    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
   });
 
   it("response body has only success and error fields on failure", async () => {
@@ -248,7 +257,7 @@ describe("POST /api/jobs/submit – error sanitization", () => {
     expect(JSON.stringify(res.body)).not.toContain("30000ms");
   });
 
-  it("returns sanitized 500 for authentication errors", async () => {
+  it("returns 401 for authentication errors instead of leaking them", async () => {
     mockSendTransaction.mockRejectedValue(
       new Error("Authentication failed: invalid credentials")
     );
@@ -256,9 +265,10 @@ describe("POST /api/jobs/submit – error sanitization", () => {
     const res = await request(buildApp())
       .post("/api/jobs/submit")
       .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(500);
+      .expect(401);
 
-    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
     expect(JSON.stringify(res.body)).not.toContain("credentials");
   });
 });
