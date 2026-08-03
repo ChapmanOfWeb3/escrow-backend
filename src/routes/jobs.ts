@@ -834,6 +834,7 @@ router.get(
 // ---------------------------------------------------------------------------
 router.post(
   "/:contractId/milestones/:index/claim-auto-release",
+  claimAutoReleaseRateLimit,
   validate(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for claim-auto-release", { params: req.params }),
   ),
