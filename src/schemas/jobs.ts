@@ -10,11 +10,30 @@ import { isValidStellarContractId, isValidStellarAddress } from "../utils/stella
  * Validates a Soroban contract address: starts with 'C', 56 characters total,
  * and passes the Stellar SDK StrKey check.
  */
-export const contractIdSchema = z
-  .string({ required_error: "contractId is required" })
-  .refine(isValidStellarContractId, {
-    message: "contractId must be a valid Stellar contract address (C...)",
-  });
+export const contractIdSchema = z.unknown().superRefine((value, ctx) => {
+  if (value === undefined || value === null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId is required",
+    });
+    return;
+  }
+
+  if (typeof value !== "string") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+    return;
+  }
+
+  if (!isValidStellarContractId(value)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+  }
+});
 
 /**
  * Validates a Stellar account (G…) address: starts with 'G', 56 characters,
@@ -99,17 +118,8 @@ export const submitBodySchema = z.object({
       },
       { message: "signedXdr must be a valid base64-encoded XDR string" },
     ),
+  sourceAddress: stellarAccountField("sourceAddress").optional(),
 });
-
-/**
- * Named Stellar account field (G…) with field-specific error messages.
- */
-const stellarAccountField = (field: string) =>
-  z
-    .string({ required_error: `${field} is required` })
-    .refine(isValidStellarAddress, {
-      message: `${field} must be a valid Stellar account address (G...)`,
-    });
 
 /**
  * POST /:contractId/milestones/:index/partial-release body.
