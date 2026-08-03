@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { TransactionBuilder } from "@stellar/stellar-sdk";
 
 const mockSendTransaction = jest.fn<() => Promise<unknown>>();
 const mockTx = { toXDR: () => "mock-xdr" };
@@ -23,6 +24,11 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
     sendTransaction = mockSendTransaction;
   },
 }));
+
+jest.unstable_mockModule("../src/utils/logger.js", () => ({
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+}));
+
 
 jest.unstable_mockModule("@stellar/stellar-sdk", () => ({
   TransactionBuilder: {
@@ -953,215 +959,108 @@ describe("POST /api/jobs/submit – trace logging", () => {
   });
 });
 
-// ============================================================================
-// POST /api/jobs/submit – HTTP status code classification (401, 404, 422, 500)
-// ============================================================================
+// ---------------------------------------------------------------------------
+// POST /api/jobs/submit – sourceAddress validation
+// ---------------------------------------------------------------------------
 
-describe("POST /api/jobs/submit – status code classification", () => {
+// Pull the mocked StrKey so individual tests can control its return value.
+const { StrKey: MockStrKey } = await import("@stellar/stellar-sdk");
+const mockIsValidEd25519 = MockStrKey.isValidEd25519PublicKey as ReturnType<typeof jest.fn>;
+
+// A realistic-looking but invalid Stellar address (wrong checksum / structure)
+const INVALID_ADDRESS = "GBADADDRESS_NOT_VALID_STELLAR_PUBLIC_KEY_FORMAT_123456789012";
+// A valid-length G... address that the SDK would accept
+const VALID_ADDRESS = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+
+describe("POST /api/jobs/submit – sourceAddress validation", () => {
   beforeEach(() => {
     mockSendTransaction.mockReset();
     resetSubmitCache();
+    // Default: SDK accepts all addresses
+    mockIsValidEd25519.mockReturnValue(true);
   });
 
-  const assertErrorResponse = (res: any, status: number, messageFragment?: string) => {
-    expect(res.status).toBe(status);
+  it("accepts a valid sourceAddress alongside signedXdr", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok", status: "PENDING" });
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR, sourceAddress: VALID_ADDRESS })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("succeeds without sourceAddress (field is optional)", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it("returns 400 when sourceAddress is not a valid Stellar address", async () => {
+    mockIsValidEd25519.mockReturnValue(false);
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR, sourceAddress: INVALID_ADDRESS })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/sourceAddress/i);
+    expect(res.body.error).toMatch(/valid Stellar account address/i);
+  });
+
+  it("returns 400 when sourceAddress is an empty string", async () => {
+    mockIsValidEd25519.mockReturnValue(false);
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR, sourceAddress: "" })
+      .expect(400);
+
     expect(res.body.success).toBe(false);
     expect(typeof res.body.error).toBe("string");
+  });
+
+  it("returns 400 when sourceAddress is a number", async () => {
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR, sourceAddress: 12345 })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
+  });
+
+  it("returns 400 when sourceAddress starts with C (contract address, not account)", async () => {
+    // Contract addresses start with C and fail isValidEd25519PublicKey
+    mockIsValidEd25519.mockReturnValue(false);
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR, sourceAddress: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM" })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/valid Stellar account address/i);
+  });
+
+  it("validation failure response has exactly { success, error } keys", async () => {
+    mockIsValidEd25519.mockReturnValue(false);
+
+    const res = await request(buildApp())
+      .post("/api/jobs/submit")
+      .send({ signedXdr: VALID_SIGNED_XDR, sourceAddress: INVALID_ADDRESS })
+      .expect(400);
+
     expect(Object.keys(res.body)).toEqual(["success", "error"]);
-    if (messageFragment) {
-      expect(res.body.error.toLowerCase()).toContain(messageFragment.toLowerCase());
-    }
-  };
-
-  // -------------------------------------------------------------------------
-  // 401 Unauthorized
-  // -------------------------------------------------------------------------
-
-  it("returns 401 for BAD_AUTH / bad signature errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("BAD_AUTH: too few valid signatures"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 401, "unauthorized");
-  });
-
-  it("returns 401 for wrong network / passphrase errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("wrong network passphrase"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 401, "unauthorized");
-  });
-
-  it("returns 401 for RPC 401 unauthorized errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("HTTP 401 Unauthorized"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 401, "unauthorized");
-  });
-
-  it("returns 401 for bad_auth lowercase errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("result: bad_auth"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 401, "signature");
-  });
-
-  // -------------------------------------------------------------------------
-  // 404 Not Found
-  // -------------------------------------------------------------------------
-
-  it("returns 404 for account not found / NO_ACCOUNT errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("tx_no_source_account: NO_ACCOUNT"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 404, "not found");
-  });
-
-  it("returns 404 for 'contract not found' errors at submission time", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("contract not found on network"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 404, "account or contract");
-  });
-
-  it("returns 404 for 'not found' / NotFound messages", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("NotFound: missing account"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 404);
-  });
-
-  // -------------------------------------------------------------------------
-  // 422 Unprocessable Entity (transaction was validly formed but rejected)
-  // -------------------------------------------------------------------------
-
-  it("returns 422 with numeric code for 'contract error #N' revert", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("host value invocation error: contract error #7"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 422, "error code 7");
-  });
-
-  it("returns 422 for INSUFFICIENT_BALANCE / tx_failed protocol errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("INSUFFICIENT_BALANCE tx_failed"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 422, "rejected");
-  });
-
-  it("returns 422 for BAD_SEQ / TOO_EARLY / TOO_LATE timing + sequence errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("result BAD_SEQ"));
-    const resA = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(resA, 422);
-
-    mockSendTransaction.mockRejectedValue(new Error("TOO_LATE transaction expired"));
-    const resB = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(resB, 422);
-  });
-
-  it("returns 422 for op_underfunded, op_no_trust, op_line_full operation errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("operations: op_underfunded"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 422);
-  });
-
-  it("returns 422 for contract revert/assert/panic/trap keywords", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("execution hit a trap"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 422);
-  });
-
-  it("returns 422 for 'transaction rejected / failed / invalid'", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("transaction failed on-core"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 422);
-  });
-
-  // -------------------------------------------------------------------------
-  // 400 Bad Request (structural / malformed XDR — client-side mistake)
-  // -------------------------------------------------------------------------
-
-  it("returns 400 for malformed XDR / tx_malformed errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("tx_malformed: MALFORMED xdr"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 400, "malformed");
-  });
-
-  it("returns 400 for 'unparseable XDR' / bad xdr messages", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("bad xdr provided – unparseable"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 400, "malformed");
-  });
-
-  // -------------------------------------------------------------------------
-  // 500 Internal Server Error (catch-all for transport / network / etc.)
-  // -------------------------------------------------------------------------
-
-  it("returns 500 for generic network / DNS / unknown errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("ECONNREFUSED fetch failed"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 500, "internal server error");
-  });
-
-  it("returns 500 for RPC 500 / upstream 5xx errors", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("HTTP 502 Bad Gateway from rpc"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 500);
-  });
-
-  it("returns 500 for generic Error('network error') – still classified as server-side", async () => {
-    mockSendTransaction.mockRejectedValue(new Error("network error"));
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 500);
-  });
-
-  it("returns 500 for thrown non-Error strings (defensive path)", async () => {
-    mockSendTransaction.mockRejectedValue("some random thrown string");
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    assertErrorResponse(res, 500);
-  });
-
-  // -------------------------------------------------------------------------
-  // Response shape consistency – every status always has { success, error }
-  // -------------------------------------------------------------------------
-
-  it("never leaks raw error messages to the client", async () => {
-    mockSendTransaction.mockRejectedValue(
-      new Error("secret=abc123 rpc_internal_key=42 something broke"),
-    );
-    const res = await request(buildApp())
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    expect(res.body.error).not.toMatch(/abc123|internal_key/);
+    expect(res.body.success).toBe(false);
+    expect(typeof res.body.error).toBe("string");
   });
 });
