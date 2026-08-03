@@ -105,6 +105,17 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
       ]);
     });
 
+    it("returns 400 for an invalid contractId string", async () => {
+      const res = await request(buildApp())
+        .get("/api/jobs/123/whitelist")
+        .expect(400);
+
+      expect(res.body).toEqual({
+        success: false,
+        error: "contractId must be a valid Stellar contract address (C...)",
+      });
+    });
+
     it("returns 400 for a Stellar account address used as contractId", async () => {
       const res = await request(buildApp())
         .get(
