@@ -10,11 +10,30 @@ import { isValidStellarContractId, isValidStellarAddress } from "../utils/stella
  * Validates a Soroban contract address: starts with 'C', 56 characters total,
  * and passes the Stellar SDK StrKey check.
  */
-export const contractIdSchema = z
-  .string({ required_error: "contractId is required" })
-  .refine(isValidStellarContractId, {
-    message: "contractId must be a valid Stellar contract address (C...)",
-  });
+export const contractIdSchema = z.unknown().superRefine((value, ctx) => {
+  if (value === undefined || value === null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId is required",
+    });
+    return;
+  }
+
+  if (typeof value !== "string") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+    return;
+  }
+
+  if (!isValidStellarContractId(value)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+  }
+});
 
 /**
  * Validates a Stellar account (G…) address: starts with 'G', 56 characters,
@@ -99,17 +118,8 @@ export const submitBodySchema = z.object({
       },
       { message: "signedXdr must be a valid base64-encoded XDR string" },
     ),
+  sourceAddress: stellarAccountField("sourceAddress").optional(),
 });
-
-/**
- * Named Stellar account field (G…) with field-specific error messages.
- */
-const stellarAccountField = (field: string) =>
-  z
-    .string({ required_error: `${field} is required` })
-    .refine(isValidStellarAddress, {
-      message: `${field} must be a valid Stellar account address (G...)`,
-    });
 
 /**
  * POST /:contractId/milestones/:index/partial-release body.
@@ -228,38 +238,22 @@ export const createJobDraftBodySchema = z.object({
   requirements: z.array(z.string()).optional().default([]),
 });
 
-/**
- * Pagination query params: ?page=1&limit=10
- * Both values are optional (defaults handled by the route), but when provided
- * they must be positive integers (page) or within 1–100 (limit).
- */
-export const byWalletQuerySchema = z.object({
-  page: z
-    .string()
-    .optional()
-    .transform((v) => (v === undefined ? 1 : parseInt(v, 10)))
-    .pipe(
-      z
-        .number()
-        .int("page must be a positive integer")
-        .min(1, "page must be a positive integer"),
-    ),
-  limit: z
-    .string()
-    .optional()
-    .transform((v) => (v === undefined ? 10 : parseInt(v, 10)))
-    .pipe(
-      z
-        .number()
-        .int("limit must be between 1 and 100")
-        .min(1, "limit must be between 1 and 100")
-        .max(100, "limit must be between 1 and 100"),
-    ),
-});
-
-/** Route params: /by-wallet/:address */
-export const byWalletParamsSchema = z.object({
-  address: stellarAddressSchema,
+/** POST /create-job-draft body */
+export const createJobDraftBodySchema = z.object({
+  clientAddress: stellarAddressSchema,
+  freelancerAddress: stellarAddressSchema,
+  arbiterAddress: stellarAddressSchema,
+  tokenAddress: z
+    .string({ required_error: "tokenAddress is required" })
+    .min(1, "tokenAddress cannot be empty"),
+  milestones: z
+    .array(
+      z.object({
+        amount: amountSchema,
+      }),
+      { required_error: "milestones is required" },
+    )
+    .min(1, "milestones must contain at least one entry"),
 });
 
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;

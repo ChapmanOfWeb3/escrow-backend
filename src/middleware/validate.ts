@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { ZodSchema, ZodError } from "zod";
 import { sendError } from "../utils/api-response.js";
+import { formatValidationError } from "../utils/validation.js";
 
 type Target = "params" | "body" | "query";
 
@@ -65,8 +66,7 @@ export function validateWithFields(
     if (!result.success) {
       onReject?.(req);
       const errors = (result.error as ZodError).errors;
-      const first = errors[0];
-      
+
       const fields = errors.reduce((acc, err) => {
         const path = err.path.join(".");
         if (path) {
@@ -77,7 +77,23 @@ export function validateWithFields(
         return acc;
       }, {} as Record<string, string>);
 
-      res.status(400).json({ success: false, error: first.message, fields });
+      // Same body as validate(), plus a `fields` map keyed by dotted path for
+      // clients that bind errors straight onto form inputs.
+      const details: ValidationErrorDetail[] = errors.map((err) => ({
+        field:
+          Array.isArray(err.path) && err.path.length > 0
+            ? String(err.path[0])
+            : "unknown",
+        message: err.message,
+      }));
+
+      res.status(400).json({
+        success: false,
+        error: "ValidationError",
+        message: "Invalid request parameters",
+        details,
+        fields,
+      });
       return;
     }
     

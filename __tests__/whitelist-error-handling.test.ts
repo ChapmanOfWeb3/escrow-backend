@@ -200,8 +200,9 @@ describe("GET /api/jobs/:contractId/whitelist – Robust Error Handling (Issue #
         .expect(400);
 
       expect(res.body.success).toBe(false);
-      expect(res.body.error).toMatch(/contractId/);
-      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+      expect(res.body.error).toBe("ValidationError");
+      expect(res.body.details[0].field).toBe("contractId");
+      expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     });
 
     it("returns 400 for account address instead of contract", async () => {
@@ -212,7 +213,8 @@ describe("GET /api/jobs/:contractId/whitelist – Robust Error Handling (Issue #
         .expect(400);
 
       expect(res.body.success).toBe(false);
-      expect(res.body.error).toMatch(/valid Stellar contract address/i);
+      expect(res.body.error).toBe("ValidationError");
+      expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     });
 
     it("never calls RPC on invalid contractId", async () => {
@@ -290,7 +292,7 @@ describe("GET /api/jobs/:contractId/whitelist – Robust Error Handling (Issue #
         .expect(500);
 
       expect(mockLoggerError).toHaveBeenCalledWith(
-        "Failed to fetch whitelisted tokens: unexpected error",
+        "Failed to fetch whitelisted tokens",
         { contractId: VALID_CONTRACT, error: detailedError }
       );
     });
@@ -512,6 +514,7 @@ describe("GET /api/jobs/:contractId/whitelist – Robust Error Handling (Issue #
       for (const scenario of scenarios) {
         mockSimulateTransaction.mockReset();
         mockLoggerError.mockReset();
+        delete process.env.API_KEY;
         scenario.setup();
 
         const res = await request(buildApp())
@@ -602,7 +605,7 @@ describe("GET /api/jobs/:contractId/whitelist – Robust Error Handling (Issue #
         .expect(500);
 
       expect(mockLoggerError).toHaveBeenCalledWith(
-        "Failed to fetch whitelisted tokens: unexpected error",
+        "Failed to fetch whitelisted tokens",
         { contractId: VALID_CONTRACT, error: "failure" }
       );
     });
