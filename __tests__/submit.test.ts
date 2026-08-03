@@ -11,11 +11,17 @@ jest.unstable_mockModule("../src/middleware/rateLimiter.js", () => ({
   generalLimiter: (_req: any, _res: any, next: any) => next(),
 }));
 
+// Must stub every limiter routes/jobs.ts imports: an ESM module mock replaces
+// the whole module, so any omitted export breaks the import of the router.
 jest.unstable_mockModule("../src/middleware/job-contract-rate-limit.js", () => ({
   submitRateLimit: (_req: any, _res: any, next: any) => next(),
   jobContractRateLimit: (_req: any, _res: any, next: any) => next(),
   partialReleaseRateLimit: (_req: any, _res: any, next: any) => next(),
   jobWhitelistRateLimit: (_req: any, _res: any, next: any) => next(),
+  buildTxRateLimit: (_req: any, _res: any, next: any) => next(),
+  timeRemainingRateLimit: (_req: any, _res: any, next: any) => next(),
+  createJobDraftRateLimit: (_req: any, _res: any, next: any) => next(),
+  claimAutoReleaseRateLimit: (_req: any, _res: any, next: any) => next(),
   resetSubmitRateLimitBuckets: () => {},
 }));
 
@@ -240,7 +246,7 @@ describe("POST /api/jobs/submit – error sanitization", () => {
       .send({ signedXdr: VALID_SIGNED_XDR })
       .expect(500);
 
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    expect(Object.keys(res.body).sort()).toEqual(["error", "success"].sort());
     expect(res.body.success).toBe(false);
     expect(typeof res.body.error).toBe("string");
   });
@@ -1012,8 +1018,9 @@ describe("POST /api/jobs/submit – sourceAddress validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/sourceAddress/i);
-    expect(res.body.error).toMatch(/valid Stellar account address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/sourceAddress/i);
+    expect(res.body.details[0].message).toMatch(/valid Stellar account address/i);
   });
 
   it("returns 400 when sourceAddress is an empty string", async () => {
@@ -1048,7 +1055,8 @@ describe("POST /api/jobs/submit – sourceAddress validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar account address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar account address/i);
   });
 
   it("validation failure response has exactly { success, error } keys", async () => {
@@ -1059,7 +1067,9 @@ describe("POST /api/jobs/submit – sourceAddress validation", () => {
       .send({ signedXdr: VALID_SIGNED_XDR, sourceAddress: INVALID_ADDRESS })
       .expect(400);
 
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    expect(Object.keys(res.body).sort()).toEqual(
+      ["details", "error", "message", "success"].sort(),
+    );
     expect(res.body.success).toBe(false);
     expect(typeof res.body.error).toBe("string");
   });

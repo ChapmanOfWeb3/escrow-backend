@@ -17,6 +17,9 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
 }));
 
 const { default: router } = await import("../src/routes/jobs.js");
+const { resetJobContractRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -27,6 +30,7 @@ function buildApp() {
 
 describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
   beforeEach(() => {
+    resetJobContractRateLimitBuckets();
     mockGetAccount.mockReset();
     mockSimulateTransaction.mockReset();
     delete process.env.API_KEY;
@@ -105,7 +109,14 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({
       success: false,
-      error: "contractId must be a valid Stellar contract address (C...)",
+      error: "ValidationError",
+      message: "Invalid request parameters",
+      details: [
+        {
+          field: "contractId",
+          message: "contractId must be a valid Stellar contract address (C...)",
+        },
+      ],
     });
   });
 

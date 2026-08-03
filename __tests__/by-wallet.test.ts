@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import request from "supertest";
 import express from "express";
 import type { Request, Response } from "express";
+import { resetByWalletRateLimitBuckets } from "../src/middleware/rateLimiter.js";
 import {
   initSchema,
   insertEvent,
@@ -66,6 +67,7 @@ afterAll(() => {
 });
 
 beforeEach(() => {
+    resetByWalletRateLimitBuckets();
   testDb.exec("DELETE FROM events");
   resetJobsByWalletCache();
 });
@@ -164,11 +166,11 @@ describe("getJobsByWallet() – unit", () => {
     seedEvent(testDb, { contractId: "C2", eventType: "funded",      ledger: 20, timestamp: 200, dataJson: JSON.stringify({ client: addr }) });
     seedEvent(testDb, { contractId: "C3", eventType: "approved",    ledger: 30, timestamp: 300, dataJson: JSON.stringify({ client: addr }) });
 
-    const result = getJobsByWallet(addr);
+    const result = await getJobsByWallet(addr);
     expect(result.total).toBe(3);
   });
 
-  it("does not match address that only appears in non-role fields", () => {
+  it("does not match address that only appears in non-role fields", async () => {
     const addr = "GNOTAROLE";
     seedEvent(testDb, {
       contractId: "C-FAKE",
@@ -178,11 +180,11 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ token: addr, some_other_field: addr }),
     });
 
-    const result = getJobsByWallet(addr);
+    const result = await getJobsByWallet(addr);
     expect(result.total).toBe(0);
   });
 
-  it("correctly extracts milestone_count from data_json milestones array", () => {
+  it("correctly extracts milestone_count from data_json milestones array", async () => {
     const addr = "GMILESTONETEST";
     const milestones = [{ amount: "100" }, { amount: "200" }, { amount: "300" }];
     seedEvent(testDb, {
@@ -193,11 +195,11 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ client: addr, milestones }),
     });
 
-    const result = getJobsByWallet(addr);
+    const result = await getJobsByWallet(addr);
     expect(result.jobs[0].milestone_count).toBe(3);
   });
 
-  it("returns milestone_count=0 when data_json has no milestones field", () => {
+  it("returns milestone_count=0 when data_json has no milestones field", async () => {
     const addr = "GNOMILESTONES";
     seedEvent(testDb, {
       contractId: "CONTRACT-NMS",
@@ -207,11 +209,11 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ client: addr }),
     });
 
-    const result = getJobsByWallet(addr);
+    const result = await getJobsByWallet(addr);
     expect(result.jobs[0].milestone_count).toBe(0);
   });
 
-  it("returns milestone_count=0 when milestones field is not an array", () => {
+  it("returns milestone_count=0 when milestones field is not an array", async () => {
     const addr = "GBADMILESTONES";
     seedEvent(testDb, {
       contractId: "CONTRACT-BMS",
@@ -222,11 +224,11 @@ describe("getJobsByWallet() – unit", () => {
     });
 
     const result = await getJobsByWallet(addr);
-    expect(result.total).toBe(3);
+    expect(result.jobs[0].milestone_count).toBe(0);
   });
 
-  it("does not match address that only appears in non-role fields", async () => {
-    const addr = "GNOTAROLE";
+  it("role priority: client takes precedence when address matches all three roles in same event", async () => {
+    const addr = "GMULTIROLE";
     seedEvent(testDb, {
       contractId: "CONTRACT-MULTI",
       eventType: "initialized",
@@ -236,7 +238,9 @@ describe("getJobsByWallet() – unit", () => {
     });
 
     const result = await getJobsByWallet(addr);
-    expect(result.total).toBe(0);
+    expect(result.total).toBe(1);
+    // CASE expression checks client first → role = "client"
+    expect(result.jobs[0].role).toBe("client");
   });
 
   // -------------------------------------------------------------------------
@@ -288,11 +292,11 @@ describe("getJobsByWallet() – unit", () => {
     expect(p.jobs).toHaveLength(0);
   });
 
-  it("pagination: page=3 limit=10 returns correct page/limit in result", () => {
+  it("pagination: page=3 limit=10 returns correct page/limit in result", async () => {
     const addr = "GPAGER5";
     seedEvent(testDb, { contractId: "G1", eventType: "initialized", ledger: 10, timestamp: 100, dataJson: JSON.stringify({ client: addr }) });
 
-    const result = getJobsByWallet(addr, 3, 10);
+    const result = await getJobsByWallet(addr, 3, 10);
     expect(result.page).toBe(3);
     expect(result.limit).toBe(10);
   });
@@ -381,15 +385,8 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       .get("/api/jobs/by-wallet/GSOMEADDR?page=-1")
       .expect(400);
 
-    const job = res.body.data.jobs[0];
-    expect(job).toMatchObject({
-      contract_id: expect.any(String),
-      role: expect.stringMatching(/^(client|freelancer|arbiter)$/),
-      milestone_count: expect.any(Number),
-      latest_event_type: expect.any(String),
-      latest_ledger: expect.any(Number),
-      latest_timestamp: expect.any(Number),
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
   });
 
   it("serves concurrent requests from the in-memory wallet jobs cache", async () => {

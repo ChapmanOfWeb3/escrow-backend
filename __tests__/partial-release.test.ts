@@ -247,7 +247,7 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
       .expect(404);
     expect(res.body).toEqual({
       success: false,
-      error: "Contract not found on network",
+      error: "Source account not found on network",
     });
   });
 
