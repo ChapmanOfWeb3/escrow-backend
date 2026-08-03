@@ -157,3 +157,106 @@ export function jobWhitelistRateLimit(
 
   next();
 }
+
+const timeRemainingBuckets = new Map<string, RateBucket>();
+
+export function resetTimeRemainingRateLimitBuckets(): void {
+  timeRemainingBuckets.clear();
+}
+
+function resolveTimeRemainingWindowMs(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_WINDOW_MS ?? "60000");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60000;
+}
+
+function resolveTimeRemainingMaxRequests(): number {
+  const configured = Number(process.env.TIME_REMAINING_RATE_MAX ?? "60");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60;
+}
+
+/** Dedicated rate limiter for GET /api/jobs/:contractId/milestones/:index/time-remaining. */
+export function timeRemainingRateLimit(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const windowMs = resolveTimeRemainingWindowMs();
+  const maxRequests = resolveTimeRemainingMaxRequests();
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+
+  let bucket = timeRemainingBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + windowMs };
+    timeRemainingBuckets.set(key, bucket);
+  }
+
+  bucket.count += 1;
+
+  const remaining = Math.max(0, maxRequests - bucket.count);
+  res.setHeader("X-RateLimit-Limit", String(maxRequests));
+  res.setHeader("X-RateLimit-Remaining", String(remaining));
+  res.setHeader("X-RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+
+  if (bucket.count > maxRequests) {
+    res.status(429).json({
+      success: false,
+      error: "Too many requests, please try again later",
+    });
+    return;
+  }
+
+  next();
+}
+
+
+const buildTxBuckets = new Map<string, RateBucket>();
+
+export function resetBuildTxRateLimitBuckets(): void {
+  buildTxBuckets.clear();
+}
+
+function resolveBuildTxWindowMs(): number {
+  const configured = Number(process.env.BUILD_TX_RATE_WINDOW_MS ?? "60000");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60000;
+}
+
+function resolveBuildTxMaxRequests(): number {
+  const configured = Number(process.env.BUILD_TX_RATE_MAX ?? "20");
+  return Number.isFinite(configured) && configured > 0 ? configured : 20;
+}
+
+/** Dedicated rate limiter for POST /api/jobs/build-tx. */
+export function buildTxRateLimit(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const windowMs = resolveBuildTxWindowMs();
+  const maxRequests = resolveBuildTxMaxRequests();
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+
+  let bucket = buildTxBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + windowMs };
+    buildTxBuckets.set(key, bucket);
+  }
+
+  bucket.count += 1;
+
+  const remaining = Math.max(0, maxRequests - bucket.count);
+  res.setHeader("X-RateLimit-Limit", String(maxRequests));
+  res.setHeader("X-RateLimit-Remaining", String(remaining));
+  res.setHeader("X-RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+
+  if (bucket.count > maxRequests) {
+    res.status(429).json({
+      success: false,
+      error: "Too many requests, please try again later",
+    });
+    return;
+  }
+
+  next();
+}
