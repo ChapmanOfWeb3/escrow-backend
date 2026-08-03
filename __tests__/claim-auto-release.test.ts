@@ -45,10 +45,19 @@ const MOCK_ACCOUNT = {
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – params validation", () => {
   beforeEach(() => {
+    delete process.env.API_KEY;
+    delete process.env.ALLOWED_ORIGINS;
     resetClaimAutoReleaseCache();
     resetClaimAutoReleaseRateLimitBuckets();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
+  });
+
+  afterEach(() => {
+    if (originalApiKey === undefined) delete process.env.API_KEY;
+    else process.env.API_KEY = originalApiKey;
+    if (originalAllowedOrigins === undefined) delete process.env.ALLOWED_ORIGINS;
+    else process.env.ALLOWED_ORIGINS = originalAllowedOrigins;
   });
 
   it("returns 400 for an invalid contractId", async () => {
