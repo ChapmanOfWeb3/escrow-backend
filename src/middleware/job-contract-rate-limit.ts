@@ -113,6 +113,26 @@ export function resetJobWhitelistRateLimitBuckets(): void {
   whitelistBuckets.clear();
 }
 
+// ---------------------------------------------------------------------------
+// createJobDraft rate limiter
+// ---------------------------------------------------------------------------
+
+const createJobDraftBuckets = new Map<string, RateBucket>();
+
+export function resetCreateJobDraftRateLimitBuckets(): void {
+  createJobDraftBuckets.clear();
+}
+
+function resolveCreateJobDraftWindowMs(): number {
+  const configured = Number(process.env.CREATE_JOB_DRAFT_RATE_WINDOW_MS ?? "60000");
+  return Number.isFinite(configured) && configured > 0 ? configured : 60000;
+}
+
+function resolveCreateJobDraftMaxRequests(): number {
+  const configured = Number(process.env.CREATE_JOB_DRAFT_RATE_MAX ?? "5");
+  return Number.isFinite(configured) && configured > 0 ? configured : 5;
+}
+
 function resolveWhitelistWindowMs(): number {
   const configured = Number(process.env.JOB_WHITELIST_RATE_WINDOW_MS ?? "60000");
   return Number.isFinite(configured) && configured > 0 ? configured : 60000;

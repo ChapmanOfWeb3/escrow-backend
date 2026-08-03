@@ -593,6 +593,39 @@ router.get(
 );
 
 // ---------------------------------------------------------------------------
+// POST /api/jobs/create-job-draft – persist a job draft (rate-limited)
+// ---------------------------------------------------------------------------
+router.post(
+  "/create-job-draft",
+  createJobDraftRateLimit,
+  validate(createJobDraftBodySchema, "body", (req) =>
+    logger.warn("Invalid create-job-draft request body", { body: req.body }),
+  ),
+  (req: Request, res: Response) => {
+    const { clientAddress, freelancerAddress, arbiterAddress, tokenAddress, milestones } =
+      req.body;
+
+    logger.info("Job draft created", {
+      clientAddress,
+      freelancerAddress,
+      arbiterAddress,
+      tokenAddress,
+      milestoneCount: milestones.length,
+    });
+
+    sendSuccess(res, {
+      draft: {
+        clientAddress,
+        freelancerAddress,
+        arbiterAddress,
+        tokenAddress,
+        milestones,
+      },
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
 // POST /api/jobs/build-tx – build an unsigned transaction for the frontend
 // ---------------------------------------------------------------------------
 router.post(
