@@ -10,11 +10,30 @@ import { isValidStellarContractId, isValidStellarAddress } from "../utils/stella
  * Validates a Soroban contract address: starts with 'C', 56 characters total,
  * and passes the Stellar SDK StrKey check.
  */
-export const contractIdSchema = z
-  .string({ required_error: "contractId is required" })
-  .refine(isValidStellarContractId, {
-    message: "contractId must be a valid Stellar contract address (C...)",
-  });
+export const contractIdSchema = z.unknown().superRefine((value, ctx) => {
+  if (value === undefined || value === null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId is required",
+    });
+    return;
+  }
+
+  if (typeof value !== "string") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+    return;
+  }
+
+  if (!isValidStellarContractId(value)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+  }
+});
 
 /**
  * Validates a Stellar account (G…) address: starts with 'G', 56 characters,
@@ -72,35 +91,16 @@ export const contractMilestoneParamsSchema = z.object({
   index: milestoneIndexSchema,
 });
 
-const buildTxArgSchema = z
-  .object({
-    type: z.string({ required_error: "arg type is required" }).min(1, "arg type cannot be empty"),
-    value: z.any(),
-  })
-  .passthrough()
-  .superRefine((arg, ctx) => {
-    if (arg.type === "address") {
-      const value = arg.value;
-      if (typeof value !== "string" || !isValidStellarAddress(value)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "address arguments must be valid Stellar account addresses (G...)",
-          path: ["value"],
-        });
-      }
-    }
-  });
-
-/** POST /build-tx body */
+/** POST /build-tx body schema validation */
 export const buildTxBodySchema = z.object({
+  // Must be a valid Soroban contract ID
   contractId: contractIdSchema,
+  // The contract method name to call
   method: z.string({ required_error: "method is required" }).min(1, "method cannot be empty"),
-  args: z.array(buildTxArgSchema).optional().default([]),
-  sourceAddress: z
-    .string({ required_error: "sourceAddress is required" })
-    .refine((value) => StrKey.isValidEd25519PublicKey(value), {
-      message: "sourceAddress must be a valid Stellar account address (G…, 56 chars)",
-    }),
+  // Optional arguments for the method, defaults to an empty array
+  args: z.array(z.any()).optional().default([]),
+  // The Stellar address of the transaction source account
+  sourceAddress: stellarAddressSchema,
 });
 
 /** POST /submit body */
@@ -118,17 +118,8 @@ export const submitBodySchema = z.object({
       },
       { message: "signedXdr must be a valid base64-encoded XDR string" },
     ),
+  sourceAddress: stellarAccountField("sourceAddress").optional(),
 });
-
-/**
- * Named Stellar account field (G…) with field-specific error messages.
- */
-const stellarAccountField = (field: string) =>
-  z
-    .string({ required_error: `${field} is required` })
-    .refine(isValidStellarAddress, {
-      message: `${field} must be a valid Stellar account address (G...)`,
-    });
 
 /**
  * POST /:contractId/milestones/:index/partial-release body.
@@ -159,7 +150,7 @@ export const partialReleaseBodySchema = z.object({
 /** POST /:contractId/milestones/:index/claim-auto-release body */
 export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
-});
+}).strict();
 
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
@@ -245,6 +236,24 @@ export const createJobDraftBodySchema = z.object({
     .min(1, "milestones must contain at least one milestone"),
   acceptedAssets: z.array(z.string()).optional().default([]),
   requirements: z.array(z.string()).optional().default([]),
+});
+
+/** POST /create-job-draft body */
+export const createJobDraftBodySchema = z.object({
+  clientAddress: stellarAddressSchema,
+  freelancerAddress: stellarAddressSchema,
+  arbiterAddress: stellarAddressSchema,
+  tokenAddress: z
+    .string({ required_error: "tokenAddress is required" })
+    .min(1, "tokenAddress cannot be empty"),
+  milestones: z
+    .array(
+      z.object({
+        amount: amountSchema,
+      }),
+      { required_error: "milestones is required" },
+    )
+    .min(1, "milestones must contain at least one entry"),
 });
 
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;

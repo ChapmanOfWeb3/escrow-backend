@@ -85,7 +85,7 @@ describe("POST /api/jobs/submit – payload validation", () => {
   it("returns standard error shape for invalid payloads", async () => {
     const res = await request(buildApp())
       .post("/api/jobs/submit")
-      .send(null)
+      .send(null as any) // cast to any so TypeScript accepts sending `null` in the test
       .expect(400);
 
     expect(res.body).toMatchObject({ success: false, error: expect.any(String) });

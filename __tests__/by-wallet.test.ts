@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import request from "supertest";
 import express from "express";
+import type { Request, Response } from "express";
 import {
   initSchema,
   insertEvent,
@@ -8,6 +9,17 @@ import {
   getJobsByWallet,
   resetJobsByWalletCache,
 } from "../src/indexer/db.js";
+
+// ---------------------------------------------------------------------------
+// Valid 56-char Stellar G-addresses (pass StrKey.isValidEd25519PublicKey).
+// Used in HTTP integration tests where the Zod param schema now validates them.
+// GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX is the well-known
+// valid address already used across the entire test suite.
+// ---------------------------------------------------------------------------
+
+/** The single well-known valid Stellar account address used project-wide. */
+const VALID_G_ADDR = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
+
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -143,39 +155,20 @@ describe("getJobsByWallet() – unit", () => {
 
     const result = await getJobsByWallet(FREELANCER);
     expect(result.total).toBe(1);
-    // Should capture the most-recent event type (highest ledger comes first)
     expect(result.jobs[0].latest_event_type).toBe("funded");
   });
 
   it("returns distinct jobs across multiple contracts", async () => {
     const addr = "GMULTICONTRACT";
-    seedEvent(testDb, {
-      contractId: "C1",
-      eventType: "initialized",
-      ledger: 10,
-      timestamp: 100,
-      dataJson: JSON.stringify({ client: addr }),
-    });
-    seedEvent(testDb, {
-      contractId: "C2",
-      eventType: "funded",
-      ledger: 20,
-      timestamp: 200,
-      dataJson: JSON.stringify({ client: addr }),
-    });
-    seedEvent(testDb, {
-      contractId: "C3",
-      eventType: "approved",
-      ledger: 30,
-      timestamp: 300,
-      dataJson: JSON.stringify({ client: addr }),
-    });
+    seedEvent(testDb, { contractId: "C1", eventType: "initialized", ledger: 10, timestamp: 100, dataJson: JSON.stringify({ client: addr }) });
+    seedEvent(testDb, { contractId: "C2", eventType: "funded",      ledger: 20, timestamp: 200, dataJson: JSON.stringify({ client: addr }) });
+    seedEvent(testDb, { contractId: "C3", eventType: "approved",    ledger: 30, timestamp: 300, dataJson: JSON.stringify({ client: addr }) });
 
-    const result = await getJobsByWallet(addr);
+    const result = getJobsByWallet(addr);
     expect(result.total).toBe(3);
   });
 
-  it("does not match address that only appears in non-role fields", async () => {
+  it("does not match address that only appears in non-role fields", () => {
     const addr = "GNOTAROLE";
     seedEvent(testDb, {
       contractId: "C-FAKE",
@@ -185,24 +178,75 @@ describe("getJobsByWallet() – unit", () => {
       dataJson: JSON.stringify({ token: addr, some_other_field: addr }),
     });
 
+    const result = getJobsByWallet(addr);
+    expect(result.total).toBe(0);
+  });
+
+  it("correctly extracts milestone_count from data_json milestones array", () => {
+    const addr = "GMILESTONETEST";
+    const milestones = [{ amount: "100" }, { amount: "200" }, { amount: "300" }];
+    seedEvent(testDb, {
+      contractId: "CONTRACT-MS",
+      eventType: "initialized",
+      ledger: 10,
+      timestamp: 100,
+      dataJson: JSON.stringify({ client: addr, milestones }),
+    });
+
+    const result = getJobsByWallet(addr);
+    expect(result.jobs[0].milestone_count).toBe(3);
+  });
+
+  it("returns milestone_count=0 when data_json has no milestones field", () => {
+    const addr = "GNOMILESTONES";
+    seedEvent(testDb, {
+      contractId: "CONTRACT-NMS",
+      eventType: "initialized",
+      ledger: 10,
+      timestamp: 100,
+      dataJson: JSON.stringify({ client: addr }),
+    });
+
+    const result = getJobsByWallet(addr);
+    expect(result.jobs[0].milestone_count).toBe(0);
+  });
+
+  it("returns milestone_count=0 when milestones field is not an array", () => {
+    const addr = "GBADMILESTONES";
+    seedEvent(testDb, {
+      contractId: "CONTRACT-BMS",
+      eventType: "initialized",
+      ledger: 10,
+      timestamp: 100,
+      dataJson: JSON.stringify({ client: addr, milestones: "not-an-array" }),
+    });
+
+    const result = await getJobsByWallet(addr);
+    expect(result.total).toBe(3);
+  });
+
+  it("does not match address that only appears in non-role fields", async () => {
+    const addr = "GNOTAROLE";
+    seedEvent(testDb, {
+      contractId: "CONTRACT-MULTI",
+      eventType: "initialized",
+      ledger: 10,
+      timestamp: 100,
+      dataJson: JSON.stringify({ client: addr, freelancer: addr, arbiter: addr }),
+    });
+
     const result = await getJobsByWallet(addr);
     expect(result.total).toBe(0);
   });
 
   // -------------------------------------------------------------------------
-  // Pagination
+  // Pagination – unit layer
   // -------------------------------------------------------------------------
 
   it("pagination: page=1 limit=2 returns first 2 of 5 jobs", async () => {
     const addr = "GPAGER";
     for (let i = 1; i <= 5; i++) {
-      seedEvent(testDb, {
-        contractId: `C${i}`,
-        eventType: "initialized",
-        ledger: i * 10,
-        timestamp: i * 100,
-        dataJson: JSON.stringify({ client: addr }),
-      });
+      seedEvent(testDb, { contractId: `C${i}`, eventType: "initialized", ledger: i * 10, timestamp: i * 100, dataJson: JSON.stringify({ client: addr }) });
     }
 
     const p1 = await getJobsByWallet(addr, 1, 2);
@@ -215,13 +259,7 @@ describe("getJobsByWallet() – unit", () => {
   it("pagination: page=2 limit=2 returns jobs 3-4 of 5", async () => {
     const addr = "GPAGER2";
     for (let i = 1; i <= 5; i++) {
-      seedEvent(testDb, {
-        contractId: `D${i}`,
-        eventType: "initialized",
-        ledger: i * 10,
-        timestamp: i * 100,
-        dataJson: JSON.stringify({ client: addr }),
-      });
+      seedEvent(testDb, { contractId: `D${i}`, eventType: "initialized", ledger: i * 10, timestamp: i * 100, dataJson: JSON.stringify({ client: addr }) });
     }
 
     const p2 = await getJobsByWallet(addr, 2, 2);
@@ -233,33 +271,30 @@ describe("getJobsByWallet() – unit", () => {
   it("pagination: last page returns remaining jobs (not a full page)", async () => {
     const addr = "GPAGER3";
     for (let i = 1; i <= 5; i++) {
-      seedEvent(testDb, {
-        contractId: `E${i}`,
-        eventType: "initialized",
-        ledger: i * 10,
-        timestamp: i * 100,
-        dataJson: JSON.stringify({ client: addr }),
-      });
+      seedEvent(testDb, { contractId: `E${i}`, eventType: "initialized", ledger: i * 10, timestamp: i * 100, dataJson: JSON.stringify({ client: addr }) });
     }
 
     const p3 = await getJobsByWallet(addr, 3, 2);
     expect(p3.total).toBe(5);
-    expect(p3.jobs).toHaveLength(1); // page 3 of 2-per-page = only 1 left
+    expect(p3.jobs).toHaveLength(1);
   });
 
   it("pagination: page beyond total returns empty jobs array", async () => {
     const addr = "GPAGER4";
-    seedEvent(testDb, {
-      contractId: "F1",
-      eventType: "initialized",
-      ledger: 10,
-      timestamp: 100,
-      dataJson: JSON.stringify({ client: addr }),
-    });
+    seedEvent(testDb, { contractId: "F1", eventType: "initialized", ledger: 10, timestamp: 100, dataJson: JSON.stringify({ client: addr }) });
 
     const p = await getJobsByWallet(addr, 99, 10);
     expect(p.total).toBe(1);
     expect(p.jobs).toHaveLength(0);
+  });
+
+  it("pagination: page=3 limit=10 returns correct page/limit in result", () => {
+    const addr = "GPAGER5";
+    seedEvent(testDb, { contractId: "G1", eventType: "initialized", ledger: 10, timestamp: 100, dataJson: JSON.stringify({ client: addr }) });
+
+    const result = getJobsByWallet(addr, 3, 10);
+    expect(result.page).toBe(3);
+    expect(result.limit).toBe(10);
   });
 });
 
@@ -291,11 +326,11 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       eventType: "initialized",
       ledger: 1,
       timestamp: 100,
-      dataJson: JSON.stringify({ client: addr }),
+      dataJson: JSON.stringify({ client: VALID_G_ADDR }),
     });
 
     const res = await request(app)
-      .get(`/api/jobs/by-wallet/${addr}`)
+      .get(`/api/jobs/by-wallet/${VALID_G_ADDR}`)
       .expect(200);
 
     expect(res.body.success).toBe(true);
@@ -305,7 +340,7 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
     expect(res.body.data.limit).toBeDefined();
   });
 
-  it("returns empty jobs array for unknown address", async () => {
+  it("200: returns empty jobs array and total=0 for unknown address", async () => {
     const res = await request(app)
       .get(`/api/jobs/by-wallet/${VALID_WALLET_2}`)
       .expect(200);
@@ -318,18 +353,10 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
   it("respects ?page=1&limit=2 query params", async () => {
     const addr = VALID_WALLET_3;
     for (let i = 1; i <= 4; i++) {
-      seedEvent(testDb, {
-        contractId: `HP${i}`,
-        eventType: "initialized",
-        ledger: i,
-        timestamp: i * 100,
-        dataJson: JSON.stringify({ client: addr }),
-      });
+      seedEvent(testDb, { contractId: `HP${i}`, eventType: "initialized", ledger: i, timestamp: i * 100, dataJson: JSON.stringify({ client: addr }) });
     }
 
-    const res = await request(app)
-      .get(`/api/jobs/by-wallet/${addr}?page=1&limit=2`)
-      .expect(200);
+    const res = await request(app).get(`/api/jobs/by-wallet/${addr}?page=1&limit=2`).expect(200);
 
     expect(res.body.success).toBe(true);
     expect(res.body.data.jobs).toHaveLength(2);
@@ -345,12 +372,14 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
       eventType: "funded",
       ledger: 50,
       timestamp: 5000,
-      dataJson: JSON.stringify({ freelancer: addr }),
+      dataJson: JSON.stringify({ freelancer: VALID_G_ADDR }),
     });
+  });
 
+  it("400: invalid page (page=-1) returns 400", async () => {
     const res = await request(app)
-      .get(`/api/jobs/by-wallet/${addr}`)
-      .expect(200);
+      .get("/api/jobs/by-wallet/GSOMEADDR?page=-1")
+      .expect(400);
 
     const job = res.body.data.jobs[0];
     expect(job).toMatchObject({
@@ -413,8 +442,9 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
-    expect(res.body.error).toMatch(/valid Stellar account address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
+    expect(res.body.details[0].message).toMatch(/valid Stellar account address/i);
   });
 
   it("returns 400 for a contract address (C…) used as wallet", async () => {
@@ -425,7 +455,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 
   it("returns 400 for an address that is too short", async () => {
@@ -434,7 +465,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 
   it("returns 400 when page is not a positive integer", async () => {
@@ -442,10 +474,10 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?page=0`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "page must be a positive integer",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("page");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 when page is not numeric", async () => {
@@ -454,7 +486,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/page/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 when limit is greater than 100", async () => {
@@ -462,10 +495,10 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=101`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "limit must be between 1 and 100",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("limit");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
   it("returns 400 when limit is less than 1", async () => {
@@ -473,20 +506,20 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .get(`/api/jobs/by-wallet/${VALID_WALLET}?limit=0`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "limit must be between 1 and 100",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].field).toBe("limit");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
-  it("error body has exactly {success, error} keys", async () => {
+  it("error body has ValidationError format", async () => {
     const res = await request(app)
       .get("/api/jobs/by-wallet/bad-address")
       .expect(400);
 
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
     expect(res.body.success).toBe(false);
-    expect(typeof res.body.error).toBe("string");
+    expect(res.body.error).toBe("ValidationError");
+    expect(Array.isArray(res.body.details)).toBe(true);
   });
 
   it("does not return 400 for a valid address and query", async () => {
@@ -503,7 +536,8 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/address/i);
   });
 });
 
@@ -577,8 +611,9 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
       .get("/api/jobs/by-wallet/not-valid")
       .expect(400);
 
-    expect(res.body).toMatchObject({ success: false, error: expect.any(String) });
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(Array.isArray(res.body.details)).toBe(true);
   });
 
   it("returns 400 for invalid page query param", async () => {
@@ -587,7 +622,8 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/page/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/page/i);
   });
 
   it("returns 400 for invalid limit query param", async () => {
@@ -596,7 +632,8 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/limit/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/limit/i);
   });
 
   // -------------------------------------------------------------------------
