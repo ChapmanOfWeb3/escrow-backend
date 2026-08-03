@@ -1,6 +1,8 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { validate } from "../src/middleware/validate.js";
+import { contractIdParamsSchema } from "../src/schemas/jobs.js";
 
 const VALID_CONTRACT = "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
 
@@ -87,6 +89,24 @@ describe("Zod contractId middleware – GET /api/jobs/:contractId", () => {
     expect(res.body.success).toBe(false);
     expect(res.body.error).toBe("ValidationError");
     expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
+  });
+
+  it("returns 400 for a non-string contractId value", () => {
+    const req = { params: { contractId: 123 } } as any;
+    const res = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn(),
+    } as any;
+    const next = jest.fn();
+
+    validate(contractIdParamsSchema, "params")(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      success: false,
+      error: "contractId must be a valid Stellar contract address (C...)",
+    });
   });
 
   // ── error body shape ──────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
+import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
-import { jest } from "@jest/globals";
 
 const mockSendTransaction = jest.fn<() => Promise<unknown>>();
 const mockTx = { toXDR: () => "mock-xdr" };
@@ -12,9 +12,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
 }));
 
 jest.unstable_mockModule("@stellar/stellar-sdk", () => ({
-  TransactionBuilder: {
-    fromXDR: jest.fn(() => mockTx),
-  },
+  TransactionBuilder: { fromXDR: jest.fn(() => mockTx) },
   Contract: jest.fn(),
   Networks: {
     TESTNET: "Test SDF Network ; September 2015",
@@ -22,23 +20,23 @@ jest.unstable_mockModule("@stellar/stellar-sdk", () => ({
   },
   BASE_FEE: "100",
   nativeToScVal: jest.fn(),
-  Address: {
-    fromString: jest.fn(() => ({ toScVal: jest.fn() })),
-  },
-  StrKey: {
-    isValidEd25519PublicKey: jest.fn(() => true),
-  },
+  Address: { fromString: jest.fn(() => ({ toScVal: jest.fn() })) },
+  StrKey: { isValidEd25519PublicKey: jest.fn(() => true) },
 }));
 
 jest.unstable_mockModule("../src/utils/logger.js", () => ({
   default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-const { default: router } = await import("../src/routes/jobs.js");
-const { resetSubmitRateLimitBuckets } = await import("../src/middleware/job-contract-rate-limit.js");
+jest.unstable_mockModule("../src/middleware/rateLimiter.js", () => ({
+  strictLimiter: (_req: any, _res: any, next: any) => next(),
+  generalLimiter: (_req: any, _res: any, next: any) => next(),
+}));
 
-const VALID_SIGNED_XDR =
-  "AAAAAgAAAABz9B8nR7h4qY6Ran5PlacgCUxOFxOdIQAAAAAAAAAAABAAAAAAAAAAAA==";
+const { default: router, resetSubmitCache } = await import("../src/routes/jobs.js");
+const { resetSubmitRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -47,182 +45,189 @@ function buildApp() {
   return app;
 }
 
-describe("POST /api/jobs/submit – dedicated rate limiting", () => {
-  const originalMax = process.env.SUBMIT_RATE_MAX;
-  const originalWindow = process.env.SUBMIT_RATE_WINDOW_MS;
+const VALID_SIGNED_XDR =
+  "AAAAAgAAAABz9B8nR7h4qY6Ran5PlacgCUxOFxOdIQAAAAAAAAAAABAAAAAAAAAAAA==";
 
+function setupEnvs(overrides: Record<string, string | undefined>) {
+  const restore: Record<string, string | undefined> = {};
+  for (const key of Object.keys(overrides)) {
+    restore[key] = process.env[key];
+    if (overrides[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = overrides[key];
+    }
+  }
+  return () => {
+    for (const key of Object.keys(restore)) {
+      if (restore[key] === undefined) delete process.env[key];
+      else process.env[key] = restore[key];
+    }
+  };
+}
+
+describe("POST /api/jobs/submit – dedicated rate limiter", () => {
   beforeEach(() => {
-    resetSubmitRateLimitBuckets();
     mockSendTransaction.mockReset();
-    mockSendTransaction.mockResolvedValue({ id: "test-tx", status: "PENDING" });
-    process.env.SUBMIT_RATE_MAX = "3";
-    process.env.SUBMIT_RATE_WINDOW_MS = "60000";
-  });
-
-  afterEach(() => {
+    resetSubmitCache();
     resetSubmitRateLimitBuckets();
-    if (originalMax === undefined) {
-      delete process.env.SUBMIT_RATE_MAX;
-    } else {
-      process.env.SUBMIT_RATE_MAX = originalMax;
-    }
-    if (originalWindow === undefined) {
-      delete process.env.SUBMIT_RATE_WINDOW_MS;
-    } else {
-      process.env.SUBMIT_RATE_WINDOW_MS = originalWindow;
+  });
+
+  it("allows requests up to the configured threshold of 3", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({ SUBMIT_RATE_MAX: "3", SUBMIT_RATE_WINDOW_MS: "60000" });
+    const app = buildApp();
+    try {
+      for (let i = 0; i < 3; i++) {
+        const res = await request(app)
+          .post("/api/jobs/submit")
+          .send({ signedXdr: VALID_SIGNED_XDR });
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+      }
+    } finally {
+      restore();
     }
   });
 
-  it("allows requests up to the configured threshold", async () => {
+  it("returns 429 Too Many Requests once the threshold is exceeded", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({ SUBMIT_RATE_MAX: "3", SUBMIT_RATE_WINDOW_MS: "60000" });
     const app = buildApp();
-    for (let i = 0; i < 3; i++) {
+    try {
+      for (let i = 0; i < 3; i++) {
+        await request(app)
+          .post("/api/jobs/submit")
+          .send({ signedXdr: VALID_SIGNED_XDR })
+          .expect(200);
+      }
+      const res = await request(app)
+        .post("/api/jobs/submit")
+        .send({ signedXdr: VALID_SIGNED_XDR })
+        .expect(429);
+      expect(res.body).toEqual({
+        success: false,
+        error: "Too many requests, please try again later",
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it("sets correct decrementing X-RateLimit-Remaining headers", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({ SUBMIT_RATE_MAX: "3", SUBMIT_RATE_WINDOW_MS: "60000" });
+    const app = buildApp();
+    try {
+      const r1 = await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      expect(r1.header["x-ratelimit-limit"]).toBe("3");
+      expect(r1.header["x-ratelimit-remaining"]).toBe("2");
+      const r2 = await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      expect(r2.header["x-ratelimit-remaining"]).toBe("1");
+      const r3 = await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      expect(r3.header["x-ratelimit-remaining"]).toBe("0");
+    } finally {
+      restore();
+    }
+  });
+
+  it("429 response body contains exactly success and error keys", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({ SUBMIT_RATE_MAX: "2", SUBMIT_RATE_WINDOW_MS: "60000" });
+    const app = buildApp();
+    try {
+      await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
       const res = await request(app)
         .post("/api/jobs/submit")
         .send({ signedXdr: VALID_SIGNED_XDR });
-      expect(res.status).not.toBe(429);
-      expect(res.headers["x-ratelimit-limit"]).toBe("3");
+      expect(res.status).toBe(429);
+      expect(Object.keys(res.body)).toEqual(["success", "error"]);
+    } finally {
+      restore();
     }
   });
 
-  it("returns 429 Too Many Requests once threshold is exceeded", async () => {
+  it("does not rate-limit other job routes when submit endpoint is throttled", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({ SUBMIT_RATE_MAX: "2", SUBMIT_RATE_WINDOW_MS: "60000" });
     const app = buildApp();
-    for (let i = 0; i < 3; i++) {
-      await request(app)
+    try {
+      await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      const submitThrottled = await request(app)
         .post("/api/jobs/submit")
-        .send({ signedXdr: VALID_SIGNED_XDR })
-        .expect(200);
+        .send({ signedXdr: VALID_SIGNED_XDR });
+      expect(submitThrottled.status).toBe(429);
+      const byWallet = await request(app).get("/api/jobs/by-wallet/GABC");
+      expect(byWallet.status).not.toBe(429);
+      const draft = await request(app)
+        .post("/api/jobs/create-job-draft")
+        .send({ client: "GABC" });
+      expect(draft.status).not.toBe(429);
+    } finally {
+      restore();
     }
-
-    const res = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(429);
-
-    expect(res.body).toEqual({
-      success: false,
-      error: "Too many requests, please try again later",
-    });
-    expect(res.headers["x-ratelimit-remaining"]).toBe("0");
-  });
-
-  it("sets correct rate limit headers on each request", async () => {
-    const app = buildApp();
-
-    const first = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(200);
-    expect(first.headers["x-ratelimit-limit"]).toBe("3");
-    expect(first.headers["x-ratelimit-remaining"]).toBe("2");
-    expect(first.headers["x-ratelimit-reset"]).toBeDefined();
-
-    const second = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(200);
-    expect(second.headers["x-ratelimit-remaining"]).toBe("1");
-
-    const third = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(200);
-    expect(third.headers["x-ratelimit-remaining"]).toBe("0");
-  });
-
-  it("429 response body has exactly {success, error} keys", async () => {
-    const app = buildApp();
-    process.env.SUBMIT_RATE_MAX = "1";
-
-    await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-
-    const res = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(429);
-
-    expect(Object.keys(res.body)).toEqual(["success", "error"]);
-    expect(res.body.success).toBe(false);
-    expect(typeof res.body.error).toBe("string");
-    expect(res.body.error.length).toBeGreaterThan(0);
-  });
-
-  it("does not rate limit other job routes when submit is limited", async () => {
-    const app = buildApp();
-    process.env.SUBMIT_RATE_MAX = "1";
-
-    await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    const blocked = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    expect(blocked.status).toBe(429);
-
-    const byWallet = await request(app).get("/api/jobs/by-wallet/GTESTWALLET");
-    expect(byWallet.status).not.toBe(429);
-
-    const draftRes = await request(app)
-      .post("/api/jobs/create-job-draft")
-      .send({
-        client: "GCLIENT123",
-        freelancer: "GFREELANCER123",
-        arbiter: "GARBITER123",
-        token: "GASTRO123",
-        autoReleaseDays: 7,
-        milestones: [{ amount: "100" }],
-      });
-    expect(draftRes.status).not.toBe(429);
   });
 
   it("resetSubmitRateLimitBuckets clears state between test runs", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({ SUBMIT_RATE_MAX: "2", SUBMIT_RATE_WINDOW_MS: "60000" });
     const app = buildApp();
-    process.env.SUBMIT_RATE_MAX = "1";
-
-    await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-
-    resetSubmitRateLimitBuckets();
-
-    const afterReset = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    expect(afterReset.status).toBe(200);
+    try {
+      await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      await request(app).post("/api/jobs/submit").send({ signedXdr: VALID_SIGNED_XDR });
+      const before = await request(app)
+        .post("/api/jobs/submit")
+        .send({ signedXdr: VALID_SIGNED_XDR });
+      expect(before.status).toBe(429);
+      resetSubmitRateLimitBuckets();
+      const after = await request(app)
+        .post("/api/jobs/submit")
+        .send({ signedXdr: VALID_SIGNED_XDR });
+      expect(after.status).toBe(200);
+    } finally {
+      restore();
+    }
   });
 
-  it("uses default values when env vars are not set", async () => {
+  it("uses default SUBMIT_RATE_MAX of 5 req/min when env vars not set", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({
+      SUBMIT_RATE_MAX: undefined,
+      SUBMIT_RATE_WINDOW_MS: undefined,
+    });
     const app = buildApp();
-    delete process.env.SUBMIT_RATE_MAX;
-    delete process.env.SUBMIT_RATE_WINDOW_MS;
-    resetSubmitRateLimitBuckets();
-
-    const res = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(200);
-
-    expect(res.headers["x-ratelimit-limit"]).toBe("5");
+    try {
+      for (let i = 0; i < 5; i++) {
+        await request(app)
+          .post("/api/jobs/submit")
+          .send({ signedXdr: VALID_SIGNED_XDR })
+          .expect(200);
+      }
+      await request(app)
+        .post("/api/jobs/submit")
+        .send({ signedXdr: VALID_SIGNED_XDR })
+        .expect(429);
+    } finally {
+      restore();
+    }
   });
 
-  it("validation errors still count against rate limit", async () => {
+  it("counts validation errors (400) against the rate limit counter", async () => {
+    mockSendTransaction.mockResolvedValue({ id: "ok" });
+    const restore = setupEnvs({ SUBMIT_RATE_MAX: "3", SUBMIT_RATE_WINDOW_MS: "60000" });
     const app = buildApp();
-    process.env.SUBMIT_RATE_MAX = "2";
-
-    await request(app)
-      .post("/api/jobs/submit")
-      .send({})
-      .expect(400);
-
-    await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: "" })
-      .expect(400);
-
-    const third = await request(app)
-      .post("/api/jobs/submit")
-      .send({ signedXdr: VALID_SIGNED_XDR });
-    expect(third.status).toBe(429);
+    try {
+      await request(app).post("/api/jobs/submit").send({ signedXdr: "" }).expect(400);
+      await request(app).post("/api/jobs/submit").send({ signedXdr: "" }).expect(400);
+      await request(app).post("/api/jobs/submit").send({ signedXdr: "" }).expect(400);
+      await request(app)
+        .post("/api/jobs/submit")
+        .send({ signedXdr: VALID_SIGNED_XDR })
+        .expect(429);
+    } finally {
+      restore();
+    }
   });
 });

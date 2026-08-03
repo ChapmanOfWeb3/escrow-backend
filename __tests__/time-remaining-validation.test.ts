@@ -58,10 +58,9 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .get("/api/jobs/not-a-valid-contract/milestones/0/time-remaining")
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "contractId must be a valid Stellar contract address (C...)",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("contractId must be a valid Stellar contract address (C...)");
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
@@ -74,7 +73,7 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
@@ -86,7 +85,7 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
@@ -98,7 +97,7 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
@@ -109,10 +108,9 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .get(`/api/jobs/${VALID_CONTRACT}/milestones/abc/time-remaining`)
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "index must be a non-negative integer",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("index must be a non-negative integer");
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
@@ -123,7 +121,7 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/index/i);
+    expect(res.body.details[0].message).toMatch(/index/i);
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
@@ -134,7 +132,7 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/index/i);
+    expect(res.body.details[0].message).toMatch(/index/i);
     expect(mockGetAccount).not.toHaveBeenCalled();
     expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
