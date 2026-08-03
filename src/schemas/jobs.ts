@@ -10,11 +10,30 @@ import { isValidStellarContractId, isValidStellarAddress } from "../utils/stella
  * Validates a Soroban contract address: starts with 'C', 56 characters total,
  * and passes the Stellar SDK StrKey check.
  */
-export const contractIdSchema = z
-  .string({ required_error: "contractId is required" })
-  .refine(isValidStellarContractId, {
-    message: "contractId must be a valid Stellar contract address (C...)",
-  });
+export const contractIdSchema = z.unknown().superRefine((value, ctx) => {
+  if (value === undefined || value === null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId is required",
+    });
+    return;
+  }
+
+  if (typeof value !== "string") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+    return;
+  }
+
+  if (!isValidStellarContractId(value)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "contractId must be a valid Stellar contract address (C...)",
+    });
+  }
+});
 
 /**
  * Validates a Stellar account (G…) address: starts with 'G', 56 characters,
@@ -72,30 +91,35 @@ export const contractMilestoneParamsSchema = z.object({
   index: milestoneIndexSchema,
 });
 
-/** POST /build-tx body */
+/** POST /build-tx body schema validation */
 export const buildTxBodySchema = z.object({
+  // Must be a valid Soroban contract ID
   contractId: contractIdSchema,
+  // The contract method name to call
   method: z.string({ required_error: "method is required" }).min(1, "method cannot be empty"),
+  // Optional arguments for the method, defaults to an empty array
   args: z.array(z.any()).optional().default([]),
+  // The Stellar address of the transaction source account
   sourceAddress: stellarAddressSchema,
 });
 
 /** POST /submit body */
 export const submitBodySchema = z.object({
   signedXdr: z
-    .string({ required_error: "signedXdr is required" })
-    .min(1, "signedXdr cannot be empty"),
+    .string({ required_error: "signedXdr is required", invalid_type_error: "signedXdr must be a string" })
+    .min(1, "signedXdr cannot be empty")
+    .refine((v) => !/\s/.test(v), {
+      message: "signedXdr must not contain whitespace",
+    })
+    .refine(
+      (v) => {
+        // Valid base64: only A-Z a-z 0-9 + / = characters, length divisible by 4
+        return /^[A-Za-z0-9+/]*={0,2}$/.test(v) && v.length % 4 === 0;
+      },
+      { message: "signedXdr must be a valid base64-encoded XDR string" },
+    ),
+  sourceAddress: stellarAccountField("sourceAddress").optional(),
 });
-
-/**
- * Named Stellar account field (G…) with field-specific error messages.
- */
-const stellarAccountField = (field: string) =>
-  z
-    .string({ required_error: `${field} is required` })
-    .refine(isValidStellarAddress, {
-      message: `${field} must be a valid Stellar account address (G...)`,
-    });
 
 /**
  * POST /:contractId/milestones/:index/partial-release body.
@@ -126,7 +150,7 @@ export const partialReleaseBodySchema = z.object({
 /** POST /:contractId/milestones/:index/claim-auto-release body */
 export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
-});
+}).strict();
 
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
@@ -214,50 +238,22 @@ export const createJobDraftBodySchema = z.object({
   requirements: z.array(z.string()).optional().default([]),
 });
 
-/**
- * POST /create-job-draft body.
- *
- * Fields:
- *  - clientAddress   – Stellar account (G...) acting as client
- *  - freelancerAddress – Stellar account (G...) acting as freelancer
- *  - arbiterAddress  – Stellar account (G...) acting as arbiter
- *  - tokenAddress    – Stellar contract (C...) of the payment token
- *  - milestones      – non-empty array of milestone amounts (positive numeric)
- *  - title           – optional human-readable job title (max 200 chars)
- *  - description     – optional job description (max 2000 chars)
- */
+/** POST /create-job-draft body */
 export const createJobDraftBodySchema = z.object({
-  clientAddress: z
-    .string({ required_error: "clientAddress is required" })
-    .refine(isValidStellarAddress, {
-      message: "clientAddress must be a valid Stellar account address (G...)",
-    }),
-  freelancerAddress: z
-    .string({ required_error: "freelancerAddress is required" })
-    .refine(isValidStellarAddress, {
-      message: "freelancerAddress must be a valid Stellar account address (G...)",
-    }),
-  arbiterAddress: z
-    .string({ required_error: "arbiterAddress is required" })
-    .refine(isValidStellarAddress, {
-      message: "arbiterAddress must be a valid Stellar account address (G...)",
-    }),
+  clientAddress: stellarAddressSchema,
+  freelancerAddress: stellarAddressSchema,
+  arbiterAddress: stellarAddressSchema,
   tokenAddress: z
     .string({ required_error: "tokenAddress is required" })
-    .refine(isValidStellarContractId, {
-      message: "tokenAddress must be a valid Stellar contract address (C...)",
-    }),
+    .min(1, "tokenAddress cannot be empty"),
   milestones: z
-    .array(amountSchema, { required_error: "milestones is required" })
+    .array(
+      z.object({
+        amount: amountSchema,
+      }),
+      { required_error: "milestones is required" },
+    )
     .min(1, "milestones must contain at least one entry"),
-  title: z
-    .string()
-    .max(200, "title must be at most 200 characters")
-    .optional(),
-  description: z
-    .string()
-    .max(2000, "description must be at most 2000 characters")
-    .optional(),
 });
 
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
