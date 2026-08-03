@@ -47,7 +47,7 @@ import {
   type ByWalletQuery,
   type CreateJobDraftBody,
 } from "../schemas/jobs.js";
-import { strictLimiter } from "../middleware/rateLimiter.js";
+import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
 import { randomUUID } from "crypto";
 
