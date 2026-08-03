@@ -34,6 +34,9 @@ jest.unstable_mockModule("../src/middleware/rateLimiter.js", () => ({
 }));
 
 const { default: router } = await import("../src/routes/jobs.js");
+const { resetSubmitRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -44,6 +47,7 @@ function buildApp() {
 
 describe("POST /api/jobs/submit – payload validation", () => {
   beforeEach(() => {
+    resetSubmitRateLimitBuckets();
     mockSendTransaction.mockReset();
     mockFromXDR.mockReset();
   });
@@ -54,10 +58,9 @@ describe("POST /api/jobs/submit – payload validation", () => {
       .send({})
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "signedXdr is required",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("signedXdr is required");
   });
 
   it("returns 400 for non-string signedXdr", async () => {
@@ -67,7 +70,8 @@ describe("POST /api/jobs/submit – payload validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/string/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/string/i);
   });
 
   it("returns 400 for empty signedXdr", async () => {
@@ -76,10 +80,9 @@ describe("POST /api/jobs/submit – payload validation", () => {
       .send({ signedXdr: "" })
       .expect(400);
 
-    expect(res.body).toEqual({
-      success: false,
-      error: "signedXdr cannot be empty",
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toBe("signedXdr cannot be empty");
   });
 
   it("returns standard error shape for invalid payloads", async () => {

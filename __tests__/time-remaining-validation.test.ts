@@ -15,6 +15,9 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
 }));
 
 const { default: router } = await import("../src/routes/jobs.js");
+const { resetTimeRemainingRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -25,6 +28,7 @@ function buildApp() {
 
 describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
   beforeEach(() => {
+    resetTimeRemainingRateLimitBuckets();
     mockGetAccount.mockReset();
     mockSimulateTransaction.mockReset();
 
@@ -47,7 +51,7 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       .get(`/api/jobs/${VALID_CONTRACT}/milestones/0/time-remaining`)
       .expect(200);
 
-    expect(res.body).toEqual({ success: true, secondsRemaining: 120 });
+    expect(res.body).toEqual({ success: true, data: { secondsRemaining: 120 } });
     expect(mockGetAccount).toHaveBeenCalled();
     expect(mockSimulateTransaction).toHaveBeenCalled();
   });

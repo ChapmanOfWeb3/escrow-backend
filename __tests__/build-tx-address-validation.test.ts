@@ -22,6 +22,9 @@ jest.unstable_mockModule("../src/utils/logger.js", () => ({
 }));
 
 const { default: router } = await import("../src/routes/jobs.js");
+const { resetBuildTxRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -39,6 +42,7 @@ const VALID_BODY = {
 
 describe("POST /api/jobs/build-tx – Stellar address validation", () => {
   beforeEach(() => {
+    resetBuildTxRateLimitBuckets();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
     mockGetAccount.mockResolvedValue({
@@ -66,7 +70,8 @@ describe("POST /api/jobs/build-tx – Stellar address validation", () => {
       .expect(400);
 
     expect(res.body).toMatchObject({ success: false, error: expect.any(String) });
-    expect(res.body.error).toMatch(/sourceAddress/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/sourceAddress/i);
   });
 
   it("rejects a wrong-length Stellar address", async () => {
@@ -95,7 +100,8 @@ describe("POST /api/jobs/build-tx – Stellar address validation", () => {
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/sourceAddress/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/sourceAddress/i);
   });
 
   it("returns a structured error payload for invalid addresses", async () => {

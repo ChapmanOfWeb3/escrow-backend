@@ -76,6 +76,16 @@ export const amountSchema = z
     { message: "amount must be a positive numeric value" },
   );
 
+/**
+ * Named Stellar account field (G…) with field-specific error messages.
+ */
+const stellarAccountField = (field: string) =>
+  z
+    .string({ required_error: `${field} is required` })
+    .refine(isValidStellarAddress, {
+      message: `${field} must be a valid Stellar account address (G...)`,
+    });
+
 // ---------------------------------------------------------------------------
 // Composed route schemas
 // ---------------------------------------------------------------------------
@@ -100,7 +110,7 @@ export const buildTxBodySchema = z.object({
   // Optional arguments for the method, defaults to an empty array
   args: z.array(z.any()).optional().default([]),
   // The Stellar address of the transaction source account
-  sourceAddress: stellarAddressSchema,
+  sourceAddress: stellarAccountField("sourceAddress"),
 });
 
 /** POST /submit body */
@@ -238,8 +248,16 @@ export const createJobDraftBodySchema = z.object({
   requirements: z.array(z.string()).optional().default([]),
 });
 
-/** POST /create-job-draft body */
-export const createJobDraftBodySchema = z.object({
+/**
+ * POST /create-job-draft body — `*Address` naming variant.
+ *
+ * Two PRs shipped this endpoint with different field names, response shapes,
+ * and token-validation strictness, and both were merged. This variant keeps a
+ * permissive `.min(1)` token rule (its own tests post a token that is not a
+ * valid 56-char contract id); the variant above enforces a real C… address.
+ * `createJobDraftRouteValidator` in routes/jobs.ts picks between them by shape.
+ */
+export const createJobDraftLegacyBodySchema = z.object({
   clientAddress: stellarAddressSchema,
   freelancerAddress: stellarAddressSchema,
   arbiterAddress: stellarAddressSchema,
@@ -255,6 +273,8 @@ export const createJobDraftBodySchema = z.object({
     )
     .min(1, "milestones must contain at least one entry"),
 });
+
+export type CreateJobDraftLegacyBody = z.infer<typeof createJobDraftLegacyBodySchema>;
 
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;

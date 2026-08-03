@@ -17,6 +17,9 @@ import {
   partialReleaseRateLimit,
   buildTxRateLimit,
   timeRemainingRateLimit,
+  createJobDraftRateLimit,
+  claimAutoReleaseRateLimit,
+  submitRateLimit,
 } from "../middleware/job-contract-rate-limit.js";
 import {
   jobContractCors,
@@ -29,6 +32,8 @@ import {
   timeRemainingSecurityHeaders,
   byWalletCors,
   byWalletSecurityHeaders,
+  claimAutoReleaseCors,
+  claimAutoReleaseSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
@@ -44,8 +49,10 @@ import {
   byWalletParamsSchema,
   byWalletQuerySchema,
   createJobDraftBodySchema,
+  createJobDraftLegacyBodySchema,
   type ByWalletQuery,
   type CreateJobDraftBody,
+  type CreateJobDraftLegacyBody,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -303,10 +310,11 @@ router.get(
 
       logger.info("Fetching jobs by wallet", { address, page, limit });
       const result = await getJobsByWallet(address, page, limit);
+      logger.info("Jobs lookup completed", { address, page, limit, total: result.total });
       sendSuccess(res, result);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.error("Failed to fetch jobs by wallet", { address, error: message });
+      logger.error("Jobs lookup failed", { address, error: message });
       sendError(res, 500, "Internal server error");
     }
   },
@@ -318,30 +326,81 @@ router.get(
 // ---------------------------------------------------------------------------
 router.options("/create-job-draft", createJobDraftCors);
 
+/**
+ * Two PRs implemented POST /create-job-draft independently and both were
+ * merged, leaving two `router.post("/create-job-draft", …)` registrations. Only
+ * the first could ever run, so the second PR's rate limiter was dead code and
+ * its tests failed. They are collapsed here into one route that honours both
+ * contracts: the body is validated against whichever schema matches the field
+ * naming used, and the response carries both shapes.
+ */
+function createJobDraftRouteValidator(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const body = req.body as Record<string, unknown> | undefined;
+  const usesAddressSuffix =
+    !!body &&
+    typeof body === "object" &&
+    ["clientAddress", "freelancerAddress", "arbiterAddress", "tokenAddress"].some(
+      (field) => field in body,
+    );
+
+  const schema = usesAddressSuffix
+    ? createJobDraftLegacyBodySchema
+    : createJobDraftBodySchema;
+
+  validate(schema, "body", (r) =>
+    logger.warn("Invalid create-job-draft request body", { body: r.body }),
+  )(req, res, next);
+}
+
 router.post(
   "/create-job-draft",
   createJobDraftCors,
   createJobDraftSecurityHeaders,
-  validate(createJobDraftBodySchema, "body", (req) =>
-    logger.warn("Invalid create-job-draft request body", { body: req.body }),
-  ),
+  createJobDraftRateLimit,
+  createJobDraftRouteValidator,
   (req: Request, res: Response) => {
     try {
-      const body = req.body as CreateJobDraftBody;
+      const body = req.body as Partial<CreateJobDraftBody> &
+        Partial<CreateJobDraftLegacyBody>;
+
+      const client = body.client ?? body.clientAddress;
+      const freelancer = body.freelancer ?? body.freelancerAddress;
+      const arbiter = body.arbiter ?? body.arbiterAddress;
+      const token = body.token ?? body.tokenAddress;
 
       const draft = {
         id: randomUUID(),
         status: "draft" as const,
-        client: body.client,
-        freelancer: body.freelancer,
-        arbiter: body.arbiter,
-        token: body.token,
+        client,
+        freelancer,
+        arbiter,
+        token,
         autoReleaseDays: body.autoReleaseDays,
         milestones: body.milestones,
         acceptedAssets: body.acceptedAssets,
         requirements: body.requirements,
         createdAt: new Date().toISOString(),
+        // `*Address` naming echoed back for the second PR's response contract.
+        draft: {
+          clientAddress: client,
+          freelancerAddress: freelancer,
+          arbiterAddress: arbiter,
+          tokenAddress: token,
+          milestones: body.milestones,
+        },
       };
+
+      logger.info("Job draft created", {
+        client,
+        freelancer,
+        arbiter,
+        token,
+        milestoneCount: body.milestones?.length ?? 0,
+      });
 
       sendSuccess(res, draft);
     } catch (err: any) {
@@ -593,39 +652,6 @@ router.get(
 );
 
 // ---------------------------------------------------------------------------
-// POST /api/jobs/create-job-draft – persist a job draft (rate-limited)
-// ---------------------------------------------------------------------------
-router.post(
-  "/create-job-draft",
-  createJobDraftRateLimit,
-  validate(createJobDraftBodySchema, "body", (req) =>
-    logger.warn("Invalid create-job-draft request body", { body: req.body }),
-  ),
-  (req: Request, res: Response) => {
-    const { clientAddress, freelancerAddress, arbiterAddress, tokenAddress, milestones } =
-      req.body;
-
-    logger.info("Job draft created", {
-      clientAddress,
-      freelancerAddress,
-      arbiterAddress,
-      tokenAddress,
-      milestoneCount: milestones.length,
-    });
-
-    sendSuccess(res, {
-      draft: {
-        clientAddress,
-        freelancerAddress,
-        arbiterAddress,
-        tokenAddress,
-        milestones,
-      },
-    });
-  },
-);
-
-// ---------------------------------------------------------------------------
 // POST /api/jobs/build-tx – build an unsigned transaction for the frontend
 // ---------------------------------------------------------------------------
 router.post(
@@ -844,9 +870,6 @@ router.get(
     const cacheKey = `${contractId}:${index}`;
 
     try {
-      const contractId = req.params.contractId as string;
-      const { index } = req.params;
-
       logger.debug("GET time-remaining request", {
         contractId,
         index,
@@ -854,49 +877,48 @@ router.get(
         requestId: (req as any).requestId,
       });
 
-      const contract = new Contract(contractId);
-      const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(
-          contract.call(
-            "time_until_auto_release",
-            nativeToScVal(Number(index), { type: "u32" }),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+      const cached = timeRemainingCache.get<number>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Time remaining served from cache", { contractId, index });
+        sendSuccess(res, { secondsRemaining: cached });
+        return;
+      }
 
-      const result = await server.simulateTransaction(tx);
-      if ("error" in result) {
-        const { status, message } = classifySimError(String(result.error));
-        logger.warn("Simulation error for time-remaining", {
-          contractId,
-          index,
-          status,
-          error: String(result.error),
-          requestId: (req as any).requestId,
-        });
-        sendError(res, status, message);
-      } else if ("result" in result && result.result?.retval) {
-        const secondsRemaining = Number(result.result.retval);
-        logger.info("Time-remaining retrieved successfully", {
-          contractId,
-          index,
-          secondsRemaining,
-          requestId: (req as any).requestId,
-        });
-        res.json({ success: true, secondsRemaining });
-      } else {
-        logger.warn("Unexpected simulation result for time-remaining", {
-          contractId,
-          index,
-          result: JSON.stringify(result),
-          requestId: (req as any).requestId,
-        });
-        sendError(res, 500, "Internal server error");
+      let requestPromise = inFlightTimeRemainingRequests.get(cacheKey);
+      const servedFromInFlight = Boolean(requestPromise);
+
+      if (!requestPromise) {
+        requestPromise = (async (): Promise<number> => {
+          const contract = new Contract(contractId);
+          const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASE,
+          })
+            .addOperation(
+              contract.call(
+                "time_until_auto_release",
+                nativeToScVal(Number(index), { type: "u32" }),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const result = await server.simulateTransaction(tx);
+
+          if ("error" in result) {
+            const { status, message } = classifySimError(String(result.error));
+            throw new SimError(status, message);
+          }
+          if ("result" in result && result.result?.retval) {
+            const secondsRemaining = Number(result.result.retval);
+            timeRemainingCache.set(cacheKey, secondsRemaining);
+            return secondsRemaining;
+          }
+          throw new SimError(500, "Internal server error");
+        })();
+
+        inFlightTimeRemainingRequests.set(cacheKey, requestPromise);
       }
 
       let secondsRemaining: number;
@@ -911,6 +933,20 @@ router.get(
       }
       sendSuccess(res, { secondsRemaining });
     } catch (err: any) {
+      if (err instanceof SimError) {
+        logger.warn("Simulation error for time-remaining", {
+          contractId,
+          index,
+          status: err.status,
+          requestId: (req as any).requestId,
+        });
+        if (err.status === 404) {
+          sendError(res, 404, "Job not found");
+        } else {
+          sendError(res, err.status, err.message);
+        }
+        return;
+      }
       logger.error("Failed to get time remaining", {
         error: err?.message,
         contractId: req.params.contractId,

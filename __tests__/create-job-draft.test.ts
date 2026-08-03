@@ -20,6 +20,9 @@ const VALID_BODY = {
 };
 
 const { default: router } = await import("../src/routes/jobs.js");
+const { resetCreateJobDraftRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -29,6 +32,10 @@ function buildApp() {
 }
 
 describe("POST /api/jobs/create-job-draft – schema validation", () => {
+  beforeEach(() => {
+    resetCreateJobDraftRateLimitBuckets();
+  });
+
   it("returns 200 with a draft payload for a valid body", async () => {
     const res = await request(buildApp())
       .post("/api/jobs/create-job-draft")
@@ -128,6 +135,10 @@ describe("POST /api/jobs/create-job-draft – schema validation", () => {
 });
 
 describe("POST /api/jobs/create-job-draft – Stellar address validation", () => {
+  beforeEach(() => {
+    resetCreateJobDraftRateLimitBuckets();
+  });
+
   it("returns 400 for an invalid freelancer address", async () => {
     const res = await request(buildApp())
       .post("/api/jobs/create-job-draft")
@@ -199,6 +210,10 @@ describe("POST /api/jobs/create-job-draft – Stellar address validation", () =>
 });
 
 describe("POST /api/jobs/create-job-draft – CORS and security headers", () => {
+  beforeEach(() => {
+    resetCreateJobDraftRateLimitBuckets();
+  });
+
   const originalAllowedOrigins = process.env.ALLOWED_ORIGINS;
 
   beforeEach(() => {

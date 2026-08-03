@@ -22,6 +22,9 @@ jest.unstable_mockModule("../src/utils/logger.js", () => ({
 
 const { default: router, resetClaimAutoReleaseCache } = await import("../src/routes/jobs.js");
 const { default: mockLogger } = await import("../src/utils/logger.js");
+const { resetClaimAutoReleaseRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 function buildApp() {
   const app = express();
@@ -44,6 +47,9 @@ const MOCK_ACCOUNT = {
 // ---------------------------------------------------------------------------
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – params validation", () => {
+  const originalApiKey = process.env.API_KEY;
+  const originalAllowedOrigins = process.env.ALLOWED_ORIGINS;
+
   beforeEach(() => {
     delete process.env.API_KEY;
     delete process.env.ALLOWED_ORIGINS;
@@ -77,7 +83,8 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – pa
       .expect(400);
 
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toMatch(/valid Stellar contract address/i);
+    expect(res.body.error).toBe("ValidationError");
+    expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 400 for a non-numeric index", async () => {
@@ -187,6 +194,7 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – pa
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – success", () => {
   beforeEach(() => {
+    resetClaimAutoReleaseRateLimitBuckets();
     resetClaimAutoReleaseCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
@@ -226,6 +234,7 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – su
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – caching", () => {
   beforeEach(() => {
+    resetClaimAutoReleaseRateLimitBuckets();
     resetClaimAutoReleaseCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
@@ -325,6 +334,7 @@ describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – ca
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – errors", () => {
   beforeEach(() => {
+    resetClaimAutoReleaseRateLimitBuckets();
     resetClaimAutoReleaseCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
@@ -448,6 +458,7 @@ function debugCallsFor(msg: string) {
 
 describe("POST /api/jobs/:contractId/milestones/:index/claim-auto-release – trace logging", () => {
   beforeEach(() => {
+    resetClaimAutoReleaseRateLimitBuckets();
     resetClaimAutoReleaseCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();

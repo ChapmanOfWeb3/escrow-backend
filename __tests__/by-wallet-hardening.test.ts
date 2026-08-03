@@ -40,13 +40,13 @@ describe("GET /api/jobs/by-wallet/:address – hardening", () => {
 
   it("logs the address on success", async () => {
     await request(buildApp())
-      .get("/api/jobs/by-wallet/GBIGTEST")
+      .get("/api/jobs/by-wallet/GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX")
       .expect(200);
 
     // Cast mock.calls to the expected tuple type to satisfy TypeScript
     const infoEntries = mockLogger.info.mock.calls as unknown as [string, Record<string, unknown>][];
     expect(infoEntries.some(([message]) => message === "Jobs lookup completed")).toBe(true);
-    expect(infoEntries.some(([, meta]) => (meta as any).address === "GBIGTEST")).toBe(true);
+    expect(infoEntries.some(([, meta]) => (meta as any).address === "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX")).toBe(true);
   });
 
   it("logs the address on error", async () => {
@@ -55,12 +55,12 @@ describe("GET /api/jobs/by-wallet/:address – hardening", () => {
     });
 
     await request(buildApp())
-      .get("/api/jobs/by-wallet/GBADTEST")
+      .get("/api/jobs/by-wallet/GB5CRPXUGXZCG6BESL4CM4F3VUAGQGFNYNBHPBRJAGLXXSRYJSEGZHUV")
       .expect(500);
 
     const errorEntries = mockLogger.error.mock.calls as unknown as [string, Record<string, unknown>][];
     expect(errorEntries.some(([message]) => message === "Jobs lookup failed")).toBe(true);
-    expect(errorEntries.some(([, meta]) => (meta as any).address === "GBADTEST")).toBe(true);
+    expect(errorEntries.some(([, meta]) => (meta as any).address === "GB5CRPXUGXZCG6BESL4CM4F3VUAGQGFNYNBHPBRJAGLXXSRYJSEGZHUV")).toBe(true);
   });
 
   it("returns 429 after exceeding the request threshold", async () => {

@@ -22,6 +22,9 @@ jest.unstable_mockModule("../src/utils/logger.js", () => ({
 }));
 
 const { default: router, resetBuildTxCache } = await import("../src/routes/jobs.js");
+const { resetBuildTxRateLimitBuckets } = await import(
+  "../src/middleware/job-contract-rate-limit.js"
+);
 
 const app = express();
 app.use(express.json());
@@ -39,6 +42,7 @@ const SECOND_ADDRESS = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H
 
 describe("POST /api/jobs/build-tx — error sanitization (#70)", () => {
   beforeEach(() => {
+    resetBuildTxRateLimitBuckets();
     resetBuildTxCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
@@ -107,7 +111,7 @@ describe("POST /api/jobs/build-tx — validation", () => {
     expect(res.body.fields).toBeDefined();
     expect(res.body.fields.contractId).toMatch(/contractId is required/i);
     expect(res.body.fields.method).toMatch(/method is required/i);
-    expect(res.body.fields.sourceAddress).toMatch(/address is required/i);
+    expect(res.body.fields.sourceAddress).toMatch(/sourceAddress is required/i);
   });
 
   it("returns 400 with field errors for invalid formats", async () => {
@@ -170,7 +174,7 @@ describe("POST /api/jobs/build-tx — request payload schema validation (#101)",
     const res = await request(app).post("/api/jobs/build-tx").send(body).expect(400);
     expect(res.body.success).toBe(false);
     expect(res.body.error).toBe("ValidationError");
-    expect(res.body.details[0].message).toBe("address is required");
+    expect(res.body.details[0].message).toBe("sourceAddress is required");
   });
 
   it("returns 400 when sourceAddress is not a valid Stellar account address", async () => {
@@ -178,7 +182,9 @@ describe("POST /api/jobs/build-tx — request payload schema validation (#101)",
     const res = await request(app).post("/api/jobs/build-tx").send(body).expect(400);
     expect(res.body.success).toBe(false);
     expect(res.body.error).toBe("ValidationError");
-    expect(res.body.details[0].message).toBe("address must be a valid Stellar account address (G…, 56 chars)");
+    expect(res.body.details[0].message).toBe(
+      "sourceAddress must be a valid Stellar account address (G...)",
+    );
   });
 
   it("returns 400 when args is not an array", async () => {
@@ -192,7 +198,9 @@ describe("POST /api/jobs/build-tx — request payload schema validation (#101)",
     const body = { ...VALID_BODY, contractId: 12345 };
     const res = await request(app).post("/api/jobs/build-tx").send(body as any).expect(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.details[0].message).toContain("Expected string, received number");
+    expect(res.body.details[0].message).toContain(
+      "contractId must be a valid Stellar contract address (C...)",
+    );
   });
 
   it("returns 400 when method is invalid data type (boolean)", async () => {
@@ -205,6 +213,7 @@ describe("POST /api/jobs/build-tx — request payload schema validation (#101)",
 
 describe("POST /api/jobs/build-tx — whitelist management argument validation", () => {
   beforeEach(() => {
+    resetBuildTxRateLimitBuckets();
     resetBuildTxCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
@@ -280,6 +289,7 @@ describe("POST /api/jobs/build-tx — whitelist management argument validation",
 
 describe("POST /api/jobs/build-tx — contract argument type mapping", () => {
   beforeEach(() => {
+    resetBuildTxRateLimitBuckets();
     resetBuildTxCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
@@ -350,6 +360,7 @@ describe("POST /api/jobs/build-tx — contract argument type mapping", () => {
 
 describe("POST /api/jobs/build-tx — in-memory caching (duplicate network hits)", () => {
   beforeEach(() => {
+    resetBuildTxRateLimitBuckets();
     resetBuildTxCache();
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
