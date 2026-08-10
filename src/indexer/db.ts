@@ -26,9 +26,26 @@ export function setDb(newDb: Database.Database) {
   dbInstance = newDb;
 }
 
-export const db = getDb();
-
-db.pragma("journal_mode = WAL");
+/**
+ * Close the active connection and drop the cached instance.
+ *
+ * Importing this module used to open a connection as a side effect, so every
+ * test file that touched it leaked a SQLite file handle and Jest had to force
+ * workers to exit. The connection is now opened lazily by `getDb()`, and this
+ * lets test teardown release it.
+ */
+export function closeDb(): void {
+  if (!dbInstance) return;
+  try {
+    dbInstance.close();
+  } catch (err) {
+    logger.warn("Failed to close database connection", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    dbInstance = null;
+  }
+}
 
 const JOBS_BY_WALLET_CACHE_TTL_S = parseInt(
   process.env.JOBS_BY_WALLET_CACHE_TTL_S || "60",
