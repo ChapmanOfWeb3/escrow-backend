@@ -249,21 +249,38 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
       expect(resetTime).toBeLessThan(now + 120); // Within 2 minutes
     });
 
-    it("has correct default rate limit configuration", () => {
+    it("has correct default rate limit configuration", async () => {
       delete process.env.TIME_REMAINING_RATE_MAX;
       delete process.env.TIME_REMAINING_RATE_WINDOW_MS;
       resetTimeRemainingRateLimitBuckets();
 
-      // Default: 60 requests per 60000ms (60s)
-      // Make 60 requests
-      for (let i = 0; i < 60; i++) {
-        request(app).get(
+      // Default: 60 requests per 60000ms (60s). The first response advertises
+      // the default limit, and requests 2–60 must all pass through.
+      //
+      // Every request must be awaited: constructing a supertest chain opens a
+      // real listening server, and only executing the chain closes it again.
+      const first = await request(app).get(
+        `/api/jobs/${VALID_CONTRACT}/milestones/0/time-remaining`
+      );
+      expect(first.status).not.toBe(429);
+      expect(first.headers["x-ratelimit-limit"]).toBe("60");
+
+      for (let i = 0; i < 59; i++) {
+        const res = await request(app).get(
           `/api/jobs/${VALID_CONTRACT}/milestones/0/time-remaining`
         );
+        expect(res.status).not.toBe(429);
       }
 
-      // 61st should be rate limited with defaults
-      // This is just a smoke test; in practice we'd need to actually wait for the requests
+      // The 61st request exceeds the default threshold.
+      const blocked = await request(app).get(
+        `/api/jobs/${VALID_CONTRACT}/milestones/0/time-remaining`
+      );
+      expect(blocked.status).toBe(429);
+      expect(blocked.body).toEqual({
+        success: false,
+        error: "Too many requests, please try again later",
+      });
     });
   });
 
