@@ -228,6 +228,229 @@ export function verifySchemaUpToDate(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Schema verification hooks (#264)
+// ---------------------------------------------------------------------------
+
+export interface SchemaVerificationResult {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  migrationVersionGap: boolean;
+  errors: string[];
+}
+
+const EXPECTED_TABLES: Record<string, string[]> = {
+  events: [
+    "id",
+    "contract_id",
+    "event_type",
+    "ledger_sequence",
+    "timestamp",
+    "data_json",
+    "created_at",
+  ],
+  indexer_state: ["key", "value"],
+  monitored_contracts: [
+    "id",
+    "contract_id",
+    "label",
+    "active",
+    "registered_at",
+  ],
+  schema_migrations: ["version", "description", "applied_at"],
+};
+
+/**
+ * Verify the database schema structure matches expected state.
+ * Returns a detailed result indicating any discrepancies.
+ */
+export function verifySchemaIntegrity(): SchemaVerificationResult {
+  const database = getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const errors: string[] = [];
+  let migrationVersionGap = false;
+
+  // Check required tables exist
+  for (const tableName of Object.keys(EXPECTED_TABLES)) {
+    const table = database
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+      )
+      .get(tableName);
+
+    if (!table) {
+      missingTables.push(tableName);
+      continue;
+    }
+
+    // Check required columns
+    const columns = database
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all() as Array<{ name: string }>;
+    const columnNames = new Set(columns.map((c) => c.name));
+
+    const missing = EXPECTED_TABLES[tableName].filter(
+      (col) => !columnNames.has(col)
+    );
+    if (missing.length > 0) {
+      missingColumns[tableName] = missing;
+    }
+  }
+
+  // Check migration version continuity
+  try {
+    const applied = database
+      .prepare("SELECT version FROM schema_migrations ORDER BY version")
+      .all() as Array<{ version: number }>;
+    const versions = applied.map((r) => r.version);
+    for (let i = 1; i < versions.length; i++) {
+      if (versions[i] - versions[i - 1] > 1) {
+        migrationVersionGap = true;
+        errors.push(
+          `Migration version gap between ${versions[i - 1]} and ${versions[i]}`
+        );
+      }
+    }
+  } catch {
+    errors.push("schema_migrations table is unreadable");
+  }
+
+  const valid =
+    missingTables.length === 0 &&
+    Object.keys(missingColumns).length === 0 &&
+    !migrationVersionGap;
+
+  return {
+    valid,
+    missingTables,
+    missingColumns,
+    migrationVersionGap,
+    errors,
+  };
+}
+
+/**
+ * Verify schema integrity and throw if the database is out of sync.
+ * Call this before starting the poller to prevent data corruption.
+ */
+export function assertSchemaValid(): void {
+  const result = verifySchemaIntegrity();
+  if (!result.valid) {
+    const reasons = [
+      ...result.missingTables.map((t) => `missing table: ${t}`),
+      ...Object.entries(result.missingColumns).map(
+        ([t, cols]) => `missing columns in ${t}: ${cols.join(", ")}`
+      ),
+      ...result.errors,
+    ];
+    throw new Error(
+      `Schema verification failed – database out of sync: ${reasons.join("; ")}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic poller throttle parameters (#265)
+// ---------------------------------------------------------------------------
+
+export interface PollerThrottleState {
+  currentIntervalMs: number;
+  lastProcessedEventCount: number;
+  idleCycles: number;
+  lastLoadAdjustmentAt: number;
+}
+
+const BASE_POLL_INTERVAL_MS = parseInt(
+  process.env.POLL_INTERVAL_MS || "15000",
+  10,
+);
+const MIN_POLL_INTERVAL_MS = parseInt(
+  process.env.POLLER_MIN_INTERVAL_MS || "5000",
+  10,
+);
+const MAX_POLL_INTERVAL_MS = parseInt(
+  process.env.POLLER_MAX_INTERVAL_MS || "60000",
+  10,
+);
+const IDLE_MULTIPLIER = parseInt(
+  process.env.POLLER_IDLE_MULTIPLIER || "2",
+  10,
+);
+const IDLE_THRESHOLD_CYCLES = parseInt(
+  process.env.POLLER_IDLE_THRESHOLD || "3",
+  10,
+);
+const LOAD_DECREASE_FACTOR = parseFloat(
+  process.env.POLLER_LOAD_DECREASE_FACTOR || "0.5",
+);
+
+let pollerThrottleState: PollerThrottleState = {
+  currentIntervalMs: BASE_POLL_INTERVAL_MS,
+  lastProcessedEventCount: 0,
+  idleCycles: 0,
+  lastLoadAdjustmentAt: Date.now(),
+};
+
+/**
+ * Get the current poller throttle state (read-only snapshot).
+ */
+export function getPollerThrottleState(): PollerThrottleState {
+  return { ...pollerThrottleState };
+}
+
+/**
+ * Reset poller throttle state to defaults (useful for tests).
+ */
+export function resetPollerThrottleState(): void {
+  pollerThrottleState = {
+    currentIntervalMs: BASE_POLL_INTERVAL_MS,
+    lastProcessedEventCount: 0,
+    idleCycles: 0,
+    lastLoadAdjustmentAt: Date.now(),
+  };
+}
+
+/**
+ * Adjust poller interval based on processing load.
+ * Called after each poll cycle with the number of events processed.
+ * When idle (no events), the interval increases up to MAX_POLL_INTERVAL_MS.
+ * When under load (events processed), the interval decreases toward MIN_POLL_INTERVAL_MS.
+ */
+export function adjustPollerInterval(
+  processedEventCount: number,
+): PollerThrottleState {
+  const state = pollerThrottleState;
+  state.lastProcessedEventCount = processedEventCount;
+
+  if (processedEventCount === 0) {
+    state.idleCycles += 1;
+    if (state.idleCycles >= IDLE_THRESHOLD_CYCLES) {
+      state.currentIntervalMs = Math.min(
+        state.currentIntervalMs * IDLE_MULTIPLIER,
+        MAX_POLL_INTERVAL_MS,
+      );
+    }
+  } else {
+    state.idleCycles = 0;
+    state.currentIntervalMs = Math.max(
+      MIN_POLL_INTERVAL_MS,
+      Math.floor(state.currentIntervalMs * LOAD_DECREASE_FACTOR),
+    );
+  }
+
+  state.lastLoadAdjustmentAt = Date.now();
+  return { ...state };
+}
+
+/**
+ * Get the current effective poll interval in milliseconds.
+ */
+export function getCurrentPollIntervalMs(): number {
+  return pollerThrottleState.currentIntervalMs;
+}
+
+// ---------------------------------------------------------------------------
 // Indexer state
 // ---------------------------------------------------------------------------
 

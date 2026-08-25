@@ -5,7 +5,8 @@ import {
   insertEventBatch,
   getActiveContractIds,
   registerContract,
-  verifySchemaUpToDate,
+  adjustPollerInterval,
+  getCurrentPollIntervalMs,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
@@ -14,16 +15,34 @@ import logger from "../utils/logger.js";
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
-// Ceiling for the backed-off poll delay when the network is idle, and the
-// multiplier applied each consecutive idle poll (#274).
-const MAX_POLL_INTERVAL_MS = parseInt(
-  process.env.POLL_INTERVAL_MAX_MS || String(POLL_INTERVAL_MS * 8),
-  10
+
+// ---------------------------------------------------------------------------
+// Alerting thresholds (#271)
+// ---------------------------------------------------------------------------
+const CONSECUTIVE_FAILURE_THRESHOLD = parseInt(
+  process.env.POLLER_FAILURE_THRESHOLD || "3",
+  10,
 );
-const POLL_BACKOFF_MULTIPLIER = parseFloat(
-  process.env.POLL_BACKOFF_MULTIPLIER || "2"
-);
+
+function getStallThresholdMs(): number {
+  return parseInt(process.env.POLLER_STALL_THRESHOLD_MS || "120000", 10);
+}
+
+let consecutiveFailures = 0;
+let lastSuccessfulPollAt: number | null = null;
+
+export function getConsecutiveFailures(): number {
+  return consecutiveFailures;
+}
+
+export function getLastSuccessfulPollAt(): number | null {
+  return lastSuccessfulPollAt;
+}
+
+export function resetFailureState(): void {
+  consecutiveFailures = 0;
+  lastSuccessfulPollAt = null;
+}
 
 const EVENT_TYPES = [
   "initialized",
@@ -63,6 +82,25 @@ export async function pollEvents(): Promise<boolean> {
     return false;
   }
 
+  // --- Diagnostics: stall detection before polling (#270, #271) ---
+  if (lastSuccessfulPollAt) {
+    const stallThresholdMs = getStallThresholdMs();
+    const elapsed = Date.now() - lastSuccessfulPollAt;
+    if (elapsed > stallThresholdMs) {
+      logger.warn("Poller stall detected – no successful poll for threshold period", {
+        elapsedMs: elapsed,
+        stallThresholdMs,
+        consecutiveFailures,
+      });
+    }
+    logger.debug("Poller stall diagnostics", {
+      elapsedMsSinceLastSuccess: elapsed,
+      stallThresholdMs,
+    });
+  }
+
+  const pollStart = performance.now();
+
   try {
     // Validate the schema before matching events against EVENT_TYPES – a stale
     // schema must not silently pass through the topic filter (#282).
@@ -70,12 +108,17 @@ export async function pollEvents(): Promise<boolean> {
 
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
-    if (currentLedger <= lastLedger) return false;
+    if (currentLedger <= lastLedger) {
+      // --- Dynamic throttling: idle cycle (#265) ---
+      adjustPollerInterval(0);
+      return;
+    }
 
     const startLedger = lastLedger + 1;
 
     logger.info("Polling events", { startLedger, currentLedger });
 
+    const eventsStart = performance.now();
     const events = await server.getEvents({
       startLedger,
       filters: [
@@ -86,6 +129,17 @@ export async function pollEvents(): Promise<boolean> {
         },
       ],
       limit: 100,
+    });
+    const eventsElapsed = performance.now() - eventsStart;
+
+    // --- Diagnostics: payload size and timing (#270) ---
+    const payloadSizeBytes = JSON.stringify(events.events).length;
+    logger.debug("RPC getEvents diagnostics", {
+      elapsedMs: Math.round(eventsElapsed),
+      payloadSizeBytes,
+      eventCount: events.events.length,
+      startLedger,
+      currentLedger,
     });
 
     // Build the batch to be written atomically (#84)
@@ -101,9 +155,19 @@ export async function pollEvents(): Promise<boolean> {
 
     // Persist the batch and advance the ledger pointer atomically (#84)
     insertEventBatch(batch, currentLedger);
+
+    const totalElapsed = performance.now() - pollStart;
+    consecutiveFailures = 0;
+    lastSuccessfulPollAt = Date.now();
+
+    // --- Dynamic poller throttling (#265) ---
+    const throttleState = adjustPollerInterval(events.events.length);
+
     logger.info("Processed indexer poll", {
       eventCount: events.events.length,
       upToLedger: currentLedger,
+      elapsedMs: Math.round(totalElapsed),
+      pollIntervalMs: throttleState.currentIntervalMs,
     });
 
     deliverWebhooks(startLedger, currentLedger).catch((err) =>
@@ -114,49 +178,50 @@ export async function pollEvents(): Promise<boolean> {
 
     return true;
   } catch (err) {
+    const totalElapsed = performance.now() - pollStart;
+    consecutiveFailures += 1;
+
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),
+      consecutiveFailures,
+      elapsedMs: Math.round(totalElapsed),
     });
-    return false;
+
+    // --- Alerting: warn when consecutive failures hit threshold (#271) ---
+    if (consecutiveFailures >= CONSECUTIVE_FAILURE_THRESHOLD) {
+      logger.error("Poller alert: consecutive failure threshold exceeded", {
+        consecutiveFailures,
+        threshold: CONSECUTIVE_FAILURE_THRESHOLD,
+        lastSuccessAt: lastSuccessfulPollAt,
+      });
+    }
   }
 }
 
-let pollTimer: NodeJS.Timeout | null = null;
+let pollerTimeout: NodeJS.Timeout | null = null;
 let pollerRunning = false;
-let currentPollDelayMs = POLL_INTERVAL_MS;
 
-/**
- * Schedules the next poll with a dynamic delay: idle polls (no new ledger to
- * process) back off toward MAX_POLL_INTERVAL_MS, while any poll that actually
- * processes ledger activity resets the delay back to the base interval (#274).
- */
-async function scheduleNextPoll() {
-  const wasBusy = await pollEvents();
-
-  currentPollDelayMs = wasBusy
-    ? POLL_INTERVAL_MS
-    : Math.min(currentPollDelayMs * POLL_BACKOFF_MULTIPLIER, MAX_POLL_INTERVAL_MS);
-
+async function pollLoop() {
   if (!pollerRunning) return;
-  pollTimer = setTimeout(scheduleNextPoll, currentPollDelayMs);
+  await pollEvents();
+  const interval = getCurrentPollIntervalMs();
+  pollerTimeout = setTimeout(pollLoop, interval);
 }
 
 export function startPoller() {
   if (pollerRunning) return;
-
-  // Fail fast on startup if the database schema is out of sync (#273).
-  verifySchemaUpToDate();
-
-  logger.info("Starting event indexer poller", { intervalMs: POLL_INTERVAL_MS });
   pollerRunning = true;
-  currentPollDelayMs = POLL_INTERVAL_MS;
-  scheduleNextPoll();
+  logger.info("Starting event indexer poller", {
+    intervalMs: getCurrentPollIntervalMs(),
+  });
+  pollEvents();
+  pollerTimeout = setTimeout(pollLoop, getCurrentPollIntervalMs());
 }
 
 export function stopPoller() {
   pollerRunning = false;
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
+  if (pollerTimeout) {
+    clearTimeout(pollerTimeout);
+    pollerTimeout = null;
   }
 }
