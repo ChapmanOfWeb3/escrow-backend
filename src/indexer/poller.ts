@@ -5,6 +5,7 @@ import {
   insertEventBatch,
   getActiveContractIds,
   registerContract,
+  verifySchemaUpToDate,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
@@ -51,6 +52,10 @@ export async function pollEvents() {
   }
 
   try {
+    // Validate the schema before matching events against EVENT_TYPES – a stale
+    // schema must not silently pass through the topic filter (#282).
+    verifySchemaUpToDate();
+
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
     if (currentLedger <= lastLedger) return;

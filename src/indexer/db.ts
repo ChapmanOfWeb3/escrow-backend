@@ -188,6 +188,45 @@ export function initSchema() {
   runMigrations();
 }
 
+/**
+ * Verifies every migration in MIGRATIONS is recorded as applied in
+ * schema_migrations. Throws if the table is missing or a version hasn't
+ * been applied yet, so callers can fail fast on a stale/out-of-sync
+ * database instead of hitting confusing SQL errors later (#282).
+ */
+export function verifySchemaUpToDate(): void {
+  const database = getDb();
+
+  const migrationsTable = database
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    )
+    .get();
+
+  if (!migrationsTable) {
+    throw new Error(
+      "Database schema is out of sync: schema_migrations table not found. Run runMigrations() first."
+    );
+  }
+
+  const appliedVersions = new Set(
+    (
+      database.prepare("SELECT version FROM schema_migrations").all() as Array<{
+        version: number;
+      }>
+    ).map((row) => row.version)
+  );
+
+  const missing = MIGRATIONS.filter((m) => !appliedVersions.has(m.version));
+  if (missing.length > 0) {
+    throw new Error(
+      `Database schema is out of sync: missing migrations ${missing
+        .map((m) => `${m.version} (${m.description})`)
+        .join(", ")}. Run runMigrations() first.`
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Indexer state
 // ---------------------------------------------------------------------------
