@@ -8,25 +8,13 @@ import {
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
+import { fetchEventsWithRetry } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
-
-const EVENT_TYPES = [
-  "initialized",
-  "funded",
-  "delivered",
-  "approved",
-  "dispute_raised",
-  "dispute_resolved",
-  "partial_release",
-  "auto_release_claimed",
-  "token_whitelisted",
-  "token_removed",
-];
 
 /**
  * Poll events for all active contract IDs stored in monitored_contracts (#85).
@@ -59,15 +47,9 @@ export async function pollEvents() {
 
     logger.info("Polling events", { startLedger, currentLedger });
 
-    const events = await server.getEvents({
+    const events = await fetchEventsWithRetry(server, {
       startLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds,
-          topics: [[...EVENT_TYPES]],
-        },
-      ],
+      contractIds,
       limit: 100,
     });
 
