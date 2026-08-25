@@ -1,8 +1,10 @@
 import { Server } from "@stellar/stellar-sdk/rpc";
+import type { Api } from "@stellar/stellar-sdk/rpc";
 import { scValToNative } from "@stellar/stellar-sdk";
 import {
   getLastIndexedLedger,
   insertEventBatch,
+  insertHistoricalEventBatch,
   getActiveContractIds,
   registerContract,
   type EventRow,
@@ -61,6 +63,28 @@ const EVENT_TYPES = [
   "token_removed",
 ];
 
+function buildEventFilter(contractIds: string[]): Api.EventFilter[] {
+  return [
+    {
+      type: "contract",
+      contractIds,
+      topics: [[...EVENT_TYPES]],
+    },
+  ];
+}
+
+function toEventRow(event: Api.EventResponse, fallbackContractId: string): EventRow {
+  return {
+    contractId: event.contractId?.contractId() ?? fallbackContractId,
+    eventType: scValToNative(event.topic[0]) as string,
+    ledgerSequence: event.ledger,
+    timestamp: event.ledgerClosedAt
+      ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
+      : Math.floor(Date.now() / 1000),
+    dataJson: JSON.stringify(event.value),
+  };
+}
+
 /**
  * Poll events for all active contract IDs stored in monitored_contracts (#85).
  * All events fetched in a single poll are written atomically together with the
@@ -105,26 +129,14 @@ export async function pollEvents(): Promise<boolean> {
 
     const events = await server.getEvents({
       startLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds,
-          topics: [[...EVENT_TYPES]],
-        },
-      ],
+      filters: buildEventFilter(contractIds),
       limit: 100,
     });
 
     // Build the batch to be written atomically (#84)
-    const batch: EventRow[] = events.events.map((event) => ({
-      contractId: event.contractId?.contractId() ?? contractIds[0],
-      eventType: scValToNative(event.topic[0]) as string,
-      ledgerSequence: event.ledger,
-      timestamp: event.ledgerClosedAt
-        ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
-        : Math.floor(Date.now() / 1000),
-      dataJson: JSON.stringify(event.value),
-    }));
+    const batch: EventRow[] = events.events.map((event) =>
+      toEventRow(event, contractIds[0])
+    );
 
     // Persist the batch and advance the ledger pointer atomically (#84)
     insertEventBatch(batch, currentLedger);
@@ -148,6 +160,143 @@ export async function pollEvents(): Promise<boolean> {
     // RPC endpoint that may itself be struggling.
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Historical event import (event_type_filter: dynamic start/end ledger)
+// ---------------------------------------------------------------------------
+// No pre-existing backfill/historical-ingestion mechanism was found elsewhere
+// in this codebase (searched for "backfill"/"historical" usage) - this is a
+// new, narrowly-scoped addition, not a duplicate of an existing one.
+
+// Caps how large a single historical range can be, so a mistyped/huge range
+// can't be silently accepted and hammer the RPC in one call. Follows the
+// same parseInt(process.env.X || "default") config convention as
+// POLL_INTERVAL_MS above - no new config mechanism introduced.
+const MAX_HISTORICAL_RANGE_LEDGERS = parseInt(
+  process.env.HISTORICAL_IMPORT_MAX_RANGE_LEDGERS || "10000",
+  10
+);
+// Safety cap on how many 100-event pages a single import will page through,
+// in case of an unexpectedly dense range or a misbehaving RPC cursor.
+const MAX_HISTORICAL_PAGES = parseInt(
+  process.env.HISTORICAL_IMPORT_MAX_PAGES || "50",
+  10
+);
+const HISTORICAL_PAGE_LIMIT = 100;
+
+export interface HistoricalRangeValidation {
+  valid: boolean;
+  error?: string;
+}
+
+/**
+ * Validates a requested historical import range. Rejects clearly rather than
+ * silently clamping (unlike the page/limit clamping used for pagination
+ * elsewhere in db.ts) because a wrong ledger range here would silently
+ * import the wrong data, not just the wrong page of otherwise-correct data.
+ */
+export function validateHistoricalRange(
+  startLedger: number,
+  endLedger: number,
+  currentLedger: number
+): HistoricalRangeValidation {
+  if (!Number.isInteger(startLedger) || startLedger < 1) {
+    return { valid: false, error: "startLedger must be a positive integer" };
+  }
+  if (!Number.isInteger(endLedger) || endLedger < 1) {
+    return { valid: false, error: "endLedger must be a positive integer" };
+  }
+  if (startLedger > endLedger) {
+    return { valid: false, error: "startLedger must be <= endLedger" };
+  }
+  if (endLedger > currentLedger) {
+    return {
+      valid: false,
+      error: `endLedger (${endLedger}) is beyond the current chain head (${currentLedger}) - that ledger does not exist yet`,
+    };
+  }
+  if (endLedger - startLedger + 1 > MAX_HISTORICAL_RANGE_LEDGERS) {
+    return {
+      valid: false,
+      error: `requested range spans ${endLedger - startLedger + 1} ledgers, exceeding the ${MAX_HISTORICAL_RANGE_LEDGERS}-ledger max per historical import`,
+    };
+  }
+  return { valid: true };
+}
+
+export interface HistoricalImportResult {
+  startLedger: number;
+  endLedger: number;
+  eventsFound: number;
+  eventsImported: number;
+}
+
+/**
+ * Imports events for an arbitrary past ledger range (custom historical
+ * import), independent of the live poller's forward progress.
+ *
+ * Deliberately does NOT call insertEventBatch()/advance last_ledger_sequence
+ * - it uses insertHistoricalEventBatch() instead, so a backfill over old
+ * ledgers can never rewind the live pointer backwards, and a backfill that
+ * raced ahead of the live poller could never cause it to skip ledgers by
+ * advancing the pointer past events the live poller hasn't processed yet.
+ * Duplicate prevention (INSERT OR IGNORE on the same UNIQUE constraint) still
+ * applies, so re-running an import - or importing a range the live poller has
+ * since caught up to - is idempotent and produces no duplicate rows.
+ */
+export async function fetchHistoricalEvents(
+  startLedger: number,
+  endLedger: number
+): Promise<HistoricalImportResult> {
+  let contractIds: string[] = getActiveContractIds();
+  if (contractIds.length === 0 && process.env.CONTRACT_ID) {
+    registerContract(process.env.CONTRACT_ID, "default");
+    contractIds = [process.env.CONTRACT_ID];
+  }
+  if (contractIds.length === 0) {
+    throw new Error("No CONTRACT_IDs configured - cannot import historical events");
+  }
+
+  const currentLedger = (await server.getLatestLedger()).sequence;
+  const validation = validateHistoricalRange(startLedger, endLedger, currentLedger);
+  if (!validation.valid) {
+    throw new Error(validation.error);
+  }
+
+  logger.info("Fetching historical events", { startLedger, endLedger, contractIds });
+
+  const filters = buildEventFilter(contractIds);
+  const collected: Api.EventResponse[] = [];
+  let cursor: string | undefined;
+
+  for (let page = 0; page < MAX_HISTORICAL_PAGES; page++) {
+    const response = cursor
+      ? await server.getEvents({ cursor, filters, limit: HISTORICAL_PAGE_LIMIT })
+      : await server.getEvents({
+          startLedger,
+          endLedger,
+          filters,
+          limit: HISTORICAL_PAGE_LIMIT,
+        });
+
+    collected.push(...response.events);
+
+    if (response.events.length < HISTORICAL_PAGE_LIMIT) break; // last page
+    cursor = response.cursor;
+  }
+
+  const batch: EventRow[] = collected.map((event) => toEventRow(event, contractIds[0]));
+  const eventsImported = insertHistoricalEventBatch(batch);
+
+  logger.info("Historical event import complete", {
+    startLedger,
+    endLedger,
+    eventsFound: batch.length,
+    eventsImported,
+  });
+
+  return { startLedger, endLedger, eventsFound: batch.length, eventsImported };
 }
 
 let pollerTimer: NodeJS.Timeout | null = null;
