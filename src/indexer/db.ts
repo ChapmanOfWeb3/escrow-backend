@@ -222,6 +222,34 @@ export function getActiveContractIds(): string[] {
 // ---------------------------------------------------------------------------
 
 /**
+ * Checks whether an event with the given (contract_id, ledger_sequence,
+ * event_type) already exists - the exact composite key the
+ * UNIQUE(contract_id, ledger_sequence, event_type) constraint on `events`
+ * enforces (see MIGRATIONS v1). insertEvent()/insertEventBatch() rely on
+ * INSERT OR IGNORE for the actual write path (unchanged), so this constraint
+ * check normally happens implicitly inside SQLite and isn't independently
+ * observable. This lookup is exposed as its own query so the duplicate-check
+ * path can be measured and EXPLAIN QUERY PLAN'd directly - it reuses the
+ * existing sqlite_autoindex_events_1 index that comes from the UNIQUE
+ * constraint; no new index is introduced.
+ */
+export function isDuplicateEvent(
+  contractId: string,
+  ledgerSequence: number,
+  eventType: string
+): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT 1 FROM events
+       WHERE contract_id = ? AND ledger_sequence = ? AND event_type = ?
+       LIMIT 1`
+    )
+    .get(contractId, ledgerSequence, eventType);
+  return row !== undefined;
+}
+
+/**
  * Insert a single event row.  For atomic batch inserts use insertEventBatch().
  */
 export function insertEvent(
