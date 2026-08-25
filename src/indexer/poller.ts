@@ -13,7 +13,40 @@ import logger from "../utils/logger.js";
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
+
+// --- Dynamic polling interval (idle backoff) ---
+// Base/minimum interval - used whenever the ledger is advancing (network active).
+const POLL_INTERVAL_MIN_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
+// Upper bound on how far the interval may back off during idle periods. This
+// caps the worst-case detection delay for a real event once the network
+// resumes, since duplicate-prevention correctness itself does not depend on
+// how often we poll (see pollEvents() doc comment below).
+const POLL_INTERVAL_MAX_MS = parseInt(
+  process.env.POLL_INTERVAL_MAX_MS || "120000",
+  10
+);
+// Multiplier applied to the current interval each consecutive idle poll.
+const POLL_IDLE_BACKOFF_MULTIPLIER = parseFloat(
+  process.env.POLL_IDLE_BACKOFF_MULTIPLIER || "1.5"
+);
+
+/**
+ * Given the current polling interval and whether the last poll observed new
+ * ledger activity, compute the interval to use for the next poll.
+ *
+ * - Activity resumes -> immediately reset to the minimum interval so new
+ *   events are picked up promptly.
+ * - Idle -> back off multiplicatively, capped at POLL_INTERVAL_MAX_MS, so the
+ *   poller never gets stuck waiting indefinitely.
+ */
+export function nextPollIntervalMs(
+  currentIntervalMs: number,
+  hadActivity: boolean
+): number {
+  if (hadActivity) return POLL_INTERVAL_MIN_MS;
+  const backedOff = Math.round(currentIntervalMs * POLL_IDLE_BACKOFF_MULTIPLIER);
+  return Math.min(backedOff, POLL_INTERVAL_MAX_MS);
+}
 
 const EVENT_TYPES = [
   "initialized",
@@ -33,8 +66,19 @@ const EVENT_TYPES = [
  * All events fetched in a single poll are written atomically together with the
  * ledger pointer update (#84) – so a mid-poll crash cannot advance the pointer
  * without committing the accompanying events.
+ *
+ * Returns whether the network showed activity (a new ledger closed since the
+ * last poll). The caller uses this to drive the dynamic polling interval
+ * (see nextPollIntervalMs()) – NOTE this only affects how *often* we poll,
+ * never *what* gets written. Duplicate prevention itself is guaranteed by the
+ * UNIQUE(contract_id, ledger_sequence, event_type) constraint + INSERT OR
+ * IGNORE in db.ts, and every poll always resumes from the last committed
+ * ledger pointer (lastLedger + 1) regardless of how much time has passed
+ * since the previous poll. So a longer interval can only delay *when* an
+ * event is detected – it cannot cause an event to be missed, double-counted,
+ * or processed out of order.
  */
-export async function pollEvents() {
+export async function pollEvents(): Promise<boolean> {
   // --- Resolve active contract IDs from the DB (#85) ---
   let contractIds: string[] = getActiveContractIds();
 
@@ -47,13 +91,13 @@ export async function pollEvents() {
 
   if (contractIds.length === 0) {
     logger.debug("No CONTRACT_IDs configured – skipping indexer poll");
-    return;
+    return false;
   }
 
   try {
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
-    if (currentLedger <= lastLedger) return;
+    if (currentLedger <= lastLedger) return false;
 
     const startLedger = lastLedger + 1;
 
@@ -94,25 +138,47 @@ export async function pollEvents() {
         error: err instanceof Error ? err.message : String(err),
       })
     );
+
+    return true;
   } catch (err) {
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),
     });
+    // Treat a failed poll as idle so we back off rather than hammering an
+    // RPC endpoint that may itself be struggling.
+    return false;
   }
 }
 
-let pollerInterval: NodeJS.Timeout | null = null;
+let pollerTimer: NodeJS.Timeout | null = null;
+let currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
+
+/** Exposed for tests/observability – the interval the next poll is scheduled at. */
+export function getCurrentPollIntervalMs(): number {
+  return currentPollIntervalMs;
+}
 
 export function startPoller() {
-  if (pollerInterval) return;
-  logger.info("Starting event indexer poller", { intervalMs: POLL_INTERVAL_MS });
-  pollEvents();
-  pollerInterval = setInterval(pollEvents, POLL_INTERVAL_MS);
+  if (pollerTimer) return;
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
+  logger.info("Starting event indexer poller", {
+    intervalMs: currentPollIntervalMs,
+    maxIntervalMs: POLL_INTERVAL_MAX_MS,
+  });
+
+  const runAndSchedule = async () => {
+    const hadActivity = await pollEvents();
+    currentPollIntervalMs = nextPollIntervalMs(currentPollIntervalMs, hadActivity);
+    pollerTimer = setTimeout(runAndSchedule, currentPollIntervalMs);
+  };
+
+  runAndSchedule();
 }
 
 export function stopPoller() {
-  if (pollerInterval) {
-    clearInterval(pollerInterval);
-    pollerInterval = null;
+  if (pollerTimer) {
+    clearTimeout(pollerTimer);
+    pollerTimer = null;
   }
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
 }
