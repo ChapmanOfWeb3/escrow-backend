@@ -15,6 +15,15 @@ const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
+// Ceiling for the backed-off poll delay when the network is idle, and the
+// multiplier applied each consecutive idle poll (#274).
+const MAX_POLL_INTERVAL_MS = parseInt(
+  process.env.POLL_INTERVAL_MAX_MS || String(POLL_INTERVAL_MS * 8),
+  10
+);
+const POLL_BACKOFF_MULTIPLIER = parseFloat(
+  process.env.POLL_BACKOFF_MULTIPLIER || "2"
+);
 
 const EVENT_TYPES = [
   "initialized",
@@ -34,8 +43,11 @@ const EVENT_TYPES = [
  * All events fetched in a single poll are written atomically together with the
  * ledger pointer update (#84) – so a mid-poll crash cannot advance the pointer
  * without committing the accompanying events.
+ *
+ * Returns whether the ledger actually advanced, so startPoller() can throttle
+ * its polling frequency up or down based on ledger processing load (#274).
  */
-export async function pollEvents() {
+export async function pollEvents(): Promise<boolean> {
   // --- Resolve active contract IDs from the DB (#85) ---
   let contractIds: string[] = getActiveContractIds();
 
@@ -48,7 +60,7 @@ export async function pollEvents() {
 
   if (contractIds.length === 0) {
     logger.debug("No CONTRACT_IDs configured – skipping indexer poll");
-    return;
+    return false;
   }
 
   try {
@@ -58,7 +70,7 @@ export async function pollEvents() {
 
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
-    if (currentLedger <= lastLedger) return;
+    if (currentLedger <= lastLedger) return false;
 
     const startLedger = lastLedger + 1;
 
@@ -99,29 +111,52 @@ export async function pollEvents() {
         error: err instanceof Error ? err.message : String(err),
       })
     );
+
+    return true;
   } catch (err) {
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),
     });
+    return false;
   }
 }
 
-let pollerInterval: NodeJS.Timeout | null = null;
+let pollTimer: NodeJS.Timeout | null = null;
+let pollerRunning = false;
+let currentPollDelayMs = POLL_INTERVAL_MS;
+
+/**
+ * Schedules the next poll with a dynamic delay: idle polls (no new ledger to
+ * process) back off toward MAX_POLL_INTERVAL_MS, while any poll that actually
+ * processes ledger activity resets the delay back to the base interval (#274).
+ */
+async function scheduleNextPoll() {
+  const wasBusy = await pollEvents();
+
+  currentPollDelayMs = wasBusy
+    ? POLL_INTERVAL_MS
+    : Math.min(currentPollDelayMs * POLL_BACKOFF_MULTIPLIER, MAX_POLL_INTERVAL_MS);
+
+  if (!pollerRunning) return;
+  pollTimer = setTimeout(scheduleNextPoll, currentPollDelayMs);
+}
 
 export function startPoller() {
-  if (pollerInterval) return;
+  if (pollerRunning) return;
 
   // Fail fast on startup if the database schema is out of sync (#273).
   verifySchemaUpToDate();
 
   logger.info("Starting event indexer poller", { intervalMs: POLL_INTERVAL_MS });
-  pollEvents();
-  pollerInterval = setInterval(pollEvents, POLL_INTERVAL_MS);
+  pollerRunning = true;
+  currentPollDelayMs = POLL_INTERVAL_MS;
+  scheduleNextPoll();
 }
 
 export function stopPoller() {
-  if (pollerInterval) {
-    clearInterval(pollerInterval);
-    pollerInterval = null;
+  pollerRunning = false;
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
   }
 }
