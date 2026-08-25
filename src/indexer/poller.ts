@@ -110,6 +110,10 @@ let pollerInterval: NodeJS.Timeout | null = null;
 
 export function startPoller() {
   if (pollerInterval) return;
+
+  // Fail fast on startup if the database schema is out of sync (#273).
+  verifySchemaUpToDate();
+
   logger.info("Starting event indexer poller", { intervalMs: POLL_INTERVAL_MS });
   pollEvents();
   pollerInterval = setInterval(pollEvents, POLL_INTERVAL_MS);
