@@ -112,6 +112,26 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 3,
+    description: "add indexes for query optimization",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_contract_id
+        ON events (contract_id);
+
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_sequence
+        ON events (ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_ledger
+        ON events (contract_id, ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_type
+        ON events (contract_id, event_type);
+
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract
+        ON webhook_subscriptions (contract_id);
+    `,
+  },
 ];
 
 /**
