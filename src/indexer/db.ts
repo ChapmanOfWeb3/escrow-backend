@@ -112,6 +112,25 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 3,
+    description: "add indexes on events for event_type_filter optimization",
+    up: `
+      -- Speeds up getIndexerStatusData(): GROUP BY event_type scan
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+
+      -- Speeds up filtering by both contract and event type
+      -- (e.g. WHERE contract_id = ? AND event_type = ?)
+      CREATE INDEX IF NOT EXISTS idx_events_contract_event_type
+        ON events (contract_id, event_type);
+
+      -- Speeds up getEventsByContract(): WHERE contract_id = ?  ORDER BY ledger_sequence
+      -- Covers the count query and the paginated fetch in a single index scan.
+      CREATE INDEX IF NOT EXISTS idx_events_contract_ledger
+        ON events (contract_id, ledger_sequence);
+    `,
+  },
 ];
 
 /**

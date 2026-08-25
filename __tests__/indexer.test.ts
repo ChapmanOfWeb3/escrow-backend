@@ -61,13 +61,22 @@ describe("Indexer Database", () => {
 
     it("does not re-apply already-applied migrations (idempotent)", () => {
       // Running again should not throw and should not duplicate rows
-      runMigrations();
-      const rows = testDb
+      const before = testDb
         .prepare("SELECT version FROM schema_migrations")
-        .all();
-      // Still exactly 2 unique versions
-      const versions = [...new Set((rows as any[]).map((r) => r.version))];
-      expect(versions.length).toBe(2);
+        .all() as Array<{ version: number }>;
+
+      runMigrations();
+
+      const after = testDb
+        .prepare("SELECT version FROM schema_migrations")
+        .all() as Array<{ version: number }>;
+
+      // No new rows added – count must be stable
+      expect(after.length).toBe(before.length);
+
+      // No duplicate version numbers exist
+      const uniqueVersions = [...new Set(after.map((r) => r.version))];
+      expect(uniqueVersions.length).toBe(after.length);
     });
   });
 
