@@ -5,6 +5,8 @@ import {
   insertEventBatch,
   getActiveContractIds,
   registerContract,
+  adjustPollerInterval,
+  getCurrentPollIntervalMs,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
@@ -13,7 +15,34 @@ import logger from "../utils/logger.js";
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
+
+// ---------------------------------------------------------------------------
+// Alerting thresholds (#271)
+// ---------------------------------------------------------------------------
+const CONSECUTIVE_FAILURE_THRESHOLD = parseInt(
+  process.env.POLLER_FAILURE_THRESHOLD || "3",
+  10,
+);
+
+function getStallThresholdMs(): number {
+  return parseInt(process.env.POLLER_STALL_THRESHOLD_MS || "120000", 10);
+}
+
+let consecutiveFailures = 0;
+let lastSuccessfulPollAt: number | null = null;
+
+export function getConsecutiveFailures(): number {
+  return consecutiveFailures;
+}
+
+export function getLastSuccessfulPollAt(): number | null {
+  return lastSuccessfulPollAt;
+}
+
+export function resetFailureState(): void {
+  consecutiveFailures = 0;
+  lastSuccessfulPollAt = null;
+}
 
 const EVENT_TYPES = [
   "initialized",
@@ -50,15 +79,39 @@ export async function pollEvents() {
     return;
   }
 
+  // --- Diagnostics: stall detection before polling (#270, #271) ---
+  if (lastSuccessfulPollAt) {
+    const stallThresholdMs = getStallThresholdMs();
+    const elapsed = Date.now() - lastSuccessfulPollAt;
+    if (elapsed > stallThresholdMs) {
+      logger.warn("Poller stall detected – no successful poll for threshold period", {
+        elapsedMs: elapsed,
+        stallThresholdMs,
+        consecutiveFailures,
+      });
+    }
+    logger.debug("Poller stall diagnostics", {
+      elapsedMsSinceLastSuccess: elapsed,
+      stallThresholdMs,
+    });
+  }
+
+  const pollStart = performance.now();
+
   try {
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
-    if (currentLedger <= lastLedger) return;
+    if (currentLedger <= lastLedger) {
+      // --- Dynamic throttling: idle cycle (#265) ---
+      adjustPollerInterval(0);
+      return;
+    }
 
     const startLedger = lastLedger + 1;
 
     logger.info("Polling events", { startLedger, currentLedger });
 
+    const eventsStart = performance.now();
     const events = await server.getEvents({
       startLedger,
       filters: [
@@ -69,6 +122,17 @@ export async function pollEvents() {
         },
       ],
       limit: 100,
+    });
+    const eventsElapsed = performance.now() - eventsStart;
+
+    // --- Diagnostics: payload size and timing (#270) ---
+    const payloadSizeBytes = JSON.stringify(events.events).length;
+    logger.debug("RPC getEvents diagnostics", {
+      elapsedMs: Math.round(eventsElapsed),
+      payloadSizeBytes,
+      eventCount: events.events.length,
+      startLedger,
+      currentLedger,
     });
 
     // Build the batch to be written atomically (#84)
@@ -84,9 +148,19 @@ export async function pollEvents() {
 
     // Persist the batch and advance the ledger pointer atomically (#84)
     insertEventBatch(batch, currentLedger);
+
+    const totalElapsed = performance.now() - pollStart;
+    consecutiveFailures = 0;
+    lastSuccessfulPollAt = Date.now();
+
+    // --- Dynamic poller throttling (#265) ---
+    const throttleState = adjustPollerInterval(events.events.length);
+
     logger.info("Processed indexer poll", {
       eventCount: events.events.length,
       upToLedger: currentLedger,
+      elapsedMs: Math.round(totalElapsed),
+      pollIntervalMs: throttleState.currentIntervalMs,
     });
 
     deliverWebhooks(startLedger, currentLedger).catch((err) =>
@@ -95,24 +169,50 @@ export async function pollEvents() {
       })
     );
   } catch (err) {
+    const totalElapsed = performance.now() - pollStart;
+    consecutiveFailures += 1;
+
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),
+      consecutiveFailures,
+      elapsedMs: Math.round(totalElapsed),
     });
+
+    // --- Alerting: warn when consecutive failures hit threshold (#271) ---
+    if (consecutiveFailures >= CONSECUTIVE_FAILURE_THRESHOLD) {
+      logger.error("Poller alert: consecutive failure threshold exceeded", {
+        consecutiveFailures,
+        threshold: CONSECUTIVE_FAILURE_THRESHOLD,
+        lastSuccessAt: lastSuccessfulPollAt,
+      });
+    }
   }
 }
 
-let pollerInterval: NodeJS.Timeout | null = null;
+let pollerTimeout: NodeJS.Timeout | null = null;
+let pollerRunning = false;
+
+async function pollLoop() {
+  if (!pollerRunning) return;
+  await pollEvents();
+  const interval = getCurrentPollIntervalMs();
+  pollerTimeout = setTimeout(pollLoop, interval);
+}
 
 export function startPoller() {
-  if (pollerInterval) return;
-  logger.info("Starting event indexer poller", { intervalMs: POLL_INTERVAL_MS });
+  if (pollerRunning) return;
+  pollerRunning = true;
+  logger.info("Starting event indexer poller", {
+    intervalMs: getCurrentPollIntervalMs(),
+  });
   pollEvents();
-  pollerInterval = setInterval(pollEvents, POLL_INTERVAL_MS);
+  pollerTimeout = setTimeout(pollLoop, getCurrentPollIntervalMs());
 }
 
 export function stopPoller() {
-  if (pollerInterval) {
-    clearInterval(pollerInterval);
-    pollerInterval = null;
+  pollerRunning = false;
+  if (pollerTimeout) {
+    clearTimeout(pollerTimeout);
+    pollerTimeout = null;
   }
 }
