@@ -1,4 +1,4 @@
-import { getDb } from "./db.js";
+import { getDb, getLastIndexedLedger, insertEvent, type EventRow } from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -11,6 +11,15 @@ import logger from "../utils/logger.js";
  * - Transactional ledger range queries
  * - Consistent state even under high concurrency
  * - Automatic rollback on failures
+ * - Dynamic historical start/end ledger ranges (#299)
+ * - In-memory queue locks for concurrent event inserts (#296)
+ * - Consecutive failure / stall threshold alerting (#298)
+ * - High-frequency polling diagnostics (#297)
+ *
+ * Range semantics: startLedger and endLedger are **inclusive**.
+ * Historical imports never advance the live `last_ledger_sequence` pointer
+ * unless `advanceLivePointer` is explicitly requested, so live polling is
+ * unaffected.
  */
 
 export interface LedgerRange {
