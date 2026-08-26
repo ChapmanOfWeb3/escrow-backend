@@ -132,6 +132,14 @@ const MIGRATIONS: Migration[] = [
         ON webhook_subscriptions (contract_id);
     `,
   },
+  {
+    version: 4,
+    description: "add ledger_range_tracker GROUP BY index (#295)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_event_type
+        ON events (ledger_sequence, event_type);
+    `,
+  },
 ];
 
 /**
