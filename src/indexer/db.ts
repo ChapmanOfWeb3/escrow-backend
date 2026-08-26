@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import NodeCache from "node-cache";
 import logger from "../utils/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -25,9 +26,41 @@ export function setDb(newDb: Database.Database) {
   dbInstance = newDb;
 }
 
-export const db = getDb();
+/**
+ * Close the active connection and drop the cached instance.
+ *
+ * Importing this module used to open a connection as a side effect, so every
+ * test file that touched it leaked a SQLite file handle and Jest had to force
+ * workers to exit. The connection is now opened lazily by `getDb()`, and this
+ * lets test teardown release it.
+ */
+export function closeDb(): void {
+  if (!dbInstance) return;
+  try {
+    dbInstance.close();
+  } catch (err) {
+    logger.warn("Failed to close database connection", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    dbInstance = null;
+  }
+}
 
-db.pragma("journal_mode = WAL");
+const JOBS_BY_WALLET_CACHE_TTL_S = parseInt(
+  process.env.JOBS_BY_WALLET_CACHE_TTL_S || "60",
+  10,
+);
+const jobsByWalletCache = new NodeCache({
+  stdTTL: JOBS_BY_WALLET_CACHE_TTL_S,
+  useClones: false,
+});
+const inFlightJobsByWalletRequests = new Map<string, Promise<PaginatedJobs>>();
+
+export function resetJobsByWalletCache(): void {
+  jobsByWalletCache.flushAll();
+  inFlightJobsByWalletRequests.clear();
+}
 
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
@@ -77,6 +110,26 @@ const MIGRATIONS: Migration[] = [
         active INTEGER NOT NULL DEFAULT 1,
         registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+    `,
+  },
+  {
+    version: 3,
+    description: "add indexes for query optimization",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_contract_id
+        ON events (contract_id);
+
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_sequence
+        ON events (ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_ledger
+        ON events (contract_id, ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_type
+        ON events (contract_id, event_type);
+
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract
+        ON webhook_subscriptions (contract_id);
     `,
   },
 ];
@@ -156,6 +209,229 @@ export function initSchema() {
 }
 
 // ---------------------------------------------------------------------------
+// Schema verification hooks (#264)
+// ---------------------------------------------------------------------------
+
+export interface SchemaVerificationResult {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  migrationVersionGap: boolean;
+  errors: string[];
+}
+
+const EXPECTED_TABLES: Record<string, string[]> = {
+  events: [
+    "id",
+    "contract_id",
+    "event_type",
+    "ledger_sequence",
+    "timestamp",
+    "data_json",
+    "created_at",
+  ],
+  indexer_state: ["key", "value"],
+  monitored_contracts: [
+    "id",
+    "contract_id",
+    "label",
+    "active",
+    "registered_at",
+  ],
+  schema_migrations: ["version", "description", "applied_at"],
+};
+
+/**
+ * Verify the database schema structure matches expected state.
+ * Returns a detailed result indicating any discrepancies.
+ */
+export function verifySchemaIntegrity(): SchemaVerificationResult {
+  const database = getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const errors: string[] = [];
+  let migrationVersionGap = false;
+
+  // Check required tables exist
+  for (const tableName of Object.keys(EXPECTED_TABLES)) {
+    const table = database
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+      )
+      .get(tableName);
+
+    if (!table) {
+      missingTables.push(tableName);
+      continue;
+    }
+
+    // Check required columns
+    const columns = database
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all() as Array<{ name: string }>;
+    const columnNames = new Set(columns.map((c) => c.name));
+
+    const missing = EXPECTED_TABLES[tableName].filter(
+      (col) => !columnNames.has(col)
+    );
+    if (missing.length > 0) {
+      missingColumns[tableName] = missing;
+    }
+  }
+
+  // Check migration version continuity
+  try {
+    const applied = database
+      .prepare("SELECT version FROM schema_migrations ORDER BY version")
+      .all() as Array<{ version: number }>;
+    const versions = applied.map((r) => r.version);
+    for (let i = 1; i < versions.length; i++) {
+      if (versions[i] - versions[i - 1] > 1) {
+        migrationVersionGap = true;
+        errors.push(
+          `Migration version gap between ${versions[i - 1]} and ${versions[i]}`
+        );
+      }
+    }
+  } catch {
+    errors.push("schema_migrations table is unreadable");
+  }
+
+  const valid =
+    missingTables.length === 0 &&
+    Object.keys(missingColumns).length === 0 &&
+    !migrationVersionGap;
+
+  return {
+    valid,
+    missingTables,
+    missingColumns,
+    migrationVersionGap,
+    errors,
+  };
+}
+
+/**
+ * Verify schema integrity and throw if the database is out of sync.
+ * Call this before starting the poller to prevent data corruption.
+ */
+export function assertSchemaValid(): void {
+  const result = verifySchemaIntegrity();
+  if (!result.valid) {
+    const reasons = [
+      ...result.missingTables.map((t) => `missing table: ${t}`),
+      ...Object.entries(result.missingColumns).map(
+        ([t, cols]) => `missing columns in ${t}: ${cols.join(", ")}`
+      ),
+      ...result.errors,
+    ];
+    throw new Error(
+      `Schema verification failed – database out of sync: ${reasons.join("; ")}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic poller throttle parameters (#265)
+// ---------------------------------------------------------------------------
+
+export interface PollerThrottleState {
+  currentIntervalMs: number;
+  lastProcessedEventCount: number;
+  idleCycles: number;
+  lastLoadAdjustmentAt: number;
+}
+
+const BASE_POLL_INTERVAL_MS = parseInt(
+  process.env.POLL_INTERVAL_MS || "15000",
+  10,
+);
+const MIN_POLL_INTERVAL_MS = parseInt(
+  process.env.POLLER_MIN_INTERVAL_MS || "5000",
+  10,
+);
+const MAX_POLL_INTERVAL_MS = parseInt(
+  process.env.POLLER_MAX_INTERVAL_MS || "60000",
+  10,
+);
+const IDLE_MULTIPLIER = parseInt(
+  process.env.POLLER_IDLE_MULTIPLIER || "2",
+  10,
+);
+const IDLE_THRESHOLD_CYCLES = parseInt(
+  process.env.POLLER_IDLE_THRESHOLD || "3",
+  10,
+);
+const LOAD_DECREASE_FACTOR = parseFloat(
+  process.env.POLLER_LOAD_DECREASE_FACTOR || "0.5",
+);
+
+let pollerThrottleState: PollerThrottleState = {
+  currentIntervalMs: BASE_POLL_INTERVAL_MS,
+  lastProcessedEventCount: 0,
+  idleCycles: 0,
+  lastLoadAdjustmentAt: Date.now(),
+};
+
+/**
+ * Get the current poller throttle state (read-only snapshot).
+ */
+export function getPollerThrottleState(): PollerThrottleState {
+  return { ...pollerThrottleState };
+}
+
+/**
+ * Reset poller throttle state to defaults (useful for tests).
+ */
+export function resetPollerThrottleState(): void {
+  pollerThrottleState = {
+    currentIntervalMs: BASE_POLL_INTERVAL_MS,
+    lastProcessedEventCount: 0,
+    idleCycles: 0,
+    lastLoadAdjustmentAt: Date.now(),
+  };
+}
+
+/**
+ * Adjust poller interval based on processing load.
+ * Called after each poll cycle with the number of events processed.
+ * When idle (no events), the interval increases up to MAX_POLL_INTERVAL_MS.
+ * When under load (events processed), the interval decreases toward MIN_POLL_INTERVAL_MS.
+ */
+export function adjustPollerInterval(
+  processedEventCount: number,
+): PollerThrottleState {
+  const state = pollerThrottleState;
+  state.lastProcessedEventCount = processedEventCount;
+
+  if (processedEventCount === 0) {
+    state.idleCycles += 1;
+    if (state.idleCycles >= IDLE_THRESHOLD_CYCLES) {
+      state.currentIntervalMs = Math.min(
+        state.currentIntervalMs * IDLE_MULTIPLIER,
+        MAX_POLL_INTERVAL_MS,
+      );
+    }
+  } else {
+    state.idleCycles = 0;
+    state.currentIntervalMs = Math.max(
+      MIN_POLL_INTERVAL_MS,
+      Math.floor(state.currentIntervalMs * LOAD_DECREASE_FACTOR),
+    );
+  }
+
+  state.lastLoadAdjustmentAt = Date.now();
+  return { ...state };
+}
+
+/**
+ * Get the current effective poll interval in milliseconds.
+ */
+export function getCurrentPollIntervalMs(): number {
+  return pollerThrottleState.currentIntervalMs;
+}
+
+// ---------------------------------------------------------------------------
 // Indexer state
 // ---------------------------------------------------------------------------
 
@@ -167,12 +443,20 @@ export function getLastIndexedLedger(): number {
   return row ? parseInt((row as any).value, 10) : 0;
 }
 
+/**
+ * Atomically update the last indexed ledger inside a transaction.
+ * This ensures data consistency when multiple operations need to coordinate
+ * on the ledger pointer update.
+ */
 export function setLastIndexedLedger(seq: number) {
   const db = getDb();
-  const stmt = db.prepare(
-    "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'"
-  );
-  stmt.run(seq.toString());
+  const updateTransaction = db.transaction(() => {
+    const stmt = db.prepare(
+      "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'"
+    );
+    stmt.run(seq.toString());
+  });
+  updateTransaction();
 }
 
 // ---------------------------------------------------------------------------
@@ -437,98 +721,119 @@ export interface PaginatedJobs {
  *   3. Determines role with a CASE expression in SQL.
  *   4. Applies LIMIT / OFFSET inside the engine, so memory footprint is O(page).
  */
-export function getJobsByWallet(
+export async function getJobsByWallet(
   address: string,
   page: number = 1,
-  limit: number = 10
-): PaginatedJobs {
-  const db = getDb();
-
+  limit: number = 10,
+): Promise<PaginatedJobs> {
   const safePage = Math.max(1, page);
   const safeLimit = Math.max(1, limit);
-  const offset = (safePage - 1) * safeLimit;
+  const cacheKey = `${address.trim().toLowerCase()}::${safePage}::${safeLimit}`;
 
-  // Count distinct contract_ids that match the address in a role field
-  const countRow = db
-    .prepare(
-      `SELECT COUNT(*) AS cnt
-       FROM (
-         SELECT contract_id
-         FROM events
-         WHERE json_extract(data_json, '$.client')     = ?
-            OR json_extract(data_json, '$.freelancer') = ?
-            OR json_extract(data_json, '$.arbiter')    = ?
-         GROUP BY contract_id
-       )`
-    )
-    .get(address, address, address) as { cnt: number };
+  const cachedResult = jobsByWalletCache.get<PaginatedJobs>(cacheKey);
+  if (cachedResult !== undefined) {
+    return cachedResult;
+  }
 
-  const total = countRow?.cnt ?? 0;
+  const inFlightResult = inFlightJobsByWalletRequests.get(cacheKey);
+  if (inFlightResult) {
+    return await inFlightResult;
+  }
 
-  // Fetch one row per contract_id – the most-recent event – with role & extras
-  const rows = db
-    .prepare(
-      `SELECT
-         e.contract_id,
-         e.event_type                                     AS latest_event_type,
-         e.ledger_sequence                                AS latest_ledger,
-         e.timestamp                                      AS latest_timestamp,
-         CASE
-           WHEN json_extract(e.data_json, '$.client')     = ? THEN 'client'
-           WHEN json_extract(e.data_json, '$.freelancer') = ? THEN 'freelancer'
-           WHEN json_extract(e.data_json, '$.arbiter')    = ? THEN 'arbiter'
-           ELSE 'unknown'
-         END                                              AS role,
-         e.data_json
-       FROM events e
-       INNER JOIN (
-         SELECT contract_id, MAX(ledger_sequence) AS max_ledger
-         FROM events
-         WHERE json_extract(data_json, '$.client')     = ?
-            OR json_extract(data_json, '$.freelancer') = ?
-            OR json_extract(data_json, '$.arbiter')    = ?
-         GROUP BY contract_id
-       ) latest
-         ON e.contract_id    = latest.contract_id
-        AND e.ledger_sequence = latest.max_ledger
-       ORDER BY e.ledger_sequence DESC
-       LIMIT ? OFFSET ?`
-    )
-    .all(
-      address, address, address,  // CASE args
-      address, address, address,  // inner subquery args
-      safeLimit, offset
-    ) as Array<{
-      contract_id: string;
-      latest_event_type: string;
-      latest_ledger: number;
-      latest_timestamp: number;
-      role: "client" | "freelancer" | "arbiter" | "unknown";
-      data_json: string;
-    }>;
+  const pendingResult = (async () => {
+    const db = getDb();
+    const offset = (safePage - 1) * safeLimit;
 
-  const jobs: JobSummary[] = rows.map((row) => {
-    let milestoneCount = 0;
-    try {
-      const parsed = JSON.parse(row.data_json) as Record<string, unknown>;
-      milestoneCount = Array.isArray(parsed["milestones"])
-        ? (parsed["milestones"] as unknown[]).length
-        : 0;
-    } catch {
-      // unparseable – leave milestone_count as 0
-    }
+    const countRow = db
+      .prepare(
+        `SELECT COUNT(*) AS cnt
+         FROM (
+           SELECT contract_id
+           FROM events
+           WHERE json_extract(data_json, '$.client')     = ?
+              OR json_extract(data_json, '$.freelancer') = ?
+              OR json_extract(data_json, '$.arbiter')    = ?
+           GROUP BY contract_id
+         )`
+      )
+      .get(address, address, address) as { cnt: number };
 
-    return {
-      contract_id: row.contract_id,
-      role: row.role,
-      milestone_count: milestoneCount,
-      latest_event_type: row.latest_event_type,
-      latest_ledger: row.latest_ledger,
-      latest_timestamp: row.latest_timestamp,
-    };
-  });
+    const total = countRow?.cnt ?? 0;
 
-  return { jobs, total, page: safePage, limit: safeLimit };
+    const rows = db
+      .prepare(
+        `SELECT
+           e.contract_id,
+           e.event_type                                     AS latest_event_type,
+           e.ledger_sequence                                AS latest_ledger,
+           e.timestamp                                      AS latest_timestamp,
+           CASE
+             WHEN json_extract(e.data_json, '$.client')     = ? THEN 'client'
+             WHEN json_extract(e.data_json, '$.freelancer') = ? THEN 'freelancer'
+             WHEN json_extract(e.data_json, '$.arbiter')    = ? THEN 'arbiter'
+             ELSE 'unknown'
+           END                                              AS role,
+           e.data_json
+         FROM events e
+         INNER JOIN (
+           SELECT contract_id, MAX(ledger_sequence) AS max_ledger
+           FROM events
+           WHERE json_extract(data_json, '$.client')     = ?
+              OR json_extract(data_json, '$.freelancer') = ?
+              OR json_extract(data_json, '$.arbiter')    = ?
+           GROUP BY contract_id
+         ) latest
+           ON e.contract_id    = latest.contract_id
+          AND e.ledger_sequence = latest.max_ledger
+         ORDER BY e.ledger_sequence DESC
+         LIMIT ? OFFSET ?`
+      )
+      .all(
+        address, address, address,
+        address, address, address,
+        safeLimit, offset
+      ) as Array<{
+        contract_id: string;
+        latest_event_type: string;
+        latest_ledger: number;
+        latest_timestamp: number;
+        role: "client" | "freelancer" | "arbiter" | "unknown";
+        data_json: string;
+      }>;
+
+    const jobs: JobSummary[] = rows.map((row) => {
+      let milestoneCount = 0;
+      try {
+        const parsed = JSON.parse(row.data_json) as Record<string, unknown>;
+        milestoneCount = Array.isArray(parsed["milestones"])
+          ? (parsed["milestones"] as unknown[]).length
+          : 0;
+      } catch {
+        // unparseable – leave milestone_count as 0
+      }
+
+      return {
+        contract_id: row.contract_id,
+        role: row.role,
+        milestone_count: milestoneCount,
+        latest_event_type: row.latest_event_type,
+        latest_ledger: row.latest_ledger,
+        latest_timestamp: row.latest_timestamp,
+      };
+    });
+
+    const result = { jobs, total, page: safePage, limit: safeLimit };
+    jobsByWalletCache.set(cacheKey, result);
+    return result;
+  })();
+
+  inFlightJobsByWalletRequests.set(cacheKey, pendingResult);
+
+  try {
+    return await pendingResult;
+  } finally {
+    inFlightJobsByWalletRequests.delete(cacheKey);
+  }
 }
 
 export interface EventDbRow {

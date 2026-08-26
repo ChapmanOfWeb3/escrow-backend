@@ -7,6 +7,8 @@ import {
   insertHistoricalEventBatch,
   getActiveContractIds,
   registerContract,
+  adjustPollerInterval,
+  getCurrentPollIntervalMs,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
@@ -16,38 +18,32 @@ const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
 
-// --- Dynamic polling interval (idle backoff) ---
-// Base/minimum interval - used whenever the ledger is advancing (network active).
-const POLL_INTERVAL_MIN_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
-// Upper bound on how far the interval may back off during idle periods. This
-// caps the worst-case detection delay for a real event once the network
-// resumes, since duplicate-prevention correctness itself does not depend on
-// how often we poll (see pollEvents() doc comment below).
-const POLL_INTERVAL_MAX_MS = parseInt(
-  process.env.POLL_INTERVAL_MAX_MS || "120000",
-  10
-);
-// Multiplier applied to the current interval each consecutive idle poll.
-const POLL_IDLE_BACKOFF_MULTIPLIER = parseFloat(
-  process.env.POLL_IDLE_BACKOFF_MULTIPLIER || "1.5"
+// ---------------------------------------------------------------------------
+// Alerting thresholds (#271)
+// ---------------------------------------------------------------------------
+const CONSECUTIVE_FAILURE_THRESHOLD = parseInt(
+  process.env.POLLER_FAILURE_THRESHOLD || "3",
+  10,
 );
 
-/**
- * Given the current polling interval and whether the last poll observed new
- * ledger activity, compute the interval to use for the next poll.
- *
- * - Activity resumes -> immediately reset to the minimum interval so new
- *   events are picked up promptly.
- * - Idle -> back off multiplicatively, capped at POLL_INTERVAL_MAX_MS, so the
- *   poller never gets stuck waiting indefinitely.
- */
-export function nextPollIntervalMs(
-  currentIntervalMs: number,
-  hadActivity: boolean
-): number {
-  if (hadActivity) return POLL_INTERVAL_MIN_MS;
-  const backedOff = Math.round(currentIntervalMs * POLL_IDLE_BACKOFF_MULTIPLIER);
-  return Math.min(backedOff, POLL_INTERVAL_MAX_MS);
+function getStallThresholdMs(): number {
+  return parseInt(process.env.POLLER_STALL_THRESHOLD_MS || "120000", 10);
+}
+
+let consecutiveFailures = 0;
+let lastSuccessfulPollAt: number | null = null;
+
+export function getConsecutiveFailures(): number {
+  return consecutiveFailures;
+}
+
+export function getLastSuccessfulPollAt(): number | null {
+  return lastSuccessfulPollAt;
+}
+
+export function resetFailureState(): void {
+  consecutiveFailures = 0;
+  lastSuccessfulPollAt = null;
 }
 
 const EVENT_TYPES = [
@@ -164,19 +160,54 @@ export async function pollEvents(): Promise<boolean> {
     return false;
   }
 
+  // --- Diagnostics: stall detection before polling (#270, #271) ---
+  if (lastSuccessfulPollAt) {
+    const stallThresholdMs = getStallThresholdMs();
+    const elapsed = Date.now() - lastSuccessfulPollAt;
+    if (elapsed > stallThresholdMs) {
+      logger.warn("Poller stall detected – no successful poll for threshold period", {
+        elapsedMs: elapsed,
+        stallThresholdMs,
+        consecutiveFailures,
+      });
+    }
+    logger.debug("Poller stall diagnostics", {
+      elapsedMsSinceLastSuccess: elapsed,
+      stallThresholdMs,
+    });
+  }
+
+  const pollStart = performance.now();
+
   try {
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
-    if (currentLedger <= lastLedger) return false;
+    if (currentLedger <= lastLedger) {
+      // --- Dynamic throttling: idle cycle (#265) ---
+      adjustPollerInterval(0);
+      return;
+    }
 
     const startLedger = lastLedger + 1;
 
     logger.info("Polling events", { startLedger, currentLedger });
 
+    const eventsStart = performance.now();
     const events = await server.getEvents({
       startLedger,
       filters: buildEventFilter(contractIds),
       limit: 100,
+    });
+    const eventsElapsed = performance.now() - eventsStart;
+
+    // --- Diagnostics: payload size and timing (#270) ---
+    const payloadSizeBytes = JSON.stringify(events.events).length;
+    logger.debug("RPC getEvents diagnostics", {
+      elapsedMs: Math.round(eventsElapsed),
+      payloadSizeBytes,
+      eventCount: events.events.length,
+      startLedger,
+      currentLedger,
     });
 
     // Build the batch to be written atomically (#84)
@@ -186,9 +217,19 @@ export async function pollEvents(): Promise<boolean> {
 
     // Persist the batch and advance the ledger pointer atomically (#84)
     insertEventBatch(batch, currentLedger);
+
+    const totalElapsed = performance.now() - pollStart;
+    consecutiveFailures = 0;
+    lastSuccessfulPollAt = Date.now();
+
+    // --- Dynamic poller throttling (#265) ---
+    const throttleState = adjustPollerInterval(events.events.length);
+
     logger.info("Processed indexer poll", {
       eventCount: events.events.length,
       upToLedger: currentLedger,
+      elapsedMs: Math.round(totalElapsed),
+      pollIntervalMs: throttleState.currentIntervalMs,
     });
 
     logPollDiagnostics(performance.now() - pollStartedAt, batch);
@@ -201,181 +242,51 @@ export async function pollEvents(): Promise<boolean> {
 
     return true;
   } catch (err) {
+    const totalElapsed = performance.now() - pollStart;
+    consecutiveFailures += 1;
+
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),
+      consecutiveFailures,
+      elapsedMs: Math.round(totalElapsed),
     });
-    // Treat a failed poll as idle so we back off rather than hammering an
-    // RPC endpoint that may itself be struggling.
-    return false;
+
+    // --- Alerting: warn when consecutive failures hit threshold (#271) ---
+    if (consecutiveFailures >= CONSECUTIVE_FAILURE_THRESHOLD) {
+      logger.error("Poller alert: consecutive failure threshold exceeded", {
+        consecutiveFailures,
+        threshold: CONSECUTIVE_FAILURE_THRESHOLD,
+        lastSuccessAt: lastSuccessfulPollAt,
+      });
+    }
   }
 }
 
-// ---------------------------------------------------------------------------
-// Historical event import (event_type_filter: dynamic start/end ledger)
-// ---------------------------------------------------------------------------
-// No pre-existing backfill/historical-ingestion mechanism was found elsewhere
-// in this codebase (searched for "backfill"/"historical" usage) - this is a
-// new, narrowly-scoped addition, not a duplicate of an existing one.
+let pollerTimeout: NodeJS.Timeout | null = null;
+let pollerRunning = false;
 
-// Caps how large a single historical range can be, so a mistyped/huge range
-// can't be silently accepted and hammer the RPC in one call. Follows the
-// same parseInt(process.env.X || "default") config convention as
-// POLL_INTERVAL_MS above - no new config mechanism introduced.
-const MAX_HISTORICAL_RANGE_LEDGERS = parseInt(
-  process.env.HISTORICAL_IMPORT_MAX_RANGE_LEDGERS || "10000",
-  10
-);
-// Safety cap on how many 100-event pages a single import will page through,
-// in case of an unexpectedly dense range or a misbehaving RPC cursor.
-const MAX_HISTORICAL_PAGES = parseInt(
-  process.env.HISTORICAL_IMPORT_MAX_PAGES || "50",
-  10
-);
-const HISTORICAL_PAGE_LIMIT = 100;
-
-export interface HistoricalRangeValidation {
-  valid: boolean;
-  error?: string;
-}
-
-/**
- * Validates a requested historical import range. Rejects clearly rather than
- * silently clamping (unlike the page/limit clamping used for pagination
- * elsewhere in db.ts) because a wrong ledger range here would silently
- * import the wrong data, not just the wrong page of otherwise-correct data.
- */
-export function validateHistoricalRange(
-  startLedger: number,
-  endLedger: number,
-  currentLedger: number
-): HistoricalRangeValidation {
-  if (!Number.isInteger(startLedger) || startLedger < 1) {
-    return { valid: false, error: "startLedger must be a positive integer" };
-  }
-  if (!Number.isInteger(endLedger) || endLedger < 1) {
-    return { valid: false, error: "endLedger must be a positive integer" };
-  }
-  if (startLedger > endLedger) {
-    return { valid: false, error: "startLedger must be <= endLedger" };
-  }
-  if (endLedger > currentLedger) {
-    return {
-      valid: false,
-      error: `endLedger (${endLedger}) is beyond the current chain head (${currentLedger}) - that ledger does not exist yet`,
-    };
-  }
-  if (endLedger - startLedger + 1 > MAX_HISTORICAL_RANGE_LEDGERS) {
-    return {
-      valid: false,
-      error: `requested range spans ${endLedger - startLedger + 1} ledgers, exceeding the ${MAX_HISTORICAL_RANGE_LEDGERS}-ledger max per historical import`,
-    };
-  }
-  return { valid: true };
-}
-
-export interface HistoricalImportResult {
-  startLedger: number;
-  endLedger: number;
-  eventsFound: number;
-  eventsImported: number;
-}
-
-/**
- * Imports events for an arbitrary past ledger range (custom historical
- * import), independent of the live poller's forward progress.
- *
- * Deliberately does NOT call insertEventBatch()/advance last_ledger_sequence
- * - it uses insertHistoricalEventBatch() instead, so a backfill over old
- * ledgers can never rewind the live pointer backwards, and a backfill that
- * raced ahead of the live poller could never cause it to skip ledgers by
- * advancing the pointer past events the live poller hasn't processed yet.
- * Duplicate prevention (INSERT OR IGNORE on the same UNIQUE constraint) still
- * applies, so re-running an import - or importing a range the live poller has
- * since caught up to - is idempotent and produces no duplicate rows.
- */
-export async function fetchHistoricalEvents(
-  startLedger: number,
-  endLedger: number
-): Promise<HistoricalImportResult> {
-  let contractIds: string[] = getActiveContractIds();
-  if (contractIds.length === 0 && process.env.CONTRACT_ID) {
-    registerContract(process.env.CONTRACT_ID, "default");
-    contractIds = [process.env.CONTRACT_ID];
-  }
-  if (contractIds.length === 0) {
-    throw new Error("No CONTRACT_IDs configured - cannot import historical events");
-  }
-
-  const currentLedger = (await server.getLatestLedger()).sequence;
-  const validation = validateHistoricalRange(startLedger, endLedger, currentLedger);
-  if (!validation.valid) {
-    throw new Error(validation.error);
-  }
-
-  logger.info("Fetching historical events", { startLedger, endLedger, contractIds });
-
-  const filters = buildEventFilter(contractIds);
-  const collected: Api.EventResponse[] = [];
-  let cursor: string | undefined;
-
-  for (let page = 0; page < MAX_HISTORICAL_PAGES; page++) {
-    const response = cursor
-      ? await server.getEvents({ cursor, filters, limit: HISTORICAL_PAGE_LIMIT })
-      : await server.getEvents({
-          startLedger,
-          endLedger,
-          filters,
-          limit: HISTORICAL_PAGE_LIMIT,
-        });
-
-    collected.push(...response.events);
-
-    if (response.events.length < HISTORICAL_PAGE_LIMIT) break; // last page
-    cursor = response.cursor;
-  }
-
-  const batch: EventRow[] = collected.map((event) => toEventRow(event, contractIds[0]));
-  const eventsImported = insertHistoricalEventBatch(batch);
-
-  logger.info("Historical event import complete", {
-    startLedger,
-    endLedger,
-    eventsFound: batch.length,
-    eventsImported,
-  });
-
-  return { startLedger, endLedger, eventsFound: batch.length, eventsImported };
-}
-
-let pollerTimer: NodeJS.Timeout | null = null;
-let currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
-
-/** Exposed for tests/observability – the interval the next poll is scheduled at. */
-export function getCurrentPollIntervalMs(): number {
-  return currentPollIntervalMs;
+async function pollLoop() {
+  if (!pollerRunning) return;
+  await pollEvents();
+  const interval = getCurrentPollIntervalMs();
+  pollerTimeout = setTimeout(pollLoop, interval);
 }
 
 export function startPoller() {
-  if (pollerTimer) return;
-  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
+  if (pollerRunning) return;
+  pollerRunning = true;
   logger.info("Starting event indexer poller", {
-    intervalMs: currentPollIntervalMs,
-    maxIntervalMs: POLL_INTERVAL_MAX_MS,
+    intervalMs: getCurrentPollIntervalMs(),
   });
-
-  const runAndSchedule = async () => {
-    const hadActivity = await pollEvents();
-    currentPollIntervalMs = nextPollIntervalMs(currentPollIntervalMs, hadActivity);
-    pollerTimer = setTimeout(runAndSchedule, currentPollIntervalMs);
-  };
-
-  runAndSchedule();
+  pollEvents();
+  pollerTimeout = setTimeout(pollLoop, getCurrentPollIntervalMs());
 }
 
 export function stopPoller() {
-  if (pollerTimer) {
-    clearTimeout(pollerTimer);
-    pollerTimer = null;
+  pollerRunning = false;
+  if (pollerTimeout) {
+    clearTimeout(pollerTimeout);
+    pollerTimeout = null;
   }
   currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
 }
