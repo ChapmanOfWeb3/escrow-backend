@@ -467,27 +467,35 @@ export function setLastIndexedLedger(seq: number) {
  * Registers a contract for polling, or re-activates it if it was previously
  * deregistered. Idempotent - calling this repeatedly for the same
  * contract_id never creates duplicate rows.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function registerContract(contractId: string, label?: string): void {
   const db = getDb();
-  db.prepare(
-    `INSERT INTO monitored_contracts (contract_id, label, active)
-     VALUES (?, ?, 1)
-     ON CONFLICT(contract_id) DO UPDATE SET
-       active = 1,
-       label = COALESCE(excluded.label, monitored_contracts.label)`
-  ).run(contractId, label ?? null);
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO monitored_contracts (contract_id, label, active)
+       VALUES (?, ?, 1)
+       ON CONFLICT(contract_id) DO UPDATE SET
+         active = 1,
+         label = COALESCE(excluded.label, monitored_contracts.label)`
+    ).run(contractId, label ?? null);
+  });
+  tx();
 }
 
 /**
  * Marks a contract inactive so it's excluded from getActiveContractIds()
  * without deleting its historical event data.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function deregisterContract(contractId: string): void {
   const db = getDb();
-  db.prepare(
-    "UPDATE monitored_contracts SET active = 0 WHERE contract_id = ?"
-  ).run(contractId);
+  const tx = db.transaction(() => {
+    db.prepare(
+      "UPDATE monitored_contracts SET active = 0 WHERE contract_id = ?"
+    ).run(contractId);
+  });
+  tx();
 }
 
 /**
@@ -507,6 +515,7 @@ export function getActiveContractIds(): string[] {
 
 /**
  * Insert a single event row.  For atomic batch inserts use insertEventBatch().
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function insertEvent(
   contractId: string,
@@ -516,19 +525,22 @@ export function insertEvent(
   dataJson: string
 ): boolean {
   const db = getDb();
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO events 
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-  const result = stmt.run(
-    contractId,
-    eventType,
-    ledgerSequence,
-    timestamp,
-    dataJson
-  );
-  return result.changes > 0;
+  const tx = db.transaction(() => {
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO events 
+      (contract_id, event_type, ledger_sequence, timestamp, data_json)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const result = stmt.run(
+      contractId,
+      eventType,
+      ledgerSequence,
+      timestamp,
+      dataJson
+    );
+    return result.changes > 0;
+  });
+  return tx();
 }
 
 export interface WebhookSubscription {
@@ -537,25 +549,40 @@ export interface WebhookSubscription {
   created_at: string;
 }
 
+/**
+ * Add a global webhook subscription. Runs INSERT + SELECT inside a single
+ * transaction so the returned row always reflects what was just committed,
+ * even under concurrent writes.
+ */
 export function addWebhookSubscription(url: string): WebhookSubscription {
   const db = getDb();
-  const result = db
-    .prepare("INSERT INTO webhook_subscriptions (url) VALUES (?)")
-    .run(url);
-  const row = db
-    .prepare(
-      "SELECT id, url, created_at FROM webhook_subscriptions WHERE id = ?"
-    )
-    .get(result.lastInsertRowid);
-  return row as WebhookSubscription;
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("INSERT INTO webhook_subscriptions (url) VALUES (?)")
+      .run(url);
+    const row = db
+      .prepare(
+        "SELECT id, url, created_at FROM webhook_subscriptions WHERE id = ?"
+      )
+      .get(result.lastInsertRowid);
+    return row as WebhookSubscription;
+  });
+  return tx();
 }
 
+/**
+ * Remove a global webhook subscription by URL.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
+ */
 export function removeWebhookSubscription(url: string): boolean {
   const db = getDb();
-  const result = db
-    .prepare("DELETE FROM webhook_subscriptions WHERE url = ?")
-    .run(url);
-  return result.changes > 0;
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("DELETE FROM webhook_subscriptions WHERE url = ?")
+      .run(url);
+    return result.changes > 0;
+  });
+  return tx();
 }
 
 export function getWebhookSubscriptions(): WebhookSubscription[] {
@@ -830,29 +857,44 @@ export interface WebhookSubscription {
   created_at: string;
 }
 
+/**
+ * Add a per-contract webhook subscription. Runs INSERT + SELECT inside a
+ * single transaction so the returned row always reflects what was just
+ * committed, even under concurrent writes.
+ */
 export function addSubscription(
   contractId: string,
   webhookUrl: string,
   eventTypes: string[]
 ): WebhookSubscription {
   const db = getDb();
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO webhook_subscriptions
-    (contract_id, webhook_url, event_types)
-    VALUES (?, ?, ?)
-  `);
-  stmt.run(contractId, webhookUrl, JSON.stringify(eventTypes));
-  return db
-    .prepare("SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
-    .get(contractId, webhookUrl) as WebhookSubscription;
+  const tx = db.transaction(() => {
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO webhook_subscriptions
+      (contract_id, webhook_url, event_types)
+      VALUES (?, ?, ?)
+    `);
+    stmt.run(contractId, webhookUrl, JSON.stringify(eventTypes));
+    return db
+      .prepare("SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
+      .get(contractId, webhookUrl) as WebhookSubscription;
+  });
+  return tx();
 }
 
+/**
+ * Remove a per-contract webhook subscription.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
+ */
 export function removeSubscription(contractId: string, webhookUrl: string): boolean {
   const db = getDb();
-  const result = db
-    .prepare("DELETE FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
-    .run(contractId, webhookUrl);
-  return result.changes > 0;
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("DELETE FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
+      .run(contractId, webhookUrl);
+    return result.changes > 0;
+  });
+  return tx();
 }
 
 export function getSubscriptions(): WebhookSubscription[] {
