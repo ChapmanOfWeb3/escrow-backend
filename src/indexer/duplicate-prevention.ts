@@ -125,6 +125,11 @@ export function findUnsyncedRanges(
  * Uses INSERT OR IGNORE at the DB level for idempotency, and tracks the
  * sync range metadata atomically.
  *
+ * All event inserts and the sync_ranges metadata write execute inside a
+ * single better-sqlite3 transaction. If any step throws, better-sqlite3
+ * automatically rolls back the entire transaction so no partial state is
+ * left in the database (#189).
+ *
  * @param events - Array of event rows to insert
  * @param syncRange - The ledger range being synced
  * @returns DuplicateCheckResult with counts
@@ -140,6 +145,12 @@ export function insertEventsWithDedup(
   syncRange: SyncRange
 ): DuplicateCheckResult {
   const db = getDb();
+
+  // Ensure the sync_ranges table exists before entering the transaction.
+  // DDL (CREATE TABLE) must not run inside the data transaction because
+  // SQLite auto-commits DDL statements, which would break rollback semantics.
+  initializeSyncRangesTable();
+
   let duplicatesFound = 0;
   let newEventsInserted = 0;
 
@@ -165,8 +176,9 @@ export function insertEventsWithDedup(
       }
     }
 
-    initializeSyncRangesTable();
-
+    // Atomically record the sync range metadata alongside the event inserts.
+    // INSERT OR IGNORE means a duplicate range call is silently skipped rather
+    // than throwing, preserving idempotency without breaking the transaction.
     db.prepare(
       `INSERT OR IGNORE INTO sync_ranges (start_ledger, end_ledger, event_count, duplicate_count)
        VALUES (?, ?, ?, ?)`
