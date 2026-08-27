@@ -431,3 +431,19 @@ export async function createFailoverServer<T>(
 
   return { server: createServer(nodeUrl), nodeUrl };
 }
+
+/**
+ * Emit a high-frequency debug log line for one poll cycle so poll speed and
+ * payload size can be traced without raising the global log level.
+ */
+export function logPollDiagnostics(
+  nodeUrl: string,
+  startedAtMs: number,
+  payloadSizeBytes: number
+): void {
+  const elapsedMs = Date.now() - startedAtMs;
+  logger.debug(
+    `poll diagnostics nodeUrl=${nodeUrl} elapsedMs=${elapsedMs} payloadSizeBytes=${payloadSizeBytes}`,
+    { nodeUrl, elapsedMs, payloadSizeBytes }
+  );
+}
