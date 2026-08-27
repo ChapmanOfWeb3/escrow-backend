@@ -685,11 +685,54 @@ router.post(
     }
 
     try {
+      const contract = new Contract(contractId);
+      const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(contract.call("get_whitelisted_tokens"))
+        .setTimeout(30)
+        .build();
+
+      const result = await server.simulateTransaction(tx);
+
+      if ("error" in result) {
+        const errorMsg = String(result.error);
+        if (
+          !errorMsg.includes("contract error #2") &&
+          !errorMsg.includes("NotInitialized")
+        ) {
+          if (
+            /not found|NotFound|contract not found/i.test(errorMsg) ||
+            /contract error #1\b/i.test(errorMsg)
+          ) {
+            logger.warn("Job not found for whitelist update", { contractId });
+            sendError(res, 404, "Job not found");
+            return;
+          }
+          logger.error("Failed to verify contract for whitelist update", { contractId, error: errorMsg });
+          sendError(res, 500, "Internal server error");
+          return;
+        }
+      }
+
       whitelistCache.del(contractId);
       logger.info("Whitelist updated successfully", { contractId, count: targetAddresses.length });
       sendSuccess(res, { contractId, addresses: targetAddresses, updated: true });
     } catch (err: any) {
-      logger.error("Failed to update whitelist", { contractId, error: err?.message });
+      const message = err?.message ?? String(err);
+      if (/unauthorized|invalid authentication/i.test(message)) {
+        logger.warn("Unauthorized request for whitelist update", { contractId });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+      if (/not found/i.test(message) && !/account not found/i.test(message)) {
+        logger.warn("Job not found for whitelist update", { contractId });
+        sendError(res, 404, "Job not found");
+        return;
+      }
+      logger.error("Failed to update whitelist", { contractId, error: message });
       sendError(res, 500, "Internal server error");
     }
   },
