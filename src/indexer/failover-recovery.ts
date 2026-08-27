@@ -464,3 +464,29 @@ export function ensureNodeHealthIndexes(): void {
       ON node_failure_events (node_url, created_at);
   `);
 }
+
+/**
+ * Per-node in-memory locks so concurrent event notifications for the same
+ * node serialize instead of racing each other into duplicate inserts. Each
+ * node gets its own queue of pending promises; unrelated nodes never block
+ * one another.
+ */
+const nodeEventLocks = new Map<string, Promise<unknown>>();
+
+/** Run `task` exclusively with respect to other calls for the same `nodeUrl`. */
+export function withNodeEventLock<T>(
+  nodeUrl: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const previous = nodeEventLocks.get(nodeUrl) ?? Promise.resolve();
+  const run = previous.then(task, task);
+
+  // Swallow rejections in the chain slot so one failed task doesn't wedge
+  // the lock for the next caller, while still propagating to the caller.
+  nodeEventLocks.set(
+    nodeUrl,
+    run.catch(() => undefined)
+  );
+
+  return run;
+}
