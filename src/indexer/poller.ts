@@ -7,6 +7,7 @@ import {
   registerContract,
   adjustPollerInterval,
   getCurrentPollIntervalMs,
+  verifySchemaUpToDate,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
