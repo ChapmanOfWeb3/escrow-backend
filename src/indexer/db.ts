@@ -4,6 +4,9 @@ import { fileURLToPath } from "url";
 import fs from "fs";
 import NodeCache from "node-cache";
 import logger from "../utils/logger.js";
+import {
+  getSqliteSchemaManagerFailureMonitor,
+} from "./sqlite_schema_manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -145,66 +148,92 @@ const MIGRATIONS: Migration[] = [
 /**
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
+ *
+ * Emits consecutive-failure / stall alerts via sqlite_schema_manager (#262).
  */
 export function runMigrations(): void {
+  const monitor = getSqliteSchemaManagerFailureMonitor();
+  monitor.checkStall();
+  const startedAt = performance.now();
   const database = getDb();
+  let failureRecorded = false;
 
-  // Bootstrap: create the migrations tracking table if it doesn't exist yet
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      description TEXT NOT NULL,
-      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+  try {
+    // Bootstrap: create the migrations tracking table if it doesn't exist yet
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        description TEXT NOT NULL,
+        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
 
-    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      contract_id TEXT NOT NULL,
-      webhook_url TEXT NOT NULL,
-      event_types TEXT NOT NULL DEFAULT '*',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(contract_id, webhook_url)
-    );
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contract_id TEXT NOT NULL,
+        webhook_url TEXT NOT NULL,
+        event_types TEXT NOT NULL DEFAULT '*',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(contract_id, webhook_url)
+      );
 
-    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      url TEXT NOT NULL UNIQUE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL UNIQUE,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
-  for (const migration of MIGRATIONS) {
-    const applied = database
-      .prepare("SELECT version FROM schema_migrations WHERE version = ?")
-      .get(migration.version);
+    for (const migration of MIGRATIONS) {
+      const applied = database
+        .prepare("SELECT version FROM schema_migrations WHERE version = ?")
+        .get(migration.version);
 
-    if (applied) continue;
+      if (applied) continue;
 
-    logger.info("Applying DB migration", {
-      version: migration.version,
-      description: migration.description,
-    });
-
-    // Run migration inside a transaction – rolls back fully on any error
-    const applyMigration = database.transaction(() => {
-      database.exec(migration.up);
-      database
-        .prepare(
-          "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
-        )
-        .run(migration.version, migration.description);
-    });
-
-    try {
-      applyMigration();
-      logger.info("Migration applied", { version: migration.version });
-    } catch (err) {
-      logger.error("Migration failed – rolled back", {
+      logger.info("Applying DB migration", {
         version: migration.version,
-        error: err instanceof Error ? err.message : String(err),
+        description: migration.description,
       });
-      throw err;
+
+      // Run migration inside a transaction – rolls back fully on any error
+      const applyMigration = database.transaction(() => {
+        database.exec(migration.up);
+        database
+          .prepare(
+            "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
+          )
+          .run(migration.version, migration.description);
+      });
+
+      try {
+        applyMigration();
+        logger.info("Migration applied", { version: migration.version });
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        logger.error("Migration failed – rolled back", {
+          version: migration.version,
+          error,
+        });
+        monitor.recordFailure("migration", {
+          error,
+          version: migration.version,
+          description: migration.description,
+          elapsedMs: Math.round(performance.now() - startedAt),
+        });
+        failureRecorded = true;
+        throw err;
+      }
     }
+
+    monitor.recordSuccess();
+  } catch (err) {
+    if (!failureRecorded) {
+      monitor.recordFailure("bootstrap", {
+        error: err instanceof Error ? err.message : String(err),
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+    }
+    throw err;
   }
 }
 

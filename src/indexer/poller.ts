@@ -7,6 +7,7 @@ import {
   registerContract,
   adjustPollerInterval,
   getCurrentPollIntervalMs,
+  verifySchemaUpToDate,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
@@ -111,7 +112,7 @@ export async function pollEvents(): Promise<boolean> {
     if (currentLedger <= lastLedger) {
       // --- Dynamic throttling: idle cycle (#265) ---
       adjustPollerInterval(0);
-      return;
+      return false;
     }
 
     const startLedger = lastLedger + 1;
@@ -195,6 +196,8 @@ export async function pollEvents(): Promise<boolean> {
         lastSuccessAt: lastSuccessfulPollAt,
       });
     }
+
+    return false;
   }
 }
 
