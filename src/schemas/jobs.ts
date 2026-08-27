@@ -276,6 +276,55 @@ export const createJobDraftLegacyBodySchema = z.object({
 
 export type CreateJobDraftLegacyBody = z.infer<typeof createJobDraftLegacyBodySchema>;
 
+/**
+ * Validates a Stellar address that can be either a public key account address (G...)
+ * or a Soroban contract address (C...).
+ */
+export const stellarAddressOrContractSchema = z
+  .string({ required_error: "Address is required" })
+  .refine((v) => isValidStellarAddress(v) || isValidStellarContractId(v), {
+    message: "Invalid Stellar address",
+  });
+
+/**
+ * POST /:contractId/whitelist/update body schema.
+ * Accepts `addresses` (or `tokens` fallback) array containing valid Stellar addresses.
+ */
+export const updateWhitelistBodySchema = z
+  .object({
+    addresses: z
+      .array(stellarAddressOrContractSchema, {
+        required_error: "addresses array is required",
+        invalid_type_error: "addresses must be an array",
+      })
+      .optional(),
+    tokens: z
+      .array(stellarAddressOrContractSchema, {
+        invalid_type_error: "tokens must be an array",
+      })
+      .optional(),
+  })
+  .superRefine((data, ctx) => {
+    const addresses = data.addresses ?? data.tokens;
+    if (!addresses) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "addresses array is required",
+        path: ["addresses"],
+      });
+      return;
+    }
+    if (addresses.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "addresses array cannot be empty",
+        path: ["addresses"],
+      });
+    }
+  });
+
+export type UpdateWhitelistBody = z.infer<typeof updateWhitelistBodySchema>;
+
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;
 export type BuildTxBody = z.infer<typeof buildTxBodySchema>;

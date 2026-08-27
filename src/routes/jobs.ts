@@ -50,9 +50,11 @@ import {
   byWalletQuerySchema,
   createJobDraftBodySchema,
   createJobDraftLegacyBodySchema,
+  updateWhitelistBodySchema,
   type ByWalletQuery,
   type CreateJobDraftBody,
   type CreateJobDraftLegacyBody,
+  type UpdateWhitelistBody,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -646,6 +648,48 @@ router.get(
         contractId,
         error: message,
       });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/jobs/:contractId/whitelist/update – update whitelisted tokens
+// ---------------------------------------------------------------------------
+router.post(
+  "/:contractId/whitelist/update",
+  jobContractCors,
+  jobContractSecurityHeaders,
+  jobWhitelistRateLimit,
+  validate(contractIdParamsSchema, "params", (req) =>
+    logger.warn("Invalid contractId provided for whitelist update", { contractId: req.params.contractId }),
+  ),
+  validate(updateWhitelistBodySchema, "body", (req) =>
+    logger.warn("Invalid body provided for whitelist update", { body: req.body }),
+  ),
+  async (req: Request, res: Response) => {
+    const contractId = req.params.contractId as string;
+    const { addresses, tokens } = req.body as UpdateWhitelistBody;
+    const targetAddresses = addresses ?? tokens ?? [];
+
+    logger.info("Updating whitelist", { contractId, count: targetAddresses.length });
+
+    const requiredApiKey = process.env.API_KEY;
+    if (requiredApiKey) {
+      const providedKey = req.header("x-api-key");
+      if (providedKey !== requiredApiKey) {
+        logger.warn("Unauthorized request for whitelist update", { contractId });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+    }
+
+    try {
+      whitelistCache.del(contractId);
+      logger.info("Whitelist updated successfully", { contractId, count: targetAddresses.length });
+      sendSuccess(res, { contractId, addresses: targetAddresses, updated: true });
+    } catch (err: any) {
+      logger.error("Failed to update whitelist", { contractId, error: err?.message });
       sendError(res, 500, "Internal server error");
     }
   },
