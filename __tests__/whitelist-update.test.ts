@@ -296,4 +296,92 @@ describe("POST /api/jobs/:contractId/whitelist/update", () => {
       );
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Issue #242 additions: CORS and security headers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("CORS and Security Headers (Issue #242)", () => {
+    it("allows trusted origins and sets CORS response headers", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
+
+      const res = await request(buildApp())
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://app.example.com")
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
+
+      expect(res.status).toBe(200);
+      expect(res.headers["access-control-allow-origin"]).toBe(
+        "https://app.example.com"
+      );
+      expect(res.headers.vary).toContain("Origin");
+    });
+
+    it("rejects requests from unauthorized origins with 403", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
+
+      const res = await request(buildApp())
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://malicious.example.com")
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(403);
+
+      expect(res.body).toEqual({
+        success: false,
+        error: "Origin not allowed by CORS policy",
+      });
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    });
+
+    it("handles OPTIONS preflight for authorized origin", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
+
+      const res = await request(buildApp())
+        .options(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://app.example.com")
+        .set("Access-Control-Request-Method", "POST")
+        .expect(204);
+
+      expect(res.headers["access-control-allow-origin"]).toBe(
+        "https://app.example.com"
+      );
+      expect(res.headers["access-control-allow-methods"]).toBe(
+        "POST, OPTIONS"
+      );
+    });
+
+    it("rejects OPTIONS preflight for unauthorized origin with 403", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
+
+      const res = await request(buildApp())
+        .options(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://malicious.example.com")
+        .set("Access-Control-Request-Method", "POST")
+        .expect(403);
+
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    });
+
+    it("allows requests without an Origin header", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
+
+      const res = await request(buildApp())
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
+
+      expect(res.status).toBe(200);
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    });
+
+    it("applies security headers on POST /api/jobs/:contractId/whitelist/update", async () => {
+      const res = await request(buildApp())
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
+
+      expect(res.headers["x-content-type-options"]).toBe("nosniff");
+      expect(res.headers["x-frame-options"]).toBe("DENY");
+      expect(res.headers["referrer-policy"]).toBe("no-referrer");
+      expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
+    });
+  });
 });
