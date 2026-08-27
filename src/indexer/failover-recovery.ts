@@ -490,3 +490,37 @@ export function withNodeEventLock<T>(
 
   return run;
 }
+
+/**
+ * Retry `operation` with exponential backoff, for RPC calls that fail with
+ * connection timeouts. Delay doubles after each attempt (capped at
+ * MAX_BACKOFF_MS) and the final failure is rethrown once `maxAttempts` is
+ * exhausted.
+ */
+export async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxAttempts = 5,
+  initialDelayMs = DEFAULT_BACKOFF_MS
+): Promise<T> {
+  let attempt = 0;
+  let delayMs = initialDelayMs;
+
+  while (true) {
+    try {
+      return await operation();
+    } catch (err) {
+      attempt += 1;
+      if (attempt >= maxAttempts) {
+        throw err;
+      }
+
+      logger.debug(
+        `retrying after connection timeout attempt=${attempt} delayMs=${delayMs}`,
+        { attempt, delayMs }
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, MAX_BACKOFF_MS);
+    }
+  }
+}
