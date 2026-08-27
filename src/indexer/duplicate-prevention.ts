@@ -1,6 +1,11 @@
 import { getDb } from "./db.js";
 import logger from "../utils/logger.js";
 
+/** Index names used by sync-ranges lookups – validated via EXPLAIN QUERY PLAN (#250). */
+export const SYNC_RANGES_INDEXES = {
+  ledgers: "idx_sync_ranges_ledgers",
+} as const;
+
 /**
  * DuplicatePrevention manages unique constraint enforcement for event ingestion
  * with support for dynamic historical sync ranges.
@@ -285,6 +290,9 @@ export function initializeSyncRangesTable(): void {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(start_ledger, end_ledger)
     );
+
+    CREATE INDEX IF NOT EXISTS ${SYNC_RANGES_INDEXES.ledgers}
+      ON sync_ranges (start_ledger, end_ledger);
   `);
 }
 

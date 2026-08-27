@@ -62,6 +62,15 @@ export function resetJobsByWalletCache(): void {
   inFlightJobsByWalletRequests.clear();
 }
 
+/**
+ * Index names used by the indexer_runner execution loop – validated via
+ * EXPLAIN QUERY PLAN (#250).
+ */
+export const INDEXER_RUNNER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+} as const;
+
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
 // ---------------------------------------------------------------------------
@@ -138,6 +147,17 @@ const MIGRATIONS: Migration[] = [
     up: `
       CREATE INDEX IF NOT EXISTS idx_events_ledger_event_type
         ON events (ledger_sequence, event_type);
+    `,
+  },
+  {
+    version: 5,
+    description: "add indexer_runner lookup indexes (#250)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_monitored_contracts_active
+        ON monitored_contracts (active);
+
+      CREATE INDEX IF NOT EXISTS idx_events_created_at
+        ON events (created_at);
     `,
   },
 ];
