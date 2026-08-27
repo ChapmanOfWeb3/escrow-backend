@@ -14,6 +14,7 @@ import { getJobsByWallet, getEventsByContract } from "../indexer/db.js";
 import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
+  whitelistUpdateRateLimit,
   partialReleaseRateLimit,
   buildTxRateLimit,
   timeRemainingRateLimit,

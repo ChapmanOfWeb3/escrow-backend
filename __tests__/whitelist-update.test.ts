@@ -1,7 +1,10 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
-import { resetJobWhitelistRateLimitBuckets } from "../src/middleware/job-contract-rate-limit.js";
+import {
+  resetJobWhitelistRateLimitBuckets,
+  resetWhitelistUpdateRateLimitBuckets,
+} from "../src/middleware/job-contract-rate-limit.js";
 
 const VALID_CONTRACT =
   "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
@@ -53,11 +56,14 @@ describe("POST /api/jobs/:contractId/whitelist/update", () => {
     mockLoggerWarn.mockReset();
     mockLoggerError.mockReset();
     resetJobWhitelistRateLimitBuckets();
+    resetWhitelistUpdateRateLimitBuckets();
     resetWhitelistCache();
 
     delete process.env.API_KEY;
     delete process.env.JOB_WHITELIST_RATE_MAX;
     delete process.env.JOB_WHITELIST_RATE_WINDOW_MS;
+    delete process.env.JOB_WHITELIST_UPDATE_RATE_MAX;
+    delete process.env.JOB_WHITELIST_UPDATE_RATE_WINDOW_MS;
     delete process.env.ALLOWED_ORIGINS;
 
     mockGetAccount.mockResolvedValue({
