@@ -447,3 +447,20 @@ export function logPollDiagnostics(
     { nodeUrl, elapsedMs, payloadSizeBytes }
   );
 }
+
+/**
+ * Create indexes covering the lookups this module performs most often
+ * (health-by-node, and failure-events-by-node ordered by recency). Safe to
+ * call repeatedly; requires the base tables to already exist.
+ */
+export function ensureNodeHealthIndexes(): void {
+  const db = getDb();
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_rpc_node_health_healthy
+      ON rpc_node_health (is_healthy);
+
+    CREATE INDEX IF NOT EXISTS idx_node_failure_events_node_url_created_at
+      ON node_failure_events (node_url, created_at);
+  `);
+}
