@@ -1,5 +1,12 @@
 import Database from "better-sqlite3";
-import { setDb, runMigrations, getDb } from "../src/indexer/db.js";
+import {
+  setDb,
+  runMigrations,
+  getDb,
+  SCHEMA_MANAGER_INDEXES,
+  explainSchemaQueryPlan,
+  schemaQueryPlanUsesIndex,
+} from "../src/indexer/db.js";
 
 describe("SQLite Schema Manager – in-memory integration tests", () => {
   let testDb: Database.Database;
@@ -44,6 +51,23 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       expect(versions).toContain(1);
       expect(versions).toContain(2);
       expect(versions).toContain(3);
+      expect(versions).toContain(4);
+      expect(versions).toContain(5);
+    });
+
+    it("creates all schema-manager lookup indexes (#259)", () => {
+      const indexes = testDb
+        .prepare(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'index' AND name LIKE 'idx_%'
+           ORDER BY name`,
+        )
+        .all() as Array<{ name: string }>;
+      const names = indexes.map((i) => i.name);
+
+      for (const indexName of Object.values(SCHEMA_MANAGER_INDEXES)) {
+        expect(names).toContain(indexName);
+      }
     });
   });
 
@@ -52,7 +76,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb
         .prepare(
           `INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-           VALUES (?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?)`,
         )
         .run("C1", "initialized", 1000, 1700000000, '{"key":"value"}');
 
@@ -70,7 +94,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("enforces unique constraint on contract_id + ledger_sequence + event_type", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-         VALUES (?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?)`,
       );
 
       insert.run("C1", "initialized", 100, 1000, "{}");
@@ -84,7 +108,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("allows different event types on the same ledger", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-         VALUES (?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?)`,
       );
 
       insert.run("C1", "initialized", 100, 1000, "{}");
@@ -97,7 +121,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("allows events across multiple contracts", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-         VALUES (?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?)`,
       );
 
       insert.run("C1", "initialized", 100, 1000, "{}");
@@ -120,7 +144,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb
         .prepare(
           `INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-           VALUES (?, ?, ?, ?, ?)`
+           VALUES (?, ?, ?, ?, ?)`,
         )
         .run("C1", "initialized", 100, 1000, largeData);
 
@@ -157,7 +181,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb
         .prepare(
           `INSERT INTO monitored_contracts (contract_id, label, active)
-           VALUES (?, ?, 1)`
+           VALUES (?, ?, 1)`,
         )
         .run("CONTRACT-ALPHA", "alpha");
 
@@ -173,7 +197,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("enforces unique contract_id", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO monitored_contracts (contract_id, label, active)
-         VALUES (?, ?, 1)`
+         VALUES (?, ?, 1)`,
       );
 
       insert.run("C1", "first");
@@ -213,7 +237,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         testDb.transaction(() => {
           testDb
             .prepare(
-              "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)"
+              "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)",
             )
             .run("C1", "t", 1, 1, "{}");
           throw new Error("intentional rollback");
@@ -233,12 +257,12 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb.transaction(() => {
         testDb
           .prepare(
-            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)",
           )
           .run("C1", "initialized", 100, 1000, "{}");
         testDb
           .prepare(
-            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)",
           )
           .run("C1", "funded", 101, 1001, "{}");
         testDb
@@ -260,7 +284,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("running migrations multiple times does not duplicate data", () => {
       testDb
         .prepare(
-          "INSERT INTO monitored_contracts (contract_id, label, active) VALUES (?, ?, 1)"
+          "INSERT INTO monitored_contracts (contract_id, label, active) VALUES (?, ?, 1)",
         )
         .run("C1", "original");
 
@@ -287,6 +311,126 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         .all() as Array<{ version: number }>;
 
       expect(versionsAfter.length).toBe(countBefore);
+    });
+  });
+
+  describe("SQLite index utilization – EXPLAIN QUERY PLAN (#259)", () => {
+    beforeEach(() => {
+      const insertEvent = testDb.prepare(
+        `INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      const insertContract = testDb.prepare(
+        `INSERT INTO monitored_contracts (contract_id, label, active) VALUES (?, ?, ?)`,
+      );
+      const insertWebhook = testDb.prepare(
+        `INSERT INTO webhook_subscriptions (contract_id, webhook_url, event_types)
+         VALUES (?, ?, ?)`,
+      );
+
+      for (let i = 0; i < 40; i++) {
+        insertEvent.run(
+          i % 2 === 0 ? "C1" : "C2",
+          i % 3 === 0 ? "initialized" : "funded",
+          1000 + i,
+          1_700_000_000 + i,
+          JSON.stringify({ i }),
+        );
+      }
+      insertContract.run("C1", "one", 1);
+      insertContract.run("C2", "two", 0);
+      insertContract.run("C3", "three", 1);
+      insertWebhook.run("C1", "https://example.com/a", "*");
+      insertWebhook.run("C2", "https://example.com/b", "funded");
+    });
+
+    it("uses an index for contract_id event lookups", () => {
+      const plan = explainSchemaQueryPlan(
+        `SELECT * FROM events WHERE contract_id = ?`,
+        "C1",
+      );
+      expect(
+        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractId) ||
+          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractLedger) ||
+          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractType),
+      ).toBe(true);
+    });
+
+    it("uses idx_events_contract_ledger for contract + ledger ordered lookups", () => {
+      const plan = explainSchemaQueryPlan(
+        `SELECT * FROM events
+         WHERE contract_id = ?
+         ORDER BY ledger_sequence ASC`,
+        "C1",
+      );
+      expect(
+        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractLedger) ||
+          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractId),
+      ).toBe(true);
+    });
+
+    it("uses idx_events_contract_type for contract + event_type lookups", () => {
+      const plan = explainSchemaQueryPlan(
+        `SELECT * FROM events WHERE contract_id = ? AND event_type = ?`,
+        "C1",
+        "funded",
+      );
+      expect(
+        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractType) ||
+          schemaQueryPlanUsesIndex(
+            plan,
+            SCHEMA_MANAGER_INDEXES.eventsContractTypeLedger,
+          ),
+      ).toBe(true);
+    });
+
+    it("uses idx_events_ledger_sequence for ledger range lookups", () => {
+      const plan = explainSchemaQueryPlan(
+        `SELECT * FROM events
+         WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+        1010,
+        1020,
+      );
+      expect(
+        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsLedgerSequence) ||
+          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsLedgerEventType),
+      ).toBe(true);
+    });
+
+    it("uses idx_webhook_subscriptions_contract for webhook lookups", () => {
+      const plan = explainSchemaQueryPlan(
+        `SELECT * FROM webhook_subscriptions WHERE contract_id = ?`,
+        "C1",
+      );
+      expect(
+        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.webhookContract),
+      ).toBe(true);
+    });
+
+    it("uses idx_monitored_contracts_active for active contract lookups", () => {
+      const plan = explainSchemaQueryPlan(
+        `SELECT contract_id FROM monitored_contracts WHERE active = 1`,
+      );
+      expect(
+        schemaQueryPlanUsesIndex(
+          plan,
+          SCHEMA_MANAGER_INDEXES.monitoredContractsActive,
+        ),
+      ).toBe(true);
+    });
+
+    it("uses idx_events_created_at for vacuum-style created_at pruning", () => {
+      const plan = explainSchemaQueryPlan(
+        `SELECT id FROM events WHERE created_at < ?`,
+        "2099-01-01",
+      );
+      expect(
+        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsCreatedAt),
+      ).toBe(true);
+    });
+
+    it("getDb returns the same connection used for EXPLAIN plans", () => {
+      expect(getDb()).toBe(testDb);
     });
   });
 });

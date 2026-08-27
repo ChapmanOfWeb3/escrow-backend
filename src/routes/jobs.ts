@@ -46,6 +46,7 @@ import {
   submitBodySchema,
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
+  whitelistUpdateBodySchema,
   byWalletParamsSchema,
   byWalletQuerySchema,
   createJobDraftBodySchema,
@@ -72,6 +73,20 @@ const inFlightWhitelistRequests = new Map<string, Promise<string[]>>();
 export function resetWhitelistCache(): void {
   whitelistCache.flushAll();
   inFlightWhitelistRequests.clear();
+}
+
+const WHITELIST_UPDATE_TTL = parseInt(
+  process.env.WHITELIST_UPDATE_CACHE_TTL_S || "60",
+  10,
+);
+export const whitelistUpdateCache = new NodeCache({
+  stdTTL: WHITELIST_UPDATE_TTL,
+  useClones: false,
+});
+const inFlightWhitelistUpdateRequests = new Map<string, Promise<string>>();
+export function resetWhitelistUpdateCache(): void {
+  whitelistUpdateCache.flushAll();
+  inFlightWhitelistUpdateRequests.clear();
 }
 
 const CLAIM_AUTO_RELEASE_TTL = parseInt(
@@ -647,6 +662,121 @@ router.get(
         error: message,
       });
       sendError(res, 500, "Internal server error");
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/jobs/:contractId/whitelist/update – build add/remove whitelist tx
+// Caches XDR by contractId:action:token:sourceAddress; concurrent identical
+// requests share one in-flight RPC promise (#246).
+// ---------------------------------------------------------------------------
+router.options("/:contractId/whitelist/update", jobContractCors);
+
+router.post(
+  "/:contractId/whitelist/update",
+  jobContractCors,
+  jobContractSecurityHeaders,
+  jobWhitelistRateLimit,
+  validate(contractIdParamsSchema, "params", (req) =>
+    logger.warn("Invalid params for whitelist/update", { params: req.params }),
+  ),
+  validate(whitelistUpdateBodySchema, "body", (req) =>
+    logger.warn("Invalid body for whitelist/update", { body: req.body }),
+  ),
+  async (req: Request, res: Response) => {
+    const contractId = req.params.contractId as string;
+    const { token, action, sourceAddress } = req.body as {
+      token: string;
+      action: "add" | "remove";
+      sourceAddress: string;
+    };
+    const cacheKey = `${contractId}:${action}:${token}:${sourceAddress}`;
+    const method =
+      action === "add" ? "add_whitelisted_token" : "remove_whitelisted_token";
+
+    try {
+      const requiredApiKey = process.env.API_KEY;
+      if (requiredApiKey) {
+        const providedKey = req.header("x-api-key");
+        if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized whitelist/update request", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+      }
+
+      const cached = whitelistUpdateCache.get<string>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Whitelist update XDR served from cache", {
+          contractId,
+          action,
+          source: "cache",
+        });
+        res.json({ success: true, xdr: cached });
+        return;
+      }
+
+      const inFlight = inFlightWhitelistUpdateRequests.get(cacheKey);
+      if (inFlight) {
+        const xdr = await inFlight;
+        logger.info("Whitelist update XDR served from in-flight cache", {
+          contractId,
+          action,
+          source: "in-flight",
+        });
+        res.json({ success: true, xdr });
+        return;
+      }
+
+      const requestPromise = (async (): Promise<string> => {
+        const contract = new Contract(contractId);
+        const account = await server.getAccount(sourceAddress);
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            contract.call(
+              method,
+              Address.fromString(sourceAddress).toScVal(),
+              Address.fromString(token).toScVal(),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        const prepared = await server.prepareTransaction(tx);
+        const xdr = prepared.toXDR();
+        whitelistUpdateCache.set(cacheKey, xdr);
+        return xdr;
+      })();
+
+      inFlightWhitelistUpdateRequests.set(cacheKey, requestPromise);
+      let xdr: string;
+      try {
+        xdr = await requestPromise;
+      } catch (err: any) {
+        whitelistUpdateCache.del(cacheKey);
+        throw err;
+      } finally {
+        inFlightWhitelistUpdateRequests.delete(cacheKey);
+      }
+
+      logger.info("Whitelist update XDR built successfully", {
+        contractId,
+        action,
+        method,
+      });
+      res.json({ success: true, xdr });
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      logger.error("Failed to build whitelist/update tx", {
+        contractId,
+        action,
+        error: message,
+      });
+      res.status(500).json({ success: false, error: "Internal server error" });
     }
   },
 );

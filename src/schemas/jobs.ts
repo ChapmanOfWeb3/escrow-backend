@@ -162,6 +162,22 @@ export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
 }).strict();
 
+/** POST /:contractId/whitelist/update body (#246, #248) */
+export const whitelistUpdateBodySchema = z
+  .object({
+    token: z
+      .string({ required_error: "token is required" })
+      .refine(isValidStellarContractId, {
+        message: "token must be a valid Stellar contract address (C...)",
+      }),
+    action: z.enum(["add", "remove"], {
+      required_error: "action is required",
+      invalid_type_error: "action must be 'add' or 'remove'",
+    }),
+    sourceAddress: stellarAccountField("sourceAddress"),
+  })
+  .strict();
+
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
   address: stellarAddressSchema,
@@ -282,6 +298,7 @@ export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
 export type SubmitBody = z.infer<typeof submitBodySchema>;
 export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
 export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;
+export type WhitelistUpdateBody = z.infer<typeof whitelistUpdateBodySchema>;
 export type ByWalletParams = z.infer<typeof byWalletParamsSchema>;
 export type ByWalletQuery = z.infer<typeof byWalletQuerySchema>;
 export type CreateJobDraftBody = z.infer<typeof createJobDraftBodySchema>;

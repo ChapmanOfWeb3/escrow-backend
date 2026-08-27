@@ -140,7 +140,62 @@ const MIGRATIONS: Migration[] = [
         ON events (ledger_sequence, event_type);
     `,
   },
+  {
+    version: 5,
+    description: "add sqlite_schema_manager lookup indexes (#259)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_monitored_contracts_active
+        ON monitored_contracts (active);
+
+      CREATE INDEX IF NOT EXISTS idx_events_created_at
+        ON events (created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_type_ledger
+        ON events (contract_id, event_type, ledger_sequence);
+    `,
+  },
 ];
+
+/** Index names owned by the schema manager – asserted via EXPLAIN QUERY PLAN (#259). */
+export const SCHEMA_MANAGER_INDEXES = {
+  eventsContractId: "idx_events_contract_id",
+  eventsLedgerSequence: "idx_events_ledger_sequence",
+  eventsContractLedger: "idx_events_contract_ledger",
+  eventsContractType: "idx_events_contract_type",
+  eventsLedgerEventType: "idx_events_ledger_event_type",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+  webhookContract: "idx_webhook_subscriptions_contract",
+  monitoredContractsActive: "idx_monitored_contracts_active",
+} as const;
+
+/**
+ * Return SQLite EXPLAIN QUERY PLAN rows for a parameterized statement.
+ * Used by schema-manager tests to assert index utilization (#259).
+ */
+export function explainSchemaQueryPlan(
+  sql: string,
+  ...params: unknown[]
+): Array<Record<string, unknown>> {
+  const database = getDb();
+  return database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<
+    Record<string, unknown>
+  >;
+}
+
+/**
+ * True when any EXPLAIN QUERY PLAN detail references the expected index name.
+ */
+export function schemaQueryPlanUsesIndex(
+  plan: Array<Record<string, unknown>>,
+  indexName: string,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && value.includes(indexName),
+    ),
+  );
+}
 
 /**
  * Ensures the schema_migrations tracking table exists, then applies any
