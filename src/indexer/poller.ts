@@ -7,41 +7,32 @@ import {
   registerContract,
   adjustPollerInterval,
   getCurrentPollIntervalMs,
+  verifySchemaUpToDate,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
+import {
+  getIndexerRunnerFailureMonitor,
+  resetIndexerRunnerFailureState,
+} from "./indexer_runner.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
 
-// ---------------------------------------------------------------------------
-// Alerting thresholds (#271)
-// ---------------------------------------------------------------------------
-const CONSECUTIVE_FAILURE_THRESHOLD = parseInt(
-  process.env.POLLER_FAILURE_THRESHOLD || "3",
-  10,
-);
-
-function getStallThresholdMs(): number {
-  return parseInt(process.env.POLLER_STALL_THRESHOLD_MS || "120000", 10);
-}
-
-let consecutiveFailures = 0;
-let lastSuccessfulPollAt: number | null = null;
+const failureMonitor = getIndexerRunnerFailureMonitor();
 
 export function getConsecutiveFailures(): number {
-  return consecutiveFailures;
+  return failureMonitor.getConsecutiveFailures();
 }
 
 export function getLastSuccessfulPollAt(): number | null {
-  return lastSuccessfulPollAt;
+  return failureMonitor.getLastSuccessfulAt();
 }
 
 export function resetFailureState(): void {
-  consecutiveFailures = 0;
-  lastSuccessfulPollAt = null;
+  resetIndexerRunnerFailureState();
 }
 
 const EVENT_TYPES = [
@@ -82,17 +73,16 @@ export async function pollEvents(): Promise<boolean> {
     return false;
   }
 
-  // --- Diagnostics: stall detection before polling (#270, #271) ---
-  if (lastSuccessfulPollAt) {
-    const stallThresholdMs = getStallThresholdMs();
-    const elapsed = Date.now() - lastSuccessfulPollAt;
-    if (elapsed > stallThresholdMs) {
-      logger.warn("Poller stall detected – no successful poll for threshold period", {
-        elapsedMs: elapsed,
-        stallThresholdMs,
-        consecutiveFailures,
-      });
-    }
+  // --- Alerting: stall detection before polling (#253, #271) ---
+  failureMonitor.checkStall();
+  if (failureMonitor.getLastSuccessfulAt()) {
+    const elapsed = Date.now() - (failureMonitor.getLastSuccessfulAt() as number);
+    const stallThresholdMs = parseInt(
+      process.env.INDEXER_RUNNER_STALL_THRESHOLD_MS ||
+        process.env.POLLER_STALL_THRESHOLD_MS ||
+        String(failureMonitor.stallThresholdMs),
+      10,
+    );
     logger.debug("Poller stall diagnostics", {
       elapsedMsSinceLastSuccess: elapsed,
       stallThresholdMs,
@@ -111,7 +101,8 @@ export async function pollEvents(): Promise<boolean> {
     if (currentLedger <= lastLedger) {
       // --- Dynamic throttling: idle cycle (#265) ---
       adjustPollerInterval(0);
-      return;
+      failureMonitor.recordSuccess();
+      return false;
     }
 
     const startLedger = lastLedger + 1;
@@ -157,8 +148,7 @@ export async function pollEvents(): Promise<boolean> {
     insertEventBatch(batch, currentLedger);
 
     const totalElapsed = performance.now() - pollStart;
-    consecutiveFailures = 0;
-    lastSuccessfulPollAt = Date.now();
+    failureMonitor.recordSuccess();
 
     // --- Dynamic poller throttling (#265) ---
     const throttleState = adjustPollerInterval(events.events.length);
@@ -178,23 +168,34 @@ export async function pollEvents(): Promise<boolean> {
 
     return true;
   } catch (err) {
-    const totalElapsed = performance.now() - pollStart;
-    consecutiveFailures += 1;
+    const totalElapsed = Math.round(performance.now() - pollStart);
+    const errorMessage = err instanceof Error ? err.message : String(err);
 
-    logger.error("Error polling events", {
-      error: err instanceof Error ? err.message : String(err),
-      consecutiveFailures,
-      elapsedMs: Math.round(totalElapsed),
+    // --- Alerting: threshold warnings on consecutive failures (#253, #271) ---
+    failureMonitor.recordFailure("poll", {
+      error: errorMessage,
+      elapsedMs: totalElapsed,
     });
 
-    // --- Alerting: warn when consecutive failures hit threshold (#271) ---
-    if (consecutiveFailures >= CONSECUTIVE_FAILURE_THRESHOLD) {
+    logger.error("Error polling events", {
+      error: errorMessage,
+      consecutiveFailures: failureMonitor.getConsecutiveFailures(),
+      elapsedMs: totalElapsed,
+    });
+
+    // Keep legacy poller alert message for existing #271 tests
+    if (
+      failureMonitor.getConsecutiveFailures() >=
+      failureMonitor.getFailureThreshold()
+    ) {
       logger.error("Poller alert: consecutive failure threshold exceeded", {
-        consecutiveFailures,
-        threshold: CONSECUTIVE_FAILURE_THRESHOLD,
-        lastSuccessAt: lastSuccessfulPollAt,
+        consecutiveFailures: failureMonitor.getConsecutiveFailures(),
+        threshold: failureMonitor.getFailureThreshold(),
+        lastSuccessAt: failureMonitor.getLastSuccessfulAt(),
       });
     }
+
+    return false;
   }
 }
 
