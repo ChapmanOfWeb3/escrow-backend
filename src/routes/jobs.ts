@@ -50,9 +50,11 @@ import {
   byWalletQuerySchema,
   createJobDraftBodySchema,
   createJobDraftLegacyBodySchema,
+  whitelistUpdateBodySchema,
   type ByWalletQuery,
   type CreateJobDraftBody,
   type CreateJobDraftLegacyBody,
+  type WhitelistUpdateBody,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -646,6 +648,83 @@ router.get(
         contractId,
         error: message,
       });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/jobs/:contractId/whitelist/update – add or remove a whitelisted token
+// ---------------------------------------------------------------------------
+router.post(
+  "/:contractId/whitelist/update",
+  jobContractCors,
+  jobContractSecurityHeaders,
+  jobWhitelistRateLimit,
+  validate(contractIdParamsSchema, "params", (req) =>
+    logger.warn("Invalid contractId for whitelist update", { contractId: req.params.contractId }),
+  ),
+  validate(whitelistUpdateBodySchema, "body", (req) =>
+    logger.warn("Invalid body for whitelist update", { contractId: req.params.contractId, body: req.body }),
+  ),
+  async (req: Request, res: Response) => {
+    const contractId = req.params.contractId as string;
+    const { token, action, adminAddress } = req.body as WhitelistUpdateBody;
+
+    try {
+      const requiredApiKey = process.env.API_KEY;
+      if (requiredApiKey) {
+        const providedKey = req.header("x-api-key");
+        if (providedKey !== requiredApiKey) {
+          logger.warn("Unauthorized whitelist update request", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+      }
+
+      logger.info("Processing whitelist update", { contractId, token, action, adminAddress });
+
+      const method = action === "add" ? "add_whitelisted_token" : "remove_whitelisted_token";
+      const contract = new Contract(contractId);
+      const account = await server.getAccount(adminAddress);
+
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            Address.fromString(adminAddress).toScVal(),
+            Address.fromString(token).toScVal(),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const prepared = await server.prepareTransaction(tx);
+
+      // Invalidate the cached whitelist so the next GET reflects the change
+      whitelistCache.del(contractId);
+
+      logger.info("Whitelist update transaction built", { contractId, token, action });
+      sendSuccess(res, { xdr: prepared.toXDR() });
+    } catch (err: any) {
+      const message = err?.message ?? "Internal server error";
+
+      if (/unauthorized|invalid authentication/i.test(message)) {
+        logger.warn("Unauthorized whitelist update request", { contractId });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+
+      if (/not found/i.test(message) && !/account not found/i.test(message)) {
+        logger.warn("Job not found for whitelist update", { contractId });
+        sendError(res, 404, "Job not found");
+        return;
+      }
+
+      logger.error("Failed to build whitelist update transaction", { contractId, error: message });
       sendError(res, 500, "Internal server error");
     }
   },
