@@ -14,6 +14,7 @@ import { getJobsByWallet, getEventsByContract } from "../indexer/db.js";
 import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
+  whitelistUpdateRateLimit,
   partialReleaseRateLimit,
   buildTxRateLimit,
   timeRemainingRateLimit,
@@ -660,7 +661,7 @@ router.post(
   "/:contractId/whitelist/update",
   jobContractCors,
   jobContractSecurityHeaders,
-  jobWhitelistRateLimit,
+  whitelistUpdateRateLimit,
   validate(contractIdParamsSchema, "params", (req) =>
     logger.warn("Invalid contractId provided for whitelist update", { contractId: req.params.contractId }),
   ),

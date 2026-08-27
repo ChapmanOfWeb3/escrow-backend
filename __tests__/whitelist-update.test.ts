@@ -1,7 +1,10 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
-import { resetJobWhitelistRateLimitBuckets } from "../src/middleware/job-contract-rate-limit.js";
+import {
+  resetJobWhitelistRateLimitBuckets,
+  resetWhitelistUpdateRateLimitBuckets,
+} from "../src/middleware/job-contract-rate-limit.js";
 
 const VALID_CONTRACT =
   "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
@@ -53,11 +56,14 @@ describe("POST /api/jobs/:contractId/whitelist/update", () => {
     mockLoggerWarn.mockReset();
     mockLoggerError.mockReset();
     resetJobWhitelistRateLimitBuckets();
+    resetWhitelistUpdateRateLimitBuckets();
     resetWhitelistCache();
 
     delete process.env.API_KEY;
     delete process.env.JOB_WHITELIST_RATE_MAX;
     delete process.env.JOB_WHITELIST_RATE_WINDOW_MS;
+    delete process.env.JOB_WHITELIST_UPDATE_RATE_MAX;
+    delete process.env.JOB_WHITELIST_UPDATE_RATE_WINDOW_MS;
     delete process.env.ALLOWED_ORIGINS;
 
     mockGetAccount.mockResolvedValue({
@@ -294,6 +300,104 @@ describe("POST /api/jobs/:contractId/whitelist/update", () => {
         "Failed to update whitelist",
         { contractId: VALID_CONTRACT, error: "RPC internal failure" }
       );
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Issue #243 additions: Custom Rate Limiting
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("Rate limiting (Issue #243)", () => {
+    it("Test 1 — Requests under the configured limit succeed and set rate-limit headers", async () => {
+      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "3";
+      const app = buildApp();
+
+      for (let i = 0; i < 3; i++) {
+        const res = await request(app)
+          .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+          .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
+
+        expect(res.status).toBe(200);
+        expect(res.headers["x-ratelimit-limit"]).toBe("3");
+        expect(res.headers["x-ratelimit-remaining"]).toBe(String(2 - i));
+        expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+      }
+    });
+
+    it("Test 2 — Request exceeding the limit returns HTTP 429 Too Many Requests", async () => {
+      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "2";
+      const app = buildApp();
+
+      // First 2 requests succeed
+      await request(app)
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(200);
+
+      await request(app)
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(200);
+
+      // 3rd request exceeds limit
+      const res = await request(app)
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(429);
+
+      expect(res.body).toEqual({
+        success: false,
+        error: "Too many requests, please try again later",
+      });
+      expect(res.headers["x-ratelimit-remaining"]).toBe("0");
+      expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+    });
+
+    it("Test 3 — Rate limiting is scoped specifically to whitelist update endpoint", async () => {
+      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "1";
+      process.env.JOB_WHITELIST_RATE_MAX = "10";
+      const app = buildApp();
+
+      // Consume whitelist update limit
+      await request(app)
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(200);
+
+      // Next whitelist update request is rate limited
+      await request(app)
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(429);
+
+      // GET /api/jobs/:contractId/whitelist should still succeed under its own quota
+      const getRes = await request(app)
+        .get(`/api/jobs/${VALID_CONTRACT}/whitelist`)
+        .expect(200);
+
+      expect(getRes.headers["x-ratelimit-limit"]).toBe("10");
+    });
+
+    it("Test 4 — Rate-limit state is isolated between test runs", async () => {
+      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "1";
+      const app = buildApp();
+
+      // First request uses up the 1 allowed request
+      await request(app)
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(200);
+
+      // Reset buckets explicitly (simulating beforeEach behavior)
+      resetWhitelistUpdateRateLimitBuckets();
+
+      // Next request should succeed again because buckets were cleared
+      const res = await request(app)
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(200);
+
+      expect(res.headers["x-ratelimit-remaining"]).toBe("0");
     });
   });
 });
