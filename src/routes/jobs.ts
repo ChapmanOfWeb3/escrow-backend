@@ -35,8 +35,6 @@ import {
   byWalletSecurityHeaders,
   claimAutoReleaseCors,
   claimAutoReleaseSecurityHeaders,
-  updateWhitelistCors,
-  updateWhitelistSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
@@ -659,13 +657,11 @@ router.get(
 // ---------------------------------------------------------------------------
 // POST /api/jobs/:contractId/whitelist/update – update whitelisted tokens
 // ---------------------------------------------------------------------------
-router.options("/:contractId/whitelist/update", updateWhitelistCors);
-
 router.post(
   "/:contractId/whitelist/update",
-  updateWhitelistCors,
-  updateWhitelistSecurityHeaders,
-  jobWhitelistRateLimit,
+  jobContractCors,
+  jobContractSecurityHeaders,
+  whitelistUpdateRateLimit,
   validate(contractIdParamsSchema, "params", (req) =>
     logger.warn("Invalid contractId provided for whitelist update", { contractId: req.params.contractId }),
   ),
