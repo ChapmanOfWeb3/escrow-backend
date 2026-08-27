@@ -363,6 +363,16 @@ router.post(
   createJobDraftRateLimit,
   createJobDraftRouteValidator,
   (req: Request, res: Response) => {
+    const traceId = randomUUID();
+    const pathVars = { route: "/api/jobs/create-job-draft" };
+
+    logger.debug("Create-job-draft handler entered", {
+      traceId,
+      ...pathVars,
+      bodyKeys: Object.keys((req.body as Record<string, unknown>) ?? {}),
+      ip: req.ip ?? req.socket?.remoteAddress,
+    });
+
     try {
       const body = req.body as Partial<CreateJobDraftBody> &
         Partial<CreateJobDraftLegacyBody>;
@@ -394,7 +404,15 @@ router.post(
         },
       };
 
+      logger.debug("Create-job-draft draft built", {
+        traceId,
+        ...pathVars,
+        milestoneCount: body.milestones?.length ?? 0,
+      });
+
       logger.info("Job draft created", {
+        traceId,
+        ...pathVars,
         client,
         freelancer,
         arbiter,
@@ -403,8 +421,23 @@ router.post(
       });
 
       sendSuccess(res, draft);
+
+      logger.debug("Create-job-draft response sent", {
+        traceId,
+        ...pathVars,
+        status: 200,
+        success: true,
+        draftId: draft.id,
+        milestoneCount: body.milestones?.length ?? 0,
+      });
     } catch (err: any) {
-      logger.error("Failed to create job draft", { error: err?.message });
+      const message = err?.message ?? String(err);
+      logger.error("Failed to create job draft", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack: err?.stack,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
@@ -771,6 +804,7 @@ router.post(
     logger.warn("Invalid body for partial-release", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
+    const traceId = randomUUID();
     try {
       const { contractId, index } = req.params;
 
@@ -778,7 +812,7 @@ router.post(
       if (requiredApiKey) {
         const providedKey = req.header("x-api-key");
         if (providedKey !== requiredApiKey) {
-          logger.warn("Unauthorized request", { contractId });
+          logger.warn("Unauthorized request", { traceId, contractId, index });
           sendError(res, 401, "Unauthorized");
           return;
         }
@@ -786,7 +820,15 @@ router.post(
 
       const { amount, sourceAddress } = req.body;
 
+      logger.debug("Partial-release handler entered", {
+        traceId,
+        contractId,
+        index,
+        ip: req.ip ?? req.socket?.remoteAddress,
+      });
+
       logger.info("Processing partial-release", {
+        traceId,
         contractId,
         index,
         amount,
@@ -801,7 +843,14 @@ router.post(
       } catch (err: any) {
         const errMsg = String(err?.message || err);
         const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+        logger.error("Failed to get account for partial release", {
+          traceId,
+          contractId,
+          index,
+          sourceAddress,
+          error: errMsg,
+          stack: err?.stack,
+        });
         sendError(res, status, message);
         return;
       }
@@ -827,15 +876,38 @@ router.post(
       } catch (err: any) {
         const errMsg = String(err?.message || err);
         const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+        logger.error("Failed to prepare transaction for partial release", {
+          traceId,
+          contractId,
+          index,
+          error: errMsg,
+          stack: err?.stack,
+        });
         sendError(res, status, message);
         return;
       }
 
+      logger.debug("Partial-release response sent", {
+        traceId,
+        contractId,
+        index,
+        status: 200,
+        success: true,
+        xdrLength: prepared.toXDR().length,
+      });
+
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
       const errMsg = String(err?.message || err);
-      logger.error("Unexpected error in partial release", { error: errMsg });
+      // Structured, server-side-only error detail – the client receives a clean
+      // 500 body with no internal stack trace leakage (#117).
+      logger.error("Unexpected error in partial release", {
+        traceId,
+        contractId: req.params.contractId,
+        index: req.params.index,
+        error: errMsg,
+        stack: err?.stack,
+      });
       sendError(res, 500, "Internal server error");
     }
   }
