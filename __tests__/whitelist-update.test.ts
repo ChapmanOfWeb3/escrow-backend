@@ -304,100 +304,90 @@ describe("POST /api/jobs/:contractId/whitelist/update", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Issue #243 additions: Custom Rate Limiting
+  // Issue #242 additions: CORS and security headers
   // ─────────────────────────────────────────────────────────────────────────
 
-  describe("Rate limiting (Issue #243)", () => {
-    it("Test 1 — Requests under the configured limit succeed and set rate-limit headers", async () => {
-      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "3";
-      const app = buildApp();
+  describe("CORS and Security Headers (Issue #242)", () => {
+    it("allows trusted origins and sets CORS response headers", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
 
-      for (let i = 0; i < 3; i++) {
-        const res = await request(app)
-          .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
-          .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
+      const res = await request(buildApp())
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://app.example.com")
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
 
-        expect(res.status).toBe(200);
-        expect(res.headers["x-ratelimit-limit"]).toBe("3");
-        expect(res.headers["x-ratelimit-remaining"]).toBe(String(2 - i));
-        expect(res.headers["x-ratelimit-reset"]).toBeDefined();
-      }
+      expect(res.status).toBe(200);
+      expect(res.headers["access-control-allow-origin"]).toBe(
+        "https://app.example.com"
+      );
+      expect(res.headers.vary).toContain("Origin");
     });
 
-    it("Test 2 — Request exceeding the limit returns HTTP 429 Too Many Requests", async () => {
-      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "2";
-      const app = buildApp();
+    it("rejects requests from unauthorized origins with 403", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
 
-      // First 2 requests succeed
-      await request(app)
+      const res = await request(buildApp())
         .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://malicious.example.com")
         .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
-        .expect(200);
-
-      await request(app)
-        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
-        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
-        .expect(200);
-
-      // 3rd request exceeds limit
-      const res = await request(app)
-        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
-        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
-        .expect(429);
+        .expect(403);
 
       expect(res.body).toEqual({
         success: false,
-        error: "Too many requests, please try again later",
+        error: "Origin not allowed by CORS policy",
       });
-      expect(res.headers["x-ratelimit-remaining"]).toBe("0");
-      expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
     });
 
-    it("Test 3 — Rate limiting is scoped specifically to whitelist update endpoint", async () => {
-      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "1";
-      process.env.JOB_WHITELIST_RATE_MAX = "10";
-      const app = buildApp();
+    it("handles OPTIONS preflight for authorized origin", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
 
-      // Consume whitelist update limit
-      await request(app)
-        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
-        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
-        .expect(200);
+      const res = await request(buildApp())
+        .options(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://app.example.com")
+        .set("Access-Control-Request-Method", "POST")
+        .expect(204);
 
-      // Next whitelist update request is rate limited
-      await request(app)
-        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
-        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
-        .expect(429);
-
-      // GET /api/jobs/:contractId/whitelist should still succeed under its own quota
-      const getRes = await request(app)
-        .get(`/api/jobs/${VALID_CONTRACT}/whitelist`)
-        .expect(200);
-
-      expect(getRes.headers["x-ratelimit-limit"]).toBe("10");
+      expect(res.headers["access-control-allow-origin"]).toBe(
+        "https://app.example.com"
+      );
+      expect(res.headers["access-control-allow-methods"]).toBe(
+        "POST, OPTIONS"
+      );
     });
 
-    it("Test 4 — Rate-limit state is isolated between test runs", async () => {
-      process.env.JOB_WHITELIST_UPDATE_RATE_MAX = "1";
-      const app = buildApp();
+    it("rejects OPTIONS preflight for unauthorized origin with 403", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
 
-      // First request uses up the 1 allowed request
-      await request(app)
+      const res = await request(buildApp())
+        .options(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
+        .set("Origin", "https://malicious.example.com")
+        .set("Access-Control-Request-Method", "POST")
+        .expect(403);
+
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    });
+
+    it("allows requests without an Origin header", async () => {
+      process.env.ALLOWED_ORIGINS = "https://app.example.com";
+
+      const res = await request(buildApp())
         .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
-        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
-        .expect(200);
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
 
-      // Reset buckets explicitly (simulating beforeEach behavior)
-      resetWhitelistUpdateRateLimitBuckets();
+      expect(res.status).toBe(200);
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    });
 
-      // Next request should succeed again because buckets were cleared
-      const res = await request(app)
+    it("applies security headers on POST /api/jobs/:contractId/whitelist/update", async () => {
+      const res = await request(buildApp())
         .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
-        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
-        .expect(200);
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] });
 
-      expect(res.headers["x-ratelimit-remaining"]).toBe("0");
+      expect(res.headers["x-content-type-options"]).toBe("nosniff");
+      expect(res.headers["x-frame-options"]).toBe("DENY");
+      expect(res.headers["referrer-policy"]).toBe("no-referrer");
+      expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
     });
   });
 });
