@@ -142,11 +142,177 @@ const MIGRATIONS: Migration[] = [
   },
 ];
 
+// ---------------------------------------------------------------------------
+// Exponential backoff retry for schema manager (#258)
+// Retries transient SQLite / connection / timeout failures during migrations.
+// ---------------------------------------------------------------------------
+
+export interface SchemaRetryConfig {
+  /** Maximum number of retry attempts (default: 5) */
+  maxRetries: number;
+  /** Initial delay in ms after first failure (default: 50) */
+  initialBackoffMs: number;
+  /** Multiplier applied to backoff on each consecutive failure (default: 2) */
+  backoffMultiplier: number;
+  /** Ceiling delay in ms (default: 2000) */
+  maxBackoffMs: number;
+}
+
+const DEFAULT_SCHEMA_RETRY_CONFIG: SchemaRetryConfig = {
+  maxRetries: 5,
+  initialBackoffMs: 50,
+  backoffMultiplier: 2,
+  maxBackoffMs: 2000,
+};
+
+/** Retryable patterns for SQLite locks and connection/RPC-style timeouts. */
+const SCHEMA_RETRYABLE_PATTERNS = [
+  "timeout",
+  "SQLITE_BUSY",
+  "SQLITE_LOCKED",
+  "database is locked",
+  "database is busy",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "connect timeout",
+  "connection reset",
+  "connection refused",
+  "connection dropped",
+  "RPC connection",
+];
+
+export function isSchemaRetryableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  return SCHEMA_RETRYABLE_PATTERNS.some((p) =>
+    msg.toLowerCase().includes(p.toLowerCase()),
+  );
+}
+
+/**
+ * Compute the backoff delay for a given attempt number.
+ * attempt 0 → initialBackoffMs
+ * attempt 1 → initialBackoffMs * multiplier
+ * etc., capped at maxBackoffMs.
+ */
+export function computeSchemaBackoffMs(
+  attempt: number,
+  config: Pick<
+    SchemaRetryConfig,
+    "initialBackoffMs" | "backoffMultiplier" | "maxBackoffMs"
+  >,
+): number {
+  return Math.min(
+    config.initialBackoffMs * Math.pow(config.backoffMultiplier, attempt),
+    config.maxBackoffMs,
+  );
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a synchronous schema operation with exponential backoff retry.
+ * Used by runMigrations so existing sync callers stay unchanged.
+ */
+export function withSchemaRetrySync<T>(
+  fn: () => T,
+  config: Partial<SchemaRetryConfig> = {},
+  context: string = "sqlite_schema_manager",
+): T {
+  const cfg = { ...DEFAULT_SCHEMA_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isSchemaRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeSchemaBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      sleepSync(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
+/**
+ * Async variant of schema retry for callers that prefer Promise-based backoff
+ * (e.g. unit tests asserting increasing delays without blocking the event loop).
+ */
+export async function withSchemaRetry<T>(
+  fn: () => Promise<T> | T,
+  config: Partial<SchemaRetryConfig> = {},
+  context: string = "sqlite_schema_manager",
+): Promise<T> {
+  const cfg = { ...DEFAULT_SCHEMA_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isSchemaRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeSchemaBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      await sleep(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
 /**
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
+ *
+ * Transient SQLite/RPC-style connection failures (locked DB, timeouts,
+ * connection dropouts) are retried with exponential backoff (#258).
  */
-export function runMigrations(): void {
+export function runMigrations(
+  retryConfig: Partial<SchemaRetryConfig> = {},
+): void {
+  withSchemaRetrySync(
+    () => {
+      applyPendingMigrations();
+    },
+    retryConfig,
+    "sqlite_schema_manager.runMigrations",
+  );
+}
+
+function applyPendingMigrations(): void {
   const database = getDb();
 
   // Bootstrap: create the migrations tracking table if it doesn't exist yet
