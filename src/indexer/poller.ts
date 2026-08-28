@@ -62,8 +62,11 @@ const EVENT_TYPES = [
  * All events fetched in a single poll are written atomically together with the
  * ledger pointer update (#84) – so a mid-poll crash cannot advance the pointer
  * without committing the accompanying events.
+ *
+ * Returns whether the ledger actually advanced, so startPoller() can throttle
+ * its polling frequency up or down based on ledger processing load (#274).
  */
-export async function pollEvents() {
+export async function pollEvents(): Promise<boolean> {
   // --- Resolve active contract IDs from the DB (#85) ---
   let contractIds: string[] = getActiveContractIds();
 
@@ -76,7 +79,7 @@ export async function pollEvents() {
 
   if (contractIds.length === 0) {
     logger.debug("No CONTRACT_IDs configured – skipping indexer poll");
-    return;
+    return false;
   }
 
   // --- Diagnostics: stall detection before polling (#270, #271) ---
@@ -99,6 +102,10 @@ export async function pollEvents() {
   const pollStart = performance.now();
 
   try {
+    // Validate the schema before matching events against EVENT_TYPES – a stale
+    // schema must not silently pass through the topic filter (#282).
+    verifySchemaUpToDate();
+
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
     if (currentLedger <= lastLedger) {
@@ -168,6 +175,8 @@ export async function pollEvents() {
         error: err instanceof Error ? err.message : String(err),
       })
     );
+
+    return true;
   } catch (err) {
     const totalElapsed = performance.now() - pollStart;
     consecutiveFailures += 1;
