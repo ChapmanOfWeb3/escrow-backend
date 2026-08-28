@@ -132,65 +132,82 @@ const MIGRATIONS: Migration[] = [
         ON webhook_subscriptions (contract_id);
     `,
   },
+  {
+    version: 4,
+    description: "add ledger_range_tracker GROUP BY index (#295)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_event_type
+        ON events (ledger_sequence, event_type);
+    `,
+  },
 ];
 
 /**
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
+ *
+ * The entire operation (bootstrap + migration loop) runs inside an outer
+ * transaction so that *any* failure mid-operation triggers a full ROLLBACK
+ * and no partial schema / migration state ever persists on disk (#186).
  */
 export function runMigrations(): void {
   const database = getDb();
 
-  // Bootstrap: create the migrations tracking table if it doesn't exist yet
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      description TEXT NOT NULL,
-      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+  const runAll = database.transaction(() => {
+    // Bootstrap: create the migrations tracking table if it doesn't exist yet
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        description TEXT NOT NULL,
+        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
 
-    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      contract_id TEXT NOT NULL,
-      webhook_url TEXT NOT NULL,
-      event_types TEXT NOT NULL DEFAULT '*',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(contract_id, webhook_url)
-    );
-  `);
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contract_id TEXT NOT NULL,
+        webhook_url TEXT NOT NULL,
+        event_types TEXT NOT NULL DEFAULT '*',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(contract_id, webhook_url)
+      );
 
-  for (const migration of MIGRATIONS) {
-    const applied = database
-      .prepare("SELECT version FROM schema_migrations WHERE version = ?")
-      .get(migration.version);
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL UNIQUE,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
-    if (applied) continue;
+    for (const migration of MIGRATIONS) {
+      const applied = database
+        .prepare("SELECT version FROM schema_migrations WHERE version = ?")
+        .get(migration.version);
 
-    logger.info("Applying DB migration", {
-      version: migration.version,
-      description: migration.description,
-    });
+      if (applied) continue;
 
-    // Run migration inside a transaction – rolls back fully on any error
-    const applyMigration = database.transaction(() => {
+      logger.info("Applying DB migration", {
+        version: migration.version,
+        description: migration.description,
+      });
+
       database.exec(migration.up);
       database
         .prepare(
           "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
         )
         .run(migration.version, migration.description);
-    });
 
-    try {
-      applyMigration();
       logger.info("Migration applied", { version: migration.version });
-    } catch (err) {
-      logger.error("Migration failed – rolled back", {
-        version: migration.version,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
     }
+  });
+
+  try {
+    runAll();
+  } catch (err) {
+    logger.error("Schema migration failed – full rollback executed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   }
 }
 
@@ -200,6 +217,45 @@ export function runMigrations(): void {
  */
 export function initSchema() {
   runMigrations();
+}
+
+/**
+ * Verifies every migration in MIGRATIONS is recorded as applied in
+ * schema_migrations. Throws if the table is missing or a version hasn't
+ * been applied yet, so callers can fail fast on a stale/out-of-sync
+ * database instead of hitting confusing SQL errors later (#282).
+ */
+export function verifySchemaUpToDate(): void {
+  const database = getDb();
+
+  const migrationsTable = database
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    )
+    .get();
+
+  if (!migrationsTable) {
+    throw new Error(
+      "Database schema is out of sync: schema_migrations table not found. Run runMigrations() first."
+    );
+  }
+
+  const appliedVersions = new Set(
+    (
+      database.prepare("SELECT version FROM schema_migrations").all() as Array<{
+        version: number;
+      }>
+    ).map((row) => row.version)
+  );
+
+  const missing = MIGRATIONS.filter((m) => !appliedVersions.has(m.version));
+  if (missing.length > 0) {
+    throw new Error(
+      `Database schema is out of sync: missing migrations ${missing
+        .map((m) => `${m.version} (${m.description})`)
+        .join(", ")}. Run runMigrations() first.`
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
