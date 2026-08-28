@@ -5,6 +5,19 @@ import logger from "../utils/logger.js";
 // SQLite vacuum cleaner (#193)
 // ---------------------------------------------------------------------------
 //
+// Extended features:
+//   - Dynamic polling frequency (Issue 1): adjustVacuumPollingInterval()
+//     increases wait delays when the database is idle (no rows pruned),
+//     backing off up to MAX_VACUUM_POLL_INTERVAL_MS.
+//
+//   - Dynamic ledger range imports (Issue 3): pruneEventsInLedgerRange()
+//     accepts custom start/end ledger values so callers can import and prune
+//     arbitrary historical windows.
+//
+//   - Schema migration check utilities (Issue 4): validateVacuumSchema()
+//     verifies the required tables/columns exist before the cleaner starts,
+//     failing fast when the database state is out of sync.
+//
 // This module prunes stale rows from the `events` table and reclaims the
 // disk space they occupied.
 //
@@ -154,4 +167,279 @@ export function runVacuumCleanup(
   logger.info("Completed sqlite vacuum cleanup", { prunedEvents });
 
   return { prunedEvents, vacuumed: true };
+}
+
+// ---------------------------------------------------------------------------
+// Issue 1: Dynamic polling frequency intervals
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_VACUUM_POLL_INTERVAL_MS = parseInt(
+  process.env.VACUUM_POLL_INTERVAL_MS || "3600000", // 1 hour
+  10,
+);
+export const MIN_VACUUM_POLL_INTERVAL_MS = parseInt(
+  process.env.VACUUM_MIN_POLL_INTERVAL_MS || "300000", // 5 minutes
+  10,
+);
+export const MAX_VACUUM_POLL_INTERVAL_MS = parseInt(
+  process.env.VACUUM_MAX_POLL_INTERVAL_MS || "86400000", // 24 hours
+  10,
+);
+/** Multiplier applied to the interval each idle cycle (no rows pruned). */
+export const VACUUM_IDLE_BACKOFF_FACTOR = 2;
+/** Consecutive idle cycles required before backing off. */
+export const VACUUM_IDLE_THRESHOLD_CYCLES = 2;
+
+export interface VacuumPollingState {
+  currentIntervalMs: number;
+  idleCycles: number;
+  lastAdjustedAt: number;
+}
+
+let vacuumPollingState: VacuumPollingState = {
+  currentIntervalMs: DEFAULT_VACUUM_POLL_INTERVAL_MS,
+  idleCycles: 0,
+  lastAdjustedAt: Date.now(),
+};
+
+/** Returns a read-only snapshot of the current vacuum polling state. */
+export function getVacuumPollingState(): VacuumPollingState {
+  return { ...vacuumPollingState };
+}
+
+/** Resets polling state to defaults. Useful for tests. */
+export function resetVacuumPollingState(): void {
+  vacuumPollingState = {
+    currentIntervalMs: DEFAULT_VACUUM_POLL_INTERVAL_MS,
+    idleCycles: 0,
+    lastAdjustedAt: Date.now(),
+  };
+}
+
+/**
+ * Adjusts the vacuum polling interval based on how many rows were pruned in
+ * the last cycle.
+ *
+ * - If `prunedRows === 0` for at least VACUUM_IDLE_THRESHOLD_CYCLES
+ *   consecutive cycles, the interval doubles (up to MAX_VACUUM_POLL_INTERVAL_MS).
+ * - If rows were pruned (the DB is active), the interval is reset to its
+ *   minimum so the cleaner stays responsive.
+ *
+ * @param prunedRows - Number of rows deleted in the most recent vacuum cycle.
+ * @returns Updated polling state snapshot.
+ */
+export function adjustVacuumPollingInterval(
+  prunedRows: number,
+): VacuumPollingState {
+  const state = vacuumPollingState;
+
+  if (prunedRows === 0) {
+    state.idleCycles += 1;
+    if (state.idleCycles >= VACUUM_IDLE_THRESHOLD_CYCLES) {
+      state.currentIntervalMs = Math.min(
+        state.currentIntervalMs * VACUUM_IDLE_BACKOFF_FACTOR,
+        MAX_VACUUM_POLL_INTERVAL_MS,
+      );
+    }
+  } else {
+    // Active pruning — shrink back to minimum so we stay on top of growth.
+    state.idleCycles = 0;
+    state.currentIntervalMs = MIN_VACUUM_POLL_INTERVAL_MS;
+  }
+
+  state.lastAdjustedAt = Date.now();
+  return { ...state };
+}
+
+// ---------------------------------------------------------------------------
+// Issue 3: Dynamic start/end ledger range support
+// ---------------------------------------------------------------------------
+
+export interface LedgerRangePruneOptions {
+  /** Inclusive lower bound of the ledger range to prune. */
+  startLedger: number;
+  /** Inclusive upper bound of the ledger range to prune. */
+  endLedger: number;
+}
+
+export interface LedgerRangePruneResult {
+  prunedEvents: number;
+  startLedger: number;
+  endLedger: number;
+}
+
+export const LEDGER_RANGE_ERROR_CODES = {
+  INVALID_LEDGER_RANGE: "VACUUM_INVALID_LEDGER_RANGE",
+} as const;
+
+/**
+ * Validates a ledger range.  Both values must be non-negative integers and
+ * startLedger must be ≤ endLedger.
+ */
+export function validateLedgerRange(
+  startLedger: number,
+  endLedger: number,
+):
+  | { ok: true }
+  | { ok: false; error: string; code: "VACUUM_INVALID_LEDGER_RANGE" } {
+  if (
+    typeof startLedger !== "number" ||
+    !Number.isInteger(startLedger) ||
+    startLedger < 0
+  ) {
+    return {
+      ok: false,
+      error: `startLedger must be a non-negative integer, got: ${startLedger}`,
+      code: LEDGER_RANGE_ERROR_CODES.INVALID_LEDGER_RANGE,
+    };
+  }
+  if (
+    typeof endLedger !== "number" ||
+    !Number.isInteger(endLedger) ||
+    endLedger < 0
+  ) {
+    return {
+      ok: false,
+      error: `endLedger must be a non-negative integer, got: ${endLedger}`,
+      code: LEDGER_RANGE_ERROR_CODES.INVALID_LEDGER_RANGE,
+    };
+  }
+  if (startLedger > endLedger) {
+    return {
+      ok: false,
+      error: `startLedger (${startLedger}) must be ≤ endLedger (${endLedger})`,
+      code: LEDGER_RANGE_ERROR_CODES.INVALID_LEDGER_RANGE,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Deletes events whose `ledger_sequence` falls within [startLedger, endLedger]
+ * (both inclusive).  Runs inside a transaction for atomicity — if anything
+ * fails the deletion rolls back and no rows are partially removed.
+ *
+ * Returns the number of rows deleted.
+ */
+export function pruneEventsInLedgerRange(
+  db: Database.Database,
+  options: LedgerRangePruneOptions,
+): LedgerRangePruneResult {
+  const { startLedger, endLedger } = options;
+
+  const validation = validateLedgerRange(startLedger, endLedger);
+  if (!validation.ok) {
+    throw new Error(validation.error);
+  }
+
+  const deleteStmt = db.prepare(
+    `DELETE FROM events WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+  );
+
+  const tx = db.transaction(() => {
+    const result = deleteStmt.run(startLedger, endLedger);
+    return result.changes;
+  });
+
+  const prunedEvents = tx() as number;
+
+  logger.info("Pruned events in ledger range", {
+    startLedger,
+    endLedger,
+    prunedEvents,
+  });
+
+  return { prunedEvents, startLedger, endLedger };
+}
+
+// ---------------------------------------------------------------------------
+// Issue 4: Schema migration check utilities
+// ---------------------------------------------------------------------------
+
+export interface VacuumSchemaValidationResult {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  errors: string[];
+}
+
+/**
+ * Tables and columns that the vacuum cleaner requires to operate correctly.
+ */
+const VACUUM_REQUIRED_SCHEMA: Record<string, string[]> = {
+  events: [
+    "id",
+    "contract_id",
+    "event_type",
+    "ledger_sequence",
+    "timestamp",
+    "data_json",
+    "created_at",
+  ],
+  schema_migrations: ["version", "description", "applied_at"],
+};
+
+/**
+ * Validates that the database schema contains all tables and columns needed
+ * by the vacuum cleaner.  Does NOT run migrations — it only checks.
+ *
+ * Returns a detailed result so callers can surface specific problems.
+ */
+export function validateVacuumSchema(
+  db: Database.Database,
+): VacuumSchemaValidationResult {
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const errors: string[] = [];
+
+  for (const [tableName, requiredCols] of Object.entries(
+    VACUUM_REQUIRED_SCHEMA,
+  )) {
+    const tableRow = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+      )
+      .get(tableName);
+
+    if (!tableRow) {
+      missingTables.push(tableName);
+      continue;
+    }
+
+    const columns = db
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all() as Array<{ name: string }>;
+    const columnNames = new Set(columns.map((c) => c.name));
+
+    const missing = requiredCols.filter((col) => !columnNames.has(col));
+    if (missing.length > 0) {
+      missingColumns[tableName] = missing;
+    }
+  }
+
+  const valid =
+    missingTables.length === 0 && Object.keys(missingColumns).length === 0;
+
+  return { valid, missingTables, missingColumns, errors };
+}
+
+/**
+ * Throws if the database schema is not ready for the vacuum cleaner.
+ * Call this at startup before scheduling any vacuum runs so the process
+ * fails fast with a clear message rather than hitting obscure SQL errors.
+ */
+export function assertVacuumSchemaValid(db: Database.Database): void {
+  const result = validateVacuumSchema(db);
+  if (!result.valid) {
+    const reasons = [
+      ...result.missingTables.map((t) => `missing table: ${t}`),
+      ...Object.entries(result.missingColumns).map(
+        ([t, cols]) => `missing columns in ${t}: ${cols.join(", ")}`,
+      ),
+      ...result.errors,
+    ];
+    throw new Error(
+      `Vacuum cleaner cannot start — database schema is out of sync: ${reasons.join("; ")}`,
+    );
+  }
 }
