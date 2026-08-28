@@ -297,8 +297,9 @@ export async function withSchemaRetry<T>(
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
  *
- * Transient SQLite/RPC-style connection failures (locked DB, timeouts,
- * connection dropouts) are retried with exponential backoff (#258).
+ * The entire operation (bootstrap + migration loop) runs inside an outer
+ * transaction so that *any* failure mid-operation triggers a full ROLLBACK
+ * and no partial schema / migration state ever persists on disk (#186).
  */
 export function runMigrations(
   retryConfig: Partial<SchemaRetryConfig> = {},
@@ -315,62 +316,61 @@ export function runMigrations(
 function applyPendingMigrations(): void {
   const database = getDb();
 
-  // Bootstrap: create the migrations tracking table if it doesn't exist yet
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      description TEXT NOT NULL,
-      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+  const runAll = database.transaction(() => {
+    // Bootstrap: create the migrations tracking table if it doesn't exist yet
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        description TEXT NOT NULL,
+        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
 
-    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      contract_id TEXT NOT NULL,
-      webhook_url TEXT NOT NULL,
-      event_types TEXT NOT NULL DEFAULT '*',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(contract_id, webhook_url)
-    );
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contract_id TEXT NOT NULL,
+        webhook_url TEXT NOT NULL,
+        event_types TEXT NOT NULL DEFAULT '*',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(contract_id, webhook_url)
+      );
 
-    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      url TEXT NOT NULL UNIQUE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL UNIQUE,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
-  for (const migration of MIGRATIONS) {
-    const applied = database
-      .prepare("SELECT version FROM schema_migrations WHERE version = ?")
-      .get(migration.version);
+    for (const migration of MIGRATIONS) {
+      const applied = database
+        .prepare("SELECT version FROM schema_migrations WHERE version = ?")
+        .get(migration.version);
 
-    if (applied) continue;
+      if (applied) continue;
 
-    logger.info("Applying DB migration", {
-      version: migration.version,
-      description: migration.description,
-    });
+      logger.info("Applying DB migration", {
+        version: migration.version,
+        description: migration.description,
+      });
 
-    // Run migration inside a transaction – rolls back fully on any error
-    const applyMigration = database.transaction(() => {
       database.exec(migration.up);
       database
         .prepare(
           "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
         )
         .run(migration.version, migration.description);
-    });
 
-    try {
-      applyMigration();
       logger.info("Migration applied", { version: migration.version });
-    } catch (err) {
-      logger.error("Migration failed – rolled back", {
-        version: migration.version,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
     }
+  });
+
+  try {
+    runAll();
+  } catch (err) {
+    logger.error("Schema migration failed – full rollback executed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   }
 }
 
