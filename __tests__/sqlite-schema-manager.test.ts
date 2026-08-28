@@ -7,6 +7,10 @@ import {
   withSchemaRetry,
   withSchemaRetrySync,
   isSchemaRetryableError,
+  insertEventBatch,
+  logSchemaManagerPollDiagnostics,
+  SCHEMA_MANAGER_INDEXES,
+  type EventRow,
 } from "../src/indexer/db.js";
 import { jest } from "@jest/globals";
 import logger from "../src/utils/logger.js";
@@ -337,7 +341,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         const versions = (cleanDb
           .prepare("SELECT version FROM schema_migrations ORDER BY version")
           .all() as Array<{ version: number }>).map((r) => r.version);
-        expect(versions).toEqual([1, 2, 3]);
+        expect(versions).toEqual([1, 2, 3, 4, 5]);
 
         const ledger = cleanDb
           .prepare("SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'")
@@ -490,12 +494,15 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
         expect(result).toBe("recovered");
         expect(calls).toBe(3);
 
-        const retryWarns = warnSpy.mock.calls.filter(
+        const warnCalls = warnSpy.mock.calls as unknown as Array<
+          [string, { backoffMs: number }]
+        >;
+        const retryWarns = warnCalls.filter(
           ([msg]) => msg === "schema_test failed, retrying",
         );
         expect(retryWarns.length).toBe(2);
         for (const [, meta] of retryWarns) {
-          delays.push((meta as { backoffMs: number }).backoffMs);
+          delays.push(meta.backoffMs);
         }
         expect(delays[0]).toBe(10);
         expect(delays[1]).toBe(20);
@@ -563,6 +570,85 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
       } finally {
         db.close();
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #261 – Poll diagnostics logging (poll speed + payload size)
+// ---------------------------------------------------------------------------
+
+describe("SQLite Schema Manager – poll diagnostics logging (#261)", () => {
+  describe("logSchemaManagerPollDiagnostics", () => {
+    it("logs a debug diagnostic string containing elapsed time and payload size", () => {
+      const debugSpy = jest.spyOn(logger, "debug").mockImplementation(() => logger);
+
+      const startedAt = Date.now() - 42;
+      logSchemaManagerPollDiagnostics("testOperation", startedAt, 2048);
+
+      expect(debugSpy).toHaveBeenCalledTimes(1);
+      const [message, meta] = debugSpy.mock.calls[0] as unknown as [
+        string,
+        { operation: string; elapsedMs: number; payloadSizeBytes: number },
+      ];
+      expect(message).toEqual(expect.stringContaining("elapsedMs="));
+      expect(message).toEqual(expect.stringContaining("payloadSizeBytes=2048"));
+      expect(message).toEqual(expect.stringContaining("operation=testOperation"));
+      expect(meta).toMatchObject({
+        operation: "testOperation",
+        payloadSizeBytes: 2048,
+      });
+      expect((meta as { elapsedMs: number }).elapsedMs).toBeGreaterThanOrEqual(0);
+
+      debugSpy.mockRestore();
+    });
+  });
+
+  describe("insertEventBatch diagnostics", () => {
+    let testDb: Database.Database;
+
+    beforeEach(() => {
+      testDb = new Database(":memory:");
+      setDb(testDb);
+      runMigrations();
+    });
+
+    afterEach(() => {
+      testDb.close();
+    });
+
+    it("emits poll diagnostics with elapsed time and payload size after a batch insert", () => {
+      const debugSpy = jest.spyOn(logger, "debug").mockImplementation(() => logger);
+
+      const events: EventRow[] = [
+        {
+          contractId: "C1",
+          eventType: "initialized",
+          ledgerSequence: 100,
+          timestamp: 1_700_000_000,
+          dataJson: "{}",
+        },
+      ];
+
+      insertEventBatch(events, 100);
+
+      const calls = debugSpy.mock.calls as unknown as Array<
+        [string, { operation: string; elapsedMs: number; payloadSizeBytes: number }]
+      >;
+      const diagnosticsCall = calls.find(([message]) =>
+        message.includes("sqlite_schema_manager poll diagnostics"),
+      );
+      expect(diagnosticsCall).toBeDefined();
+
+      const [message, meta] = diagnosticsCall!;
+      expect(message).toEqual(expect.stringContaining("operation=insertEventBatch"));
+      expect(message).toEqual(expect.stringContaining("elapsedMs="));
+      expect(message).toEqual(expect.stringContaining("payloadSizeBytes="));
+      expect(meta).toMatchObject({ operation: "insertEventBatch" });
+      expect((meta as { elapsedMs: number }).elapsedMs).toBeGreaterThanOrEqual(0);
+      expect((meta as { payloadSizeBytes: number }).payloadSizeBytes).toBeGreaterThan(0);
+
+      debugSpy.mockRestore();
     });
   });
 });
