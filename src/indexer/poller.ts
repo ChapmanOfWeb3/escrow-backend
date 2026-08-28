@@ -16,6 +16,10 @@ import {
   resolveHistoricalLedgerRange,
 } from "./ledger-range-tracker.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
+import {
+  logIndexerRunnerPollDiagnostics,
+  payloadSizeBytes,
+} from "./indexer_runner.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
@@ -107,6 +111,13 @@ export async function pollEvents(): Promise<boolean> {
 
   const pollStart = performance.now();
 
+  // --- High-frequency poll start diagnostics (#252) ---
+  logIndexerRunnerPollDiagnostics({
+    operation: "pollEvents",
+    status: "started",
+    elapsedMs: 0,
+  });
+
   try {
     // Validate the schema before matching events against EVENT_TYPES – a stale
     // schema must not silently pass through the topic filter (#282).
@@ -182,6 +193,16 @@ export async function pollEvents(): Promise<boolean> {
     if (currentLedger <= lastLedger) {
       // --- Dynamic throttling: idle cycle (#265) ---
       adjustPollerInterval(0);
+      const idleElapsed = Math.round(performance.now() - pollStart);
+      logIndexerRunnerPollDiagnostics({
+        operation: "pollEvents",
+        status: "success",
+        elapsedMs: idleElapsed,
+        eventCount: 0,
+        startLedger: lastLedger,
+        currentLedger,
+        payloadSizeBytes: 0,
+      });
       return false;
     }
 
@@ -203,11 +224,20 @@ export async function pollEvents(): Promise<boolean> {
     });
     const eventsElapsed = performance.now() - eventsStart;
 
-    // --- Diagnostics: payload size and timing (#270) ---
-    const payloadSizeBytes = JSON.stringify(events.events).length;
+    // --- Diagnostics: payload size and timing (#270, #252) ---
+    const sizeBytes = payloadSizeBytes(events.events);
     logger.debug("RPC getEvents diagnostics", {
       elapsedMs: Math.round(eventsElapsed),
-      payloadSizeBytes,
+      payloadSizeBytes: sizeBytes,
+      eventCount: events.events.length,
+      startLedger,
+      currentLedger,
+    });
+    logIndexerRunnerPollDiagnostics({
+      operation: "getEvents",
+      status: "success",
+      elapsedMs: Math.round(eventsElapsed),
+      payloadSizeBytes: sizeBytes,
       eventCount: events.events.length,
       startLedger,
       currentLedger,
@@ -227,17 +257,27 @@ export async function pollEvents(): Promise<boolean> {
     // Persist the batch and advance the ledger pointer atomically (#84)
     insertEventBatch(batch, currentLedger);
 
-    const totalElapsed = performance.now() - pollStart;
+    const totalElapsed = Math.round(performance.now() - pollStart);
     consecutiveFailures = 0;
     lastSuccessfulPollAt = Date.now();
 
     // --- Dynamic poller throttling (#265) ---
     const throttleState = adjustPollerInterval(events.events.length);
 
+    logIndexerRunnerPollDiagnostics({
+      operation: "pollEvents",
+      status: "success",
+      elapsedMs: totalElapsed,
+      payloadSizeBytes: sizeBytes,
+      eventCount: events.events.length,
+      startLedger,
+      currentLedger,
+    });
+
     logger.info("Processed indexer poll", {
       eventCount: events.events.length,
       upToLedger: currentLedger,
-      elapsedMs: Math.round(totalElapsed),
+      elapsedMs: totalElapsed,
       pollIntervalMs: throttleState.currentIntervalMs,
     });
 
@@ -249,13 +289,20 @@ export async function pollEvents(): Promise<boolean> {
 
     return true;
   } catch (err) {
-    const totalElapsed = performance.now() - pollStart;
+    const totalElapsed = Math.round(performance.now() - pollStart);
     consecutiveFailures += 1;
+
+    logIndexerRunnerPollDiagnostics({
+      operation: "pollEvents",
+      status: "failure",
+      elapsedMs: totalElapsed,
+      error: err instanceof Error ? err.message : String(err),
+    });
 
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),
       consecutiveFailures,
-      elapsedMs: Math.round(totalElapsed),
+      elapsedMs: totalElapsed,
     });
 
     // --- Alerting: warn when consecutive failures hit threshold (#271) ---
@@ -266,6 +313,7 @@ export async function pollEvents(): Promise<boolean> {
         lastSuccessAt: lastSuccessfulPollAt,
       });
     }
+
     return false;
   }
 }

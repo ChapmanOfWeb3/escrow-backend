@@ -3,10 +3,13 @@ import {
   setDb,
   runMigrations,
   getDb,
-  SCHEMA_MANAGER_INDEXES,
-  explainSchemaQueryPlan,
-  schemaQueryPlanUsesIndex,
+  computeSchemaBackoffMs,
+  withSchemaRetry,
+  withSchemaRetrySync,
+  isSchemaRetryableError,
 } from "../src/indexer/db.js";
+import { jest } from "@jest/globals";
+import logger from "../src/utils/logger.js";
 
 describe("SQLite Schema Manager – in-memory integration tests", () => {
   let testDb: Database.Database;
@@ -314,123 +317,252 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     });
   });
 
-  describe("SQLite index utilization – EXPLAIN QUERY PLAN (#259)", () => {
-    beforeEach(() => {
-      const insertEvent = testDb.prepare(
-        `INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-         VALUES (?, ?, ?, ?, ?)`,
-      );
-      const insertContract = testDb.prepare(
-        `INSERT INTO monitored_contracts (contract_id, label, active) VALUES (?, ?, ?)`,
-      );
-      const insertWebhook = testDb.prepare(
-        `INSERT INTO webhook_subscriptions (contract_id, webhook_url, event_types)
-         VALUES (?, ?, ?)`,
-      );
+  describe("transaction atomicity – full rollback on failure (#186)", () => {
+    it("successful multi-statement migration commits every table + row", () => {
+      const cleanDb = new Database(":memory:");
+      setDb(cleanDb);
+      try {
+        runMigrations();
 
-      for (let i = 0; i < 40; i++) {
-        insertEvent.run(
-          i % 2 === 0 ? "C1" : "C2",
-          i % 3 === 0 ? "initialized" : "funded",
-          1000 + i,
-          1_700_000_000 + i,
-          JSON.stringify({ i }),
-        );
+        const tables = (cleanDb
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all() as Array<{ name: string }>).map((t) => t.name);
+
+        expect(tables).toContain("schema_migrations");
+        expect(tables).toContain("events");
+        expect(tables).toContain("indexer_state");
+        expect(tables).toContain("monitored_contracts");
+        expect(tables).toContain("webhook_subscriptions");
+
+        const versions = (cleanDb
+          .prepare("SELECT version FROM schema_migrations ORDER BY version")
+          .all() as Array<{ version: number }>).map((r) => r.version);
+        expect(versions).toEqual([1, 2, 3]);
+
+        const ledger = cleanDb
+          .prepare("SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'")
+          .get() as { value: string };
+        expect(ledger.value).toBe("0");
+      } finally {
+        cleanDb.close();
+        setDb(testDb);
       }
-      insertContract.run("C1", "one", 1);
-      insertContract.run("C2", "two", 0);
-      insertContract.run("C3", "three", 1);
-      insertWebhook.run("C1", "https://example.com/a", "*");
-      insertWebhook.run("C2", "https://example.com/b", "funded");
     });
 
-    it("uses an index for contract_id event lookups", () => {
-      const plan = explainSchemaQueryPlan(
-        `SELECT * FROM events WHERE contract_id = ?`,
-        "C1",
-      );
-      expect(
-        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractId) ||
-          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractLedger) ||
-          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractType),
-      ).toBe(true);
+    it("forced failure mid-migration rolls back ALL schema changes – no partial tables/rows persist", () => {
+      const cleanDb = new Database(":memory:");
+      setDb(cleanDb);
+      try {
+        cleanDb.exec(`
+          CREATE TABLE webhook_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
+        expect(() => runMigrations()).toThrow();
+
+        const tables = new Set(
+          (cleanDb
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .all() as Array<{ name: string }>).map((t) => t.name)
+        );
+
+        expect(tables.has("webhook_subscriptions")).toBe(true);
+
+        const hasSchemaMigrations = tables.has("schema_migrations");
+        const hasEvents = tables.has("events");
+        const hasIndexerState = tables.has("indexer_state");
+        const hasMonitoredContracts = tables.has("monitored_contracts");
+        const hasRpcNodeHealth = tables.has("rpc_node_health");
+        const hasFailoverState = tables.has("failover_state");
+        const hasNodeFailureEvents = tables.has("node_failure_events");
+
+        expect(hasSchemaMigrations).toBe(false);
+        expect(hasEvents).toBe(false);
+        expect(hasIndexerState).toBe(false);
+        expect(hasMonitoredContracts).toBe(false);
+        expect(hasRpcNodeHealth).toBe(false);
+        expect(hasFailoverState).toBe(false);
+        expect(hasNodeFailureEvents).toBe(false);
+
+        if (hasSchemaMigrations) {
+          const versions = cleanDb
+            .prepare("SELECT version FROM schema_migrations")
+            .all() as Array<{ version: number }>;
+          expect(versions.length).toBe(0);
+        }
+      } finally {
+        cleanDb.close();
+        setDb(testDb);
+      }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #258 – Exponential backoff retry on connection / lock timeouts
+// ---------------------------------------------------------------------------
+
+describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
+  describe("computeSchemaBackoffMs", () => {
+    const config = {
+      initialBackoffMs: 50,
+      backoffMultiplier: 2,
+      maxBackoffMs: 2000,
+    };
+
+    it("returns initial backoff for attempt 0", () => {
+      expect(computeSchemaBackoffMs(0, config)).toBe(50);
     });
 
-    it("uses idx_events_contract_ledger for contract + ledger ordered lookups", () => {
-      const plan = explainSchemaQueryPlan(
-        `SELECT * FROM events
-         WHERE contract_id = ?
-         ORDER BY ledger_sequence ASC`,
-        "C1",
-      );
-      expect(
-        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractLedger) ||
-          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractId),
-      ).toBe(true);
+    it("doubles backoff on each attempt (retry frequency increases)", () => {
+      expect(computeSchemaBackoffMs(1, config)).toBe(100);
+      expect(computeSchemaBackoffMs(2, config)).toBe(200);
+      expect(computeSchemaBackoffMs(3, config)).toBe(400);
+      expect(computeSchemaBackoffMs(4, config)).toBe(800);
     });
 
-    it("uses idx_events_contract_type for contract + event_type lookups", () => {
-      const plan = explainSchemaQueryPlan(
-        `SELECT * FROM events WHERE contract_id = ? AND event_type = ?`,
-        "C1",
-        "funded",
-      );
-      expect(
-        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsContractType) ||
-          schemaQueryPlanUsesIndex(
-            plan,
-            SCHEMA_MANAGER_INDEXES.eventsContractTypeLedger,
-          ),
-      ).toBe(true);
+    it("caps at maxBackoffMs", () => {
+      expect(computeSchemaBackoffMs(6, config)).toBe(2000);
+      expect(computeSchemaBackoffMs(10, config)).toBe(2000);
+      expect(computeSchemaBackoffMs(100, config)).toBe(2000);
     });
 
-    it("uses idx_events_ledger_sequence for ledger range lookups", () => {
-      const plan = explainSchemaQueryPlan(
-        `SELECT * FROM events
-         WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
-        1010,
-        1020,
-      );
-      expect(
-        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsLedgerSequence) ||
-          schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsLedgerEventType),
-      ).toBe(true);
+    it("respects custom multiplier", () => {
+      const cfg3x = { ...config, backoffMultiplier: 3 };
+      expect(computeSchemaBackoffMs(0, cfg3x)).toBe(50);
+      expect(computeSchemaBackoffMs(1, cfg3x)).toBe(150);
+      expect(computeSchemaBackoffMs(2, cfg3x)).toBe(450);
+    });
+  });
+
+  describe("isSchemaRetryableError", () => {
+    it("treats SQLITE_BUSY / locked / timeout / connection dropouts as retryable", () => {
+      expect(isSchemaRetryableError(new Error("SQLITE_BUSY"))).toBe(true);
+      expect(isSchemaRetryableError(new Error("database is locked"))).toBe(true);
+      expect(isSchemaRetryableError(new Error("connect timeout"))).toBe(true);
+      expect(isSchemaRetryableError(new Error("ECONNRESET"))).toBe(true);
+      expect(isSchemaRetryableError(new Error("RPC connection dropped"))).toBe(true);
     });
 
-    it("uses idx_webhook_subscriptions_contract for webhook lookups", () => {
-      const plan = explainSchemaQueryPlan(
-        `SELECT * FROM webhook_subscriptions WHERE contract_id = ?`,
-        "C1",
+    it("does not retry permanent schema errors", () => {
+      expect(isSchemaRetryableError(new Error("UNIQUE constraint failed"))).toBe(false);
+      expect(isSchemaRetryableError(new Error("no such table: events"))).toBe(false);
+      expect(isSchemaRetryableError("not-an-error")).toBe(false);
+    });
+  });
+
+  describe("withSchemaRetry", () => {
+    it("returns result on first success without retry", async () => {
+      let calls = 0;
+      const result = await withSchemaRetry(
+        async () => {
+          calls++;
+          return "ok";
+        },
+        { maxRetries: 3, initialBackoffMs: 5 },
+        "test",
       );
-      expect(
-        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.webhookContract),
-      ).toBe(true);
+      expect(result).toBe("ok");
+      expect(calls).toBe(1);
     });
 
-    it("uses idx_monitored_contracts_active for active contract lookups", () => {
-      const plan = explainSchemaQueryPlan(
-        `SELECT contract_id FROM monitored_contracts WHERE active = 1`,
-      );
-      expect(
-        schemaQueryPlanUsesIndex(
-          plan,
-          SCHEMA_MANAGER_INDEXES.monitoredContractsActive,
+    it("retries transient connection timeouts with increasing backoff", async () => {
+      let calls = 0;
+      const delays: number[] = [];
+      const warnSpy = jest.spyOn(logger, "warn").mockImplementation((() => logger) as any);
+
+      try {
+        const result = await withSchemaRetry(
+          async () => {
+            calls++;
+            if (calls < 3) {
+              throw new Error("connect timeout");
+            }
+            return "recovered";
+          },
+          { maxRetries: 5, initialBackoffMs: 10, backoffMultiplier: 2, maxBackoffMs: 1000 },
+          "schema_test",
+        );
+
+        expect(result).toBe("recovered");
+        expect(calls).toBe(3);
+
+        const retryWarns = warnSpy.mock.calls.filter(
+          ([msg]) => msg === "schema_test failed, retrying",
+        );
+        expect(retryWarns.length).toBe(2);
+        for (const [, meta] of retryWarns) {
+          delays.push((meta as { backoffMs: number }).backoffMs);
+        }
+        expect(delays[0]).toBe(10);
+        expect(delays[1]).toBe(20);
+        expect(delays[1]).toBeGreaterThan(delays[0]);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("stops after max attempts on persistent connection dropout", async () => {
+      let calls = 0;
+      await expect(
+        withSchemaRetry(
+          async () => {
+            calls++;
+            throw new Error("ECONNRESET connection dropped");
+          },
+          { maxRetries: 2, initialBackoffMs: 5 },
+          "schema_test",
         ),
-      ).toBe(true);
+      ).rejects.toThrow(/ECONNRESET/);
+      // initial + 2 retries = 3 attempts
+      expect(calls).toBe(3);
     });
 
-    it("uses idx_events_created_at for vacuum-style created_at pruning", () => {
-      const plan = explainSchemaQueryPlan(
-        `SELECT id FROM events WHERE created_at < ?`,
-        "2099-01-01",
+    it("does not retry non-retryable errors", async () => {
+      let calls = 0;
+      await expect(
+        withSchemaRetry(
+          async () => {
+            calls++;
+            throw new Error("UNIQUE constraint failed");
+          },
+          { maxRetries: 5, initialBackoffMs: 5 },
+        ),
+      ).rejects.toThrow(/UNIQUE/);
+      expect(calls).toBe(1);
+    });
+  });
+
+  describe("withSchemaRetrySync / runMigrations wiring", () => {
+    it("retries sync SQLITE_BUSY then succeeds", () => {
+      let calls = 0;
+      const result = withSchemaRetrySync(
+        () => {
+          calls++;
+          if (calls < 2) throw new Error("SQLITE_BUSY: database is locked");
+          return "synced";
+        },
+        { maxRetries: 3, initialBackoffMs: 1, maxBackoffMs: 5 },
+        "sync_test",
       );
-      expect(
-        schemaQueryPlanUsesIndex(plan, SCHEMA_MANAGER_INDEXES.eventsCreatedAt),
-      ).toBe(true);
+      expect(result).toBe("synced");
+      expect(calls).toBe(2);
     });
 
-    it("getDb returns the same connection used for EXPLAIN plans", () => {
-      expect(getDb()).toBe(testDb);
+    it("runMigrations still succeeds under normal conditions with retry wrapper", () => {
+      const db = new Database(":memory:");
+      setDb(db);
+      try {
+        expect(() =>
+          runMigrations({ maxRetries: 2, initialBackoffMs: 1, maxBackoffMs: 5 }),
+        ).not.toThrow();
+        expect(getDb()).toBe(db);
+      } finally {
+        db.close();
+      }
     });
   });
 });

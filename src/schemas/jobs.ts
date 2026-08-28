@@ -162,11 +162,14 @@ export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
 }).strict();
 
-/** POST /:contractId/whitelist/update body (#246, #248) */
+/**
+ * POST /:contractId/whitelist/update body.
+ * Builds an unsigned tx to add or remove a token from the contract whitelist.
+ */
 export const whitelistUpdateBodySchema = z
   .object({
     token: z
-      .string({ required_error: "token is required" })
+      .string({ required_error: "token is required", invalid_type_error: "token must be a string" })
       .refine(isValidStellarContractId, {
         message: "token must be a valid Stellar contract address (C...)",
       }),
