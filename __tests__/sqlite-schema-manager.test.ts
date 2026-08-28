@@ -7,6 +7,12 @@ import {
   withSchemaRetry,
   withSchemaRetrySync,
   isSchemaRetryableError,
+  validateHistoricalRange,
+  insertHistoricalEventBatch,
+  getHistoricalEventCounts,
+  getLastIndexedLedger,
+  HistoricalRangeError,
+  type EventRow,
 } from "../src/indexer/db.js";
 import { jest } from "@jest/globals";
 import logger from "../src/utils/logger.js";
@@ -563,6 +569,168 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
       } finally {
         db.close();
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #263 – Dynamic historical sync ranges for custom event imports
+// ---------------------------------------------------------------------------
+
+describe("SQLite Schema Manager – dynamic historical sync ranges (#263)", () => {
+  let testDb: Database.Database;
+
+  beforeEach(() => {
+    testDb = new Database(":memory:");
+    setDb(testDb);
+    runMigrations();
+  });
+
+  afterEach(() => {
+    testDb.close();
+  });
+
+  const event = (
+    contractId: string,
+    eventType: string,
+    ledgerSequence: number,
+  ): EventRow => ({
+    contractId,
+    eventType,
+    ledgerSequence,
+    timestamp: 1_700_000_000 + ledgerSequence,
+    dataJson: "{}",
+  });
+
+  describe("validateHistoricalRange", () => {
+    it("returns the range when start and end are valid positive integers", () => {
+      expect(validateHistoricalRange(100, 200)).toEqual({
+        startLedger: 100,
+        endLedger: 200,
+      });
+    });
+
+    it("allows start === end (single-ledger range)", () => {
+      expect(validateHistoricalRange(50, 50)).toEqual({
+        startLedger: 50,
+        endLedger: 50,
+      });
+    });
+
+    it("rejects a non-integer start ledger", () => {
+      expect(() => validateHistoricalRange(1.5, 200)).toThrow(HistoricalRangeError);
+    });
+
+    it("rejects a start ledger below 1", () => {
+      expect(() => validateHistoricalRange(0, 200)).toThrow(HistoricalRangeError);
+    });
+
+    it("rejects a non-numeric end ledger", () => {
+      expect(() => validateHistoricalRange(100, "200")).toThrow(HistoricalRangeError);
+    });
+
+    it("rejects start > end", () => {
+      expect(() => validateHistoricalRange(300, 200)).toThrow(HistoricalRangeError);
+    });
+  });
+
+  describe("insertHistoricalEventBatch", () => {
+    it("imports events within the declared range without advancing the live pointer", () => {
+      const result = insertHistoricalEventBatch(
+        [event("C1", "initialized", 100), event("C1", "funded", 150)],
+        { startLedger: 100, endLedger: 200 },
+      );
+
+      expect(result.inserted).toBe(2);
+      expect(result.range).toEqual({ startLedger: 100, endLedger: 200 });
+      expect(getLastIndexedLedger()).toBe(0);
+
+      const counts = getHistoricalEventCounts(100, 200);
+      expect(counts.totalEvents).toBe(2);
+      expect(counts.eventsByType).toEqual({ initialized: 1, funded: 1 });
+    });
+
+    it("advances the live pointer only when advanceLivePointer is requested", () => {
+      insertHistoricalEventBatch(
+        [event("C1", "initialized", 100)],
+        { startLedger: 100, endLedger: 200 },
+        { advanceLivePointer: true },
+      );
+
+      expect(getLastIndexedLedger()).toBe(200);
+    });
+
+    it("does not move the live pointer backwards when advanceLivePointer is set", () => {
+      testDb
+        .prepare("UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'")
+        .run("500");
+
+      insertHistoricalEventBatch(
+        [event("C1", "initialized", 100)],
+        { startLedger: 100, endLedger: 200 },
+        { advanceLivePointer: true },
+      );
+
+      expect(getLastIndexedLedger()).toBe(500);
+    });
+
+    it("rejects an event whose ledger_sequence falls outside the declared range", () => {
+      expect(() =>
+        insertHistoricalEventBatch(
+          [event("C1", "initialized", 999)],
+          { startLedger: 100, endLedger: 200 },
+        ),
+      ).toThrow(HistoricalRangeError);
+
+      const counts = getHistoricalEventCounts(1, 10_000);
+      expect(counts.totalEvents).toBe(0);
+    });
+
+    it("ignores duplicate events on repeated import (idempotent)", () => {
+      const batch = [event("C1", "initialized", 100)];
+      insertHistoricalEventBatch(batch, { startLedger: 100, endLedger: 200 });
+      const second = insertHistoricalEventBatch(batch, { startLedger: 100, endLedger: 200 });
+
+      expect(second.inserted).toBe(0);
+      expect(getHistoricalEventCounts(100, 200).totalEvents).toBe(1);
+    });
+
+    it("rejects an invalid range before touching the database", () => {
+      expect(() =>
+        insertHistoricalEventBatch(
+          [event("C1", "initialized", 100)],
+          { startLedger: 200, endLedger: 100 },
+        ),
+      ).toThrow(HistoricalRangeError);
+      expect(getHistoricalEventCounts(1, 10_000).totalEvents).toBe(0);
+    });
+  });
+
+  describe("getHistoricalEventCounts", () => {
+    it("asserts correct block event counts are indexed for a custom range", () => {
+      insertHistoricalEventBatch(
+        [
+          event("C1", "initialized", 100),
+          event("C1", "funded", 101),
+          event("C2", "initialized", 105),
+        ],
+        { startLedger: 100, endLedger: 200 },
+      );
+      insertHistoricalEventBatch(
+        [event("C2", "completed", 250)],
+        { startLedger: 201, endLedger: 300 },
+      );
+
+      const counts = getHistoricalEventCounts(100, 200);
+      expect(counts.totalEvents).toBe(3);
+      expect(counts.eventsByType).toEqual({
+        initialized: 2,
+        funded: 1,
+      });
+    });
+
+    it("throws for an invalid range", () => {
+      expect(() => getHistoricalEventCounts(-1, 10)).toThrow(HistoricalRangeError);
     });
   });
 });
