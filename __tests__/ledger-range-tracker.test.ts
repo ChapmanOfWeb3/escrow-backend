@@ -8,6 +8,7 @@ import {
   insertEventBatch,
   type EventRow,
 } from "../src/indexer/db.js";
+import { countEventsInRange } from "../src/indexer/duplicate-prevention.js";
 import {
   getLedgerRangeSnapshot,
   advanceLedgerIfMatch,
@@ -15,6 +16,9 @@ import {
   readLedgerRange,
   getLedgerRangeMetadata,
   executeInTransaction,
+  explainQueryPlan,
+  queryPlanUsesIndex,
+  LEDGER_RANGE_INDEXES,
 } from "../src/indexer/ledger-range-tracker.js";
 
 describe("LedgerRangeTracker – Transactional Operations", () => {
@@ -492,6 +496,97 @@ describe("LedgerRangeTracker – Transactional Operations", () => {
       const canAdvance = advanceLedgerIfMatch(101, 150);
       expect(canAdvance).toBe(true);
       expect(getLastIndexedLedger()).toBe(150);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Index utilization via EXPLAIN QUERY PLAN (#295)
+  // -------------------------------------------------------------------------
+
+  describe("SQLite index utilization – EXPLAIN QUERY PLAN (#295)", () => {
+    beforeEach(() => {
+      for (let i = 0; i < 50; i++) {
+        insertEvent(
+          `C${i % 5}`,
+          i % 2 === 0 ? "initialized" : "funded",
+          1000 + i,
+          2000 + i,
+          JSON.stringify({ index: i }),
+        );
+      }
+    });
+
+    it("uses idx_events_ledger_sequence for readLedgerRange lookups", () => {
+      const plan = explainQueryPlan(
+        `SELECT * FROM events
+         WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+         ORDER BY ledger_sequence ASC`,
+        1005,
+        1020,
+      );
+
+      expect(queryPlanUsesIndex(plan, LEDGER_RANGE_INDEXES.ledgerSequence)).toBe(
+        true,
+      );
+      expect(queryPlanUsesIndex(plan, LEDGER_RANGE_INDEXES.ledgerEventType)).toBe(
+        false,
+      );
+    });
+
+    it("uses idx_events_ledger_sequence for metadata count queries", () => {
+      const plan = explainQueryPlan(
+        `SELECT COUNT(*) as count FROM events
+         WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+        1000,
+        1040,
+      );
+
+      expect(queryPlanUsesIndex(plan, LEDGER_RANGE_INDEXES.ledgerSequence)).toBe(
+        true,
+      );
+      expect(queryPlanUsesIndex(plan, LEDGER_RANGE_INDEXES.ledgerEventType)).toBe(
+        false,
+      );
+    });
+
+    it("uses idx_events_ledger_event_type for metadata aggregation", () => {
+      const plan = explainQueryPlan(
+        `SELECT event_type, COUNT(*) as count FROM events
+         WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+         GROUP BY event_type`,
+        1000,
+        1040,
+      );
+
+      expect(queryPlanUsesIndex(plan, LEDGER_RANGE_INDEXES.ledgerEventType)).toBe(
+        true,
+      );
+      expect(queryPlanUsesIndex(plan, LEDGER_RANGE_INDEXES.ledgerSequence)).toBe(
+        false,
+      );
+    });
+
+    it("continues to insert, update, and delete events after index migration", () => {
+      insertEvent("C-IDX", "delivered", 2000, 3000, JSON.stringify({ ok: true }));
+      expect(countEventsInRange(2000, 2000)).toBe(1);
+
+      testDb
+        .prepare(
+          `UPDATE events SET data_json = ? WHERE contract_id = ? AND ledger_sequence = ?`,
+        )
+        .run(JSON.stringify({ ok: false }), "C-IDX", 2000);
+
+      const updated = testDb
+        .prepare(
+          `SELECT data_json FROM events WHERE contract_id = ? AND ledger_sequence = ?`,
+        )
+        .get("C-IDX", 2000) as { data_json: string };
+      expect(JSON.parse(updated.data_json)).toEqual({ ok: false });
+
+      testDb
+        .prepare(`DELETE FROM events WHERE contract_id = ? AND ledger_sequence = ?`)
+        .run("C-IDX", 2000);
+      expect(countEventsInRange(2000, 2000)).toBe(0);
     });
   });
 });
