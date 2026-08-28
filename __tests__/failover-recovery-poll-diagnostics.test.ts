@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { jest } from "@jest/globals";
 import { setDb, runMigrations } from "../src/indexer/db.js";
 import {
   initializeNodeHealthTables,
@@ -27,7 +28,10 @@ describe("FailoverRecovery – poll diagnostics logging", () => {
     logPollDiagnostics("https://rpc.example.com", startedAt, 2048);
 
     expect(debugSpy).toHaveBeenCalledTimes(1);
-    const [message, meta] = debugSpy.mock.calls[0];
+    const [message, meta] = debugSpy.mock.calls[0] as unknown as [
+      string,
+      { nodeUrl: string; elapsedMs: number; payloadSizeBytes: number },
+    ];
     expect(message).toEqual(expect.stringContaining("elapsedMs="));
     expect(message).toEqual(expect.stringContaining("payloadSizeBytes=2048"));
     expect(meta).toMatchObject({

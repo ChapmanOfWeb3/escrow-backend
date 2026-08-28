@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import { retryWithBackoff } from "../src/indexer/failover-recovery.js";
 
 describe("FailoverRecovery – retryWithBackoff", () => {
