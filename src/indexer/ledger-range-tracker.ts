@@ -1,4 +1,4 @@
-import { getDb } from "./db.js";
+import { getDb, getLastIndexedLedger, insertEvent, type EventRow } from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -11,6 +11,15 @@ import logger from "../utils/logger.js";
  * - Transactional ledger range queries
  * - Consistent state even under high concurrency
  * - Automatic rollback on failures
+ * - Dynamic historical start/end ledger ranges (#299)
+ * - In-memory queue locks for concurrent event inserts (#296)
+ * - Consecutive failure / stall threshold alerting (#298)
+ * - High-frequency polling diagnostics (#297)
+ *
+ * Range semantics: startLedger and endLedger are **inclusive**.
+ * Historical imports never advance the live `last_ledger_sequence` pointer
+ * unless `advanceLivePointer` is explicitly requested, so live polling is
+ * unaffected.
  */
 
 export interface LedgerRange {
@@ -197,4 +206,38 @@ export function executeInTransaction<T>(
   const db = getDb();
   const transaction = db.transaction(() => operation(db));
   return transaction();
+}
+
+/** Index names used by ledger range queries – validated via EXPLAIN QUERY PLAN (#295). */
+export const LEDGER_RANGE_INDEXES = {
+  ledgerEventType: "idx_events_ledger_event_type",
+  ledgerSequence: "idx_events_ledger_sequence",
+} as const;
+
+/**
+ * Return SQLite EXPLAIN QUERY PLAN rows for a parameterized statement.
+ * Useful in tests to assert index usage for ledger range lookups (#295).
+ */
+export function explainQueryPlan(
+  sql: string,
+  ...params: unknown[]
+): Array<Record<string, unknown>> {
+  const db = getDb();
+  return db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<
+    Record<string, unknown>
+  >;
+}
+
+/**
+ * True when any EXPLAIN QUERY PLAN detail references the expected index name.
+ */
+export function queryPlanUsesIndex(
+  plan: Array<Record<string, unknown>>,
+  indexName: string,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && value.includes(indexName),
+    ),
+  );
 }
