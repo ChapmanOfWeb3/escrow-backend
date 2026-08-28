@@ -149,7 +149,9 @@ const MIGRATIONS: Migration[] = [
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
  *
- * Emits consecutive-failure / stall alerts via sqlite_schema_manager (#262).
+ * The entire operation (bootstrap + migration loop) runs inside an outer
+ * transaction so that *any* failure mid-operation triggers a full ROLLBACK
+ * and no partial schema / migration state ever persists on disk (#186).
  */
 export function runMigrations(): void {
   const monitor = getSqliteSchemaManagerFailureMonitor();
@@ -158,7 +160,7 @@ export function runMigrations(): void {
   const database = getDb();
   let failureRecorded = false;
 
-  try {
+  const runAll = database.transaction(() => {
     // Bootstrap: create the migrations tracking table if it doesn't exist yet
     database.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -195,44 +197,23 @@ export function runMigrations(): void {
         description: migration.description,
       });
 
-      // Run migration inside a transaction – rolls back fully on any error
-      const applyMigration = database.transaction(() => {
-        database.exec(migration.up);
-        database
-          .prepare(
-            "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
-          )
-          .run(migration.version, migration.description);
-      });
+      database.exec(migration.up);
+      database
+        .prepare(
+          "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
+        )
+        .run(migration.version, migration.description);
 
-      try {
-        applyMigration();
-        logger.info("Migration applied", { version: migration.version });
-      } catch (err) {
-        const error = err instanceof Error ? err.message : String(err);
-        logger.error("Migration failed – rolled back", {
-          version: migration.version,
-          error,
-        });
-        monitor.recordFailure("migration", {
-          error,
-          version: migration.version,
-          description: migration.description,
-          elapsedMs: Math.round(performance.now() - startedAt),
-        });
-        failureRecorded = true;
-        throw err;
-      }
+      logger.info("Migration applied", { version: migration.version });
     }
+  });
 
-    monitor.recordSuccess();
+  try {
+    runAll();
   } catch (err) {
-    if (!failureRecorded) {
-      monitor.recordFailure("bootstrap", {
-        error: err instanceof Error ? err.message : String(err),
-        elapsedMs: Math.round(performance.now() - startedAt),
-      });
-    }
+    logger.error("Schema migration failed – full rollback executed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
     throw err;
   }
 }
