@@ -68,44 +68,52 @@ function mapHealthRow(row: HealthRow): NodeHealthStatus {
 /**
  * Create the health/failover tables when absent and seed the singleton
  * failover_state row. Safe to call repeatedly.
+ *
+ * The entire operation runs inside a transaction so that any failure
+ * mid-initialization triggers a full ROLLBACK and no partial schema state
+ * persists on disk (#186).
  */
 export function initializeNodeHealthTables(): void {
   const db = getDb();
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS rpc_node_health (
-      node_url TEXT PRIMARY KEY,
-      is_healthy INTEGER NOT NULL DEFAULT 1,
-      failure_count INTEGER NOT NULL DEFAULT 0,
-      last_failure_at INTEGER,
-      last_success_at INTEGER,
-      next_retry_at INTEGER,
-      backoff_duration_ms INTEGER NOT NULL DEFAULT ${DEFAULT_BACKOFF_MS},
-      consecutive_successes INTEGER NOT NULL DEFAULT 0
-    );
+  const init = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS rpc_node_health (
+        node_url TEXT PRIMARY KEY,
+        is_healthy INTEGER NOT NULL DEFAULT 1,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        last_failure_at INTEGER,
+        last_success_at INTEGER,
+        next_retry_at INTEGER,
+        backoff_duration_ms INTEGER NOT NULL DEFAULT ${DEFAULT_BACKOFF_MS},
+        consecutive_successes INTEGER NOT NULL DEFAULT 0
+      );
 
-    CREATE TABLE IF NOT EXISTS failover_state (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      active_node_url TEXT,
-      total_failovers INTEGER NOT NULL DEFAULT 0,
-      last_failover_at INTEGER
-    );
+      CREATE TABLE IF NOT EXISTS failover_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        active_node_url TEXT,
+        total_failovers INTEGER NOT NULL DEFAULT 0,
+        last_failover_at INTEGER
+      );
 
-    CREATE TABLE IF NOT EXISTS node_failure_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      node_url TEXT NOT NULL,
-      error_message TEXT,
-      retry_count INTEGER NOT NULL DEFAULT 0,
-      recovery_attempt_at INTEGER,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (node_url) REFERENCES rpc_node_health(node_url)
-    );
-  `);
+      CREATE TABLE IF NOT EXISTS node_failure_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_url TEXT NOT NULL,
+        error_message TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        recovery_attempt_at INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (node_url) REFERENCES rpc_node_health(node_url)
+      );
+    `);
 
-  db.prepare(
-    `INSERT OR IGNORE INTO failover_state (id, active_node_url, total_failovers, last_failover_at)
-     VALUES (1, NULL, 0, NULL)`
-  ).run();
+    db.prepare(
+      `INSERT OR IGNORE INTO failover_state (id, active_node_url, total_failovers, last_failover_at)
+       VALUES (1, NULL, 0, NULL)`
+    ).run();
+  });
+
+  init();
 }
 
 /** Insert the node's health row if it is not tracked yet. */
@@ -430,4 +438,97 @@ export async function createFailoverServer<T>(
   }
 
   return { server: createServer(nodeUrl), nodeUrl };
+}
+
+/**
+ * Emit a high-frequency debug log line for one poll cycle so poll speed and
+ * payload size can be traced without raising the global log level.
+ */
+export function logPollDiagnostics(
+  nodeUrl: string,
+  startedAtMs: number,
+  payloadSizeBytes: number
+): void {
+  const elapsedMs = Date.now() - startedAtMs;
+  logger.debug(
+    `poll diagnostics nodeUrl=${nodeUrl} elapsedMs=${elapsedMs} payloadSizeBytes=${payloadSizeBytes}`,
+    { nodeUrl, elapsedMs, payloadSizeBytes }
+  );
+}
+
+/**
+ * Create indexes covering the lookups this module performs most often
+ * (health-by-node, and failure-events-by-node ordered by recency). Safe to
+ * call repeatedly; requires the base tables to already exist.
+ */
+export function ensureNodeHealthIndexes(): void {
+  const db = getDb();
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_rpc_node_health_healthy
+      ON rpc_node_health (is_healthy);
+
+    CREATE INDEX IF NOT EXISTS idx_node_failure_events_node_url_created_at
+      ON node_failure_events (node_url, created_at);
+  `);
+}
+
+/**
+ * Per-node in-memory locks so concurrent event notifications for the same
+ * node serialize instead of racing each other into duplicate inserts. Each
+ * node gets its own queue of pending promises; unrelated nodes never block
+ * one another.
+ */
+const nodeEventLocks = new Map<string, Promise<unknown>>();
+
+/** Run `task` exclusively with respect to other calls for the same `nodeUrl`. */
+export function withNodeEventLock<T>(
+  nodeUrl: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const previous = nodeEventLocks.get(nodeUrl) ?? Promise.resolve();
+  const run = previous.then(task, task);
+
+  // Swallow rejections in the chain slot so one failed task doesn't wedge
+  // the lock for the next caller, while still propagating to the caller.
+  nodeEventLocks.set(
+    nodeUrl,
+    run.catch(() => undefined)
+  );
+
+  return run;
+}
+
+/**
+ * Retry `operation` with exponential backoff, for RPC calls that fail with
+ * connection timeouts. Delay doubles after each attempt (capped at
+ * MAX_BACKOFF_MS) and the final failure is rethrown once `maxAttempts` is
+ * exhausted.
+ */
+export async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxAttempts = 5,
+  initialDelayMs = DEFAULT_BACKOFF_MS
+): Promise<T> {
+  let attempt = 0;
+  let delayMs = initialDelayMs;
+
+  while (true) {
+    try {
+      return await operation();
+    } catch (err) {
+      attempt += 1;
+      if (attempt >= maxAttempts) {
+        throw err;
+      }
+
+      logger.debug(
+        `retrying after connection timeout attempt=${attempt} delayMs=${delayMs}`,
+        { attempt, delayMs }
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, MAX_BACKOFF_MS);
+    }
+  }
 }
