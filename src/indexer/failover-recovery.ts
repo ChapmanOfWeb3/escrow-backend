@@ -439,3 +439,96 @@ export async function createFailoverServer<T>(
 
   return { server: createServer(nodeUrl), nodeUrl };
 }
+
+/**
+ * Emit a high-frequency debug log line for one poll cycle so poll speed and
+ * payload size can be traced without raising the global log level.
+ */
+export function logPollDiagnostics(
+  nodeUrl: string,
+  startedAtMs: number,
+  payloadSizeBytes: number
+): void {
+  const elapsedMs = Date.now() - startedAtMs;
+  logger.debug(
+    `poll diagnostics nodeUrl=${nodeUrl} elapsedMs=${elapsedMs} payloadSizeBytes=${payloadSizeBytes}`,
+    { nodeUrl, elapsedMs, payloadSizeBytes }
+  );
+}
+
+/**
+ * Create indexes covering the lookups this module performs most often
+ * (health-by-node, and failure-events-by-node ordered by recency). Safe to
+ * call repeatedly; requires the base tables to already exist.
+ */
+export function ensureNodeHealthIndexes(): void {
+  const db = getDb();
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_rpc_node_health_healthy
+      ON rpc_node_health (is_healthy);
+
+    CREATE INDEX IF NOT EXISTS idx_node_failure_events_node_url_created_at
+      ON node_failure_events (node_url, created_at);
+  `);
+}
+
+/**
+ * Per-node in-memory locks so concurrent event notifications for the same
+ * node serialize instead of racing each other into duplicate inserts. Each
+ * node gets its own queue of pending promises; unrelated nodes never block
+ * one another.
+ */
+const nodeEventLocks = new Map<string, Promise<unknown>>();
+
+/** Run `task` exclusively with respect to other calls for the same `nodeUrl`. */
+export function withNodeEventLock<T>(
+  nodeUrl: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const previous = nodeEventLocks.get(nodeUrl) ?? Promise.resolve();
+  const run = previous.then(task, task);
+
+  // Swallow rejections in the chain slot so one failed task doesn't wedge
+  // the lock for the next caller, while still propagating to the caller.
+  nodeEventLocks.set(
+    nodeUrl,
+    run.catch(() => undefined)
+  );
+
+  return run;
+}
+
+/**
+ * Retry `operation` with exponential backoff, for RPC calls that fail with
+ * connection timeouts. Delay doubles after each attempt (capped at
+ * MAX_BACKOFF_MS) and the final failure is rethrown once `maxAttempts` is
+ * exhausted.
+ */
+export async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxAttempts = 5,
+  initialDelayMs = DEFAULT_BACKOFF_MS
+): Promise<T> {
+  let attempt = 0;
+  let delayMs = initialDelayMs;
+
+  while (true) {
+    try {
+      return await operation();
+    } catch (err) {
+      attempt += 1;
+      if (attempt >= maxAttempts) {
+        throw err;
+      }
+
+      logger.debug(
+        `retrying after connection timeout attempt=${attempt} delayMs=${delayMs}`,
+        { attempt, delayMs }
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, MAX_BACKOFF_MS);
+    }
+  }
+}
