@@ -20,6 +20,7 @@ import {
   logIndexerRunnerPollDiagnostics,
   payloadSizeBytes,
 } from "./indexer_runner.js";
+import { EVENT_TYPES } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
@@ -54,18 +55,8 @@ export function resetFailureState(): void {
   lastSuccessfulPollAt = null;
 }
 
-const EVENT_TYPES = [
-  "initialized",
-  "funded",
-  "delivered",
-  "approved",
-  "dispute_raised",
-  "dispute_resolved",
-  "partial_release",
-  "auto_release_claimed",
-  "token_whitelisted",
-  "token_removed",
-];
+// The accepted topic list lives in event_type_filter, so the RPC-side filter
+// sent to getEvents and the client-side topic check cannot drift apart.
 
 /**
  * Poll events for all active contract IDs stored in monitored_contracts (#85).
