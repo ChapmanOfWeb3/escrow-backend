@@ -7,6 +7,7 @@ import {
   withSchemaRetry,
   withSchemaRetrySync,
   isSchemaRetryableError,
+  SCHEMA_MANAGER_INDEXES,
 } from "../src/indexer/db.js";
 import { jest } from "@jest/globals";
 import logger from "../src/utils/logger.js";
@@ -337,7 +338,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         const versions = (cleanDb
           .prepare("SELECT version FROM schema_migrations ORDER BY version")
           .all() as Array<{ version: number }>).map((r) => r.version);
-        expect(versions).toEqual([1, 2, 3]);
+        expect(versions).toEqual([1, 2, 3, 4, 5]);
 
         const ledger = cleanDb
           .prepare("SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'")
@@ -490,12 +491,12 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
         expect(result).toBe("recovered");
         expect(calls).toBe(3);
 
-        const retryWarns = warnSpy.mock.calls.filter(
-          ([msg]) => msg === "schema_test failed, retrying",
+        const retryWarns = (warnSpy.mock.calls as unknown as any[][]).filter(
+          (args) => args[0] === "schema_test failed, retrying",
         );
         expect(retryWarns.length).toBe(2);
-        for (const [, meta] of retryWarns) {
-          delays.push((meta as { backoffMs: number }).backoffMs);
+        for (const args of retryWarns) {
+          delays.push((args[1] as { backoffMs: number }).backoffMs);
         }
         expect(delays[0]).toBe(10);
         expect(delays[1]).toBe(20);

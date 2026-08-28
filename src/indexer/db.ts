@@ -156,6 +156,13 @@ const MIGRATIONS: Migration[] = [
   },
 ];
 
+/** Index names created by the SQLite schema manager lookup-index migration (#259). */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
+
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
 // Retries transient SQLite / connection / timeout failures during migrations.

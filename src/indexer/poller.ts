@@ -1,4 +1,3 @@
-import { Server } from "@stellar/stellar-sdk/rpc";
 import { scValToNative } from "@stellar/stellar-sdk";
 import {
   getLastIndexedLedger,
@@ -16,6 +15,7 @@ import {
   resolveHistoricalLedgerRange,
 } from "./ledger-range-tracker.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
+import { RpcPollerClient } from "./rpc-poller-client.js";
 import {
   logIndexerRunnerPollDiagnostics,
   payloadSizeBytes,
@@ -24,7 +24,28 @@ import logger from "../utils/logger.js";
 
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
-const server = new Server(RPC_URL);
+
+// ---------------------------------------------------------------------------
+// RPC exponential backoff retry (#249)
+// ---------------------------------------------------------------------------
+// All RPC calls in the indexer poll loop go through RpcPollerClient, which
+// retries transient failures (timeouts, connection resets, rate limits, 5xx)
+// with a doubling backoff up to maxRetries, then resets on success.
+const rpcClient = new RpcPollerClient(RPC_URL, {
+  maxRetries: parseInt(process.env.INDEXER_RPC_MAX_RETRIES || "5", 10),
+  initialBackoffMs: parseInt(
+    process.env.INDEXER_RPC_INITIAL_BACKOFF_MS || "1000",
+    10,
+  ),
+  backoffMultiplier: parseInt(
+    process.env.INDEXER_RPC_BACKOFF_MULTIPLIER || "2",
+    10,
+  ),
+  maxBackoffMs: parseInt(
+    process.env.INDEXER_RPC_MAX_BACKOFF_MS || "30000",
+    10,
+  ),
+});
 
 // ---------------------------------------------------------------------------
 // Alerting thresholds (#271)
@@ -124,7 +145,7 @@ export async function pollEvents(): Promise<boolean> {
     verifySchemaUpToDate();
 
     const lastLedger = getLastIndexedLedger();
-    const currentLedger = (await server.getLatestLedger()).sequence;
+    const currentLedger = (await rpcClient.getLatestLedger()).sequence;
 
     // --- Dynamic historical sync ranges (#254) ---
     // When LEDGER_RANGE_START / LEDGER_RANGE_END (or either) are configured,
@@ -150,7 +171,7 @@ export async function pollEvents(): Promise<boolean> {
         pageSize: histConfig.pageSize,
         advanceLivePointer: false,
         fetchEvents: async (page) => {
-          const pageEvents = await server.getEvents({
+          const pageEvents = await rpcClient.getEvents({
             startLedger: page.startLedger,
             filters: [
               {
@@ -162,8 +183,8 @@ export async function pollEvents(): Promise<boolean> {
             limit: histConfig.pageSize,
           });
           return pageEvents.events
-            .filter((event) => event.ledger <= page.endLedger)
-            .map((event) => ({
+            .filter((event: any) => event.ledger <= page.endLedger)
+            .map((event: any) => ({
               contractId: event.contractId?.contractId() ?? contractIds[0],
               eventType: scValToNative(event.topic[0]) as string,
               ledgerSequence: event.ledger,
@@ -211,7 +232,7 @@ export async function pollEvents(): Promise<boolean> {
     logger.info("Polling events", { startLedger, currentLedger });
 
     const eventsStart = performance.now();
-    const events = await server.getEvents({
+    const events = await rpcClient.getEvents({
       startLedger,
       filters: [
         {
@@ -244,7 +265,7 @@ export async function pollEvents(): Promise<boolean> {
     });
 
     // Build the batch to be written atomically (#84)
-    const batch: EventRow[] = events.events.map((event) => ({
+    const batch: EventRow[] = events.events.map((event: any) => ({
       contractId: event.contractId?.contractId() ?? contractIds[0],
       eventType: scValToNative(event.topic[0]) as string,
       ledgerSequence: event.ledger,
