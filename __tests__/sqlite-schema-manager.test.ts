@@ -7,6 +7,14 @@ import {
   withSchemaRetry,
   withSchemaRetrySync,
   isSchemaRetryableError,
+  getShippedMigrationVersions,
+  SCHEMA_MANAGER_INDEXES,
+  insertEventLocked,
+  insertEventBatchLocked,
+  resetEventInsertLocksForTests,
+  setEventInsertLockHookForTests,
+  getEventInsertLockCount,
+  type EventRow,
 } from "../src/indexer/db.js";
 import { jest } from "@jest/globals";
 import logger from "../src/utils/logger.js";
@@ -337,7 +345,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         const versions = (cleanDb
           .prepare("SELECT version FROM schema_migrations ORDER BY version")
           .all() as Array<{ version: number }>).map((r) => r.version);
-        expect(versions).toEqual([1, 2, 3]);
+        expect(versions).toEqual(getShippedMigrationVersions());
 
         const ledger = cleanDb
           .prepare("SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'")
@@ -564,5 +572,110 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
         db.close();
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #260 – In-memory event queue locks for concurrent inserts
+// ---------------------------------------------------------------------------
+
+describe("SQLite Schema Manager – concurrent event insert locks (#260)", () => {
+  let testDb: Database.Database;
+
+  beforeAll(() => {
+    testDb = new Database(":memory:");
+    setDb(testDb);
+  });
+
+  afterAll(() => {
+    testDb.close();
+  });
+
+  beforeEach(() => {
+    testDb.exec("DROP TABLE IF EXISTS events");
+    testDb.exec("DROP TABLE IF EXISTS indexer_state");
+    testDb.exec("DROP TABLE IF EXISTS monitored_contracts");
+    testDb.exec("DROP TABLE IF EXISTS schema_migrations");
+    testDb.exec("DROP TABLE IF EXISTS webhook_subscriptions");
+    runMigrations();
+    resetEventInsertLocksForTests();
+  });
+
+  afterEach(() => {
+    resetEventInsertLocksForTests();
+  });
+
+  it("concurrent notifications for the same event insert exactly once", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        insertEventLocked("C1", "initialized", 100, 1000, "{}"),
+      ),
+    );
+
+    const rows = testDb.prepare("SELECT * FROM events").all();
+    expect(rows.length).toBe(1);
+
+    const insertedCount = results.filter(Boolean).length;
+    expect(insertedCount).toBe(1);
+  });
+
+  it("serializes same-identity notifications one at a time (no overlapping lock holders)", async () => {
+    let concurrentHolders = 0;
+    let maxConcurrentHolders = 0;
+
+    setEventInsertLockHookForTests(async () => {
+      concurrentHolders++;
+      maxConcurrentHolders = Math.max(maxConcurrentHolders, concurrentHolders);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      concurrentHolders--;
+    });
+
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        insertEventLocked("C1", "initialized", 100, 1000 + i, "{}"),
+      ),
+    );
+
+    expect(maxConcurrentHolders).toBe(1);
+    expect(getEventInsertLockCount()).toBe(0);
+  });
+
+  it("unrelated event identities are not serialized against each other", async () => {
+    const observedKeys: string[] = [];
+    setEventInsertLockHookForTests(async (key) => {
+      observedKeys.push(key);
+    });
+
+    await Promise.all([
+      insertEventLocked("C1", "initialized", 100, 1000, "{}"),
+      insertEventLocked("C2", "funded", 200, 2000, "{}"),
+      insertEventLocked("C3", "delivered", 300, 3000, "{}"),
+    ]);
+
+    expect(observedKeys.sort()).toEqual(
+      ["C1:100:initialized", "C2:200:funded", "C3:300:delivered"].sort(),
+    );
+    const rows = testDb.prepare("SELECT * FROM events").all();
+    expect(rows.length).toBe(3);
+  });
+
+  it("insertEventBatchLocked serializes concurrent overlapping batches without duplicates", async () => {
+    const batchA: EventRow[] = [
+      { contractId: "C1", eventType: "initialized", ledgerSequence: 100, timestamp: 1000, dataJson: "{}" },
+      { contractId: "C1", eventType: "funded", ledgerSequence: 101, timestamp: 1001, dataJson: "{}" },
+    ];
+    const batchB: EventRow[] = [
+      { contractId: "C1", eventType: "initialized", ledgerSequence: 100, timestamp: 1000, dataJson: "{}" },
+      { contractId: "C1", eventType: "delivered", ledgerSequence: 102, timestamp: 1002, dataJson: "{}" },
+    ];
+
+    await Promise.all([
+      insertEventBatchLocked(batchA, 101),
+      insertEventBatchLocked(batchB, 102),
+    ]);
+
+    const rows = testDb.prepare("SELECT * FROM events ORDER BY ledger_sequence").all() as any[];
+    expect(rows.length).toBe(3);
+    expect(rows.map((r) => r.event_type)).toEqual(["initialized", "funded", "delivered"]);
   });
 });
