@@ -5,8 +5,6 @@ import {
   insertEventBatch,
   getActiveContractIds,
   registerContract,
-  adjustPollerInterval,
-  getCurrentPollIntervalMs,
   verifySchemaUpToDate,
   type EventRow,
 } from "./db.js";
@@ -19,6 +17,8 @@ import { deliverWebhooks } from "./webhook-delivery.js";
 import {
   logIndexerRunnerPollDiagnostics,
   payloadSizeBytes,
+  adjustIndexerRunnerPollInterval,
+  getIndexerRunnerPollDelayMs,
 } from "./indexer_runner.js";
 import logger from "../utils/logger.js";
 
@@ -177,7 +177,7 @@ export async function pollEvents(): Promise<boolean> {
 
       consecutiveFailures = 0;
       lastSuccessfulPollAt = Date.now();
-      adjustPollerInterval(result.eventCount);
+      adjustIndexerRunnerPollInterval(result.eventCount);
 
       logger.info("Historical ledger range import complete", {
         startLedger: range.startLedger,
@@ -191,8 +191,8 @@ export async function pollEvents(): Promise<boolean> {
     }
 
     if (currentLedger <= lastLedger) {
-      // --- Dynamic throttling: idle cycle (#265) ---
-      adjustPollerInterval(0);
+      // --- Dynamic throttling: idle cycle (#256) ---
+      adjustIndexerRunnerPollInterval(0);
       const idleElapsed = Math.round(performance.now() - pollStart);
       logIndexerRunnerPollDiagnostics({
         operation: "pollEvents",
@@ -261,8 +261,8 @@ export async function pollEvents(): Promise<boolean> {
     consecutiveFailures = 0;
     lastSuccessfulPollAt = Date.now();
 
-    // --- Dynamic poller throttling (#265) ---
-    const throttleState = adjustPollerInterval(events.events.length);
+    // --- Dynamic poller throttling (#256) ---
+    const throttleState = adjustIndexerRunnerPollInterval(events.events.length);
 
     logIndexerRunnerPollDiagnostics({
       operation: "pollEvents",
@@ -324,7 +324,7 @@ let pollerRunning = false;
 async function pollLoop() {
   if (!pollerRunning) return;
   await pollEvents();
-  const interval = getCurrentPollIntervalMs();
+  const interval = getIndexerRunnerPollDelayMs();
   pollerTimeout = setTimeout(pollLoop, interval);
 }
 
@@ -332,10 +332,10 @@ export function startPoller() {
   if (pollerRunning) return;
   pollerRunning = true;
   logger.info("Starting event indexer poller", {
-    intervalMs: getCurrentPollIntervalMs(),
+    intervalMs: getIndexerRunnerPollDelayMs(),
   });
   pollEvents();
-  pollerTimeout = setTimeout(pollLoop, getCurrentPollIntervalMs());
+  pollerTimeout = setTimeout(pollLoop, getIndexerRunnerPollDelayMs());
 }
 
 export function stopPoller() {
