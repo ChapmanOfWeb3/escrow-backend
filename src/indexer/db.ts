@@ -154,7 +154,23 @@ const MIGRATIONS: Migration[] = [
         ON events (contract_id, event_type, ledger_sequence);
     `,
   },
+  {
+    version: 6,
+    description: "add indexer_metrics_collector aggregation index (#335)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+    `,
+  },
 ];
+
+/**
+ * Migration versions this build ships, ascending. Callers compare these
+ * against `schema_migrations` to detect a database that is behind the code.
+ */
+export function getShippedMigrationVersions(): number[] {
+  return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
+}
 
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)

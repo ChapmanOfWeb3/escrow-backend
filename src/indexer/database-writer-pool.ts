@@ -1,4 +1,9 @@
-import { getDb } from "./db.js";
+import {
+  getDb,
+  getShippedMigrationVersions,
+  verifySchemaIntegrity,
+  verifySchemaUpToDate,
+} from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -11,6 +16,8 @@ import logger from "../utils/logger.js";
  * - Automatic rollback on failures
  * - Queue-based serialization to prevent writer contention
  * - Built-in retry logic for transient conflicts
+ * - Migration verification hooks that validate the schema before starting (#331)
+ * - High-frequency debug diagnostics for write speeds and payload sizes (#328)
  */
 
 export interface WriteOperation<T> {
@@ -47,8 +54,12 @@ async function processWriteQueue(): Promise<void> {
   if (isProcessing) return;
   isProcessing = true;
 
+  const drainStartedAt = performance.now();
+  let drainedCount = 0;
+
   try {
     while (writeQueue.length > 0) {
+      drainedCount++;
       const item = writeQueue.shift();
       if (!item) break;
 
@@ -62,6 +73,15 @@ async function processWriteQueue(): Promise<void> {
     }
   } finally {
     isProcessing = false;
+
+    logWriterPoolDiagnostics({
+      pool: POOL_NAME,
+      operation: "drain_write_queue",
+      status: "success",
+      elapsedMs: roundElapsed(performance.now() - drainStartedAt),
+      queueDepth: writeQueue.length,
+      attempt: drainedCount,
+    });
 
     // If new items were added while processing, process them
     if (writeQueue.length > 0) {
@@ -89,8 +109,17 @@ async function executeWrite<T>(
   const db = getDb();
   const operationName = operation.name || "unknown";
   const startTime = Date.now();
+  const startedAt = performance.now();
   let lastError: Error | null = null;
   let retryCount = 0;
+
+  logWriterPoolDiagnostics({
+    pool: POOL_NAME,
+    operation: operationName,
+    status: "started",
+    elapsedMs: 0,
+    queueDepth: writeQueue.length,
+  });
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -117,6 +146,17 @@ async function executeWrite<T>(
         });
       }
 
+      logWriterPoolDiagnostics({
+        pool: POOL_NAME,
+        operation: operationName,
+        status: "success",
+        elapsedMs: roundElapsed(performance.now() - startedAt),
+        payloadSizeBytes: writerPoolPayloadSizeBytes(result),
+        queueDepth: writeQueue.length,
+        attempt: attempt + 1,
+        retries: attempt,
+      });
+
       return {
         success: true,
         data: result,
@@ -142,6 +182,15 @@ async function executeWrite<T>(
           error: lastError.message,
           backoffMs,
         });
+        logWriterPoolDiagnostics({
+          pool: POOL_NAME,
+          operation: operationName,
+          status: "retry",
+          elapsedMs: roundElapsed(performance.now() - startedAt),
+          queueDepth: writeQueue.length,
+          attempt: attempt + 1,
+          error: lastError.message,
+        });
 
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
         continue;
@@ -154,6 +203,16 @@ async function executeWrite<T>(
         operationName,
         retries: attempt,
         executionTimeMs,
+        error: lastError.message,
+      });
+      logWriterPoolDiagnostics({
+        pool: POOL_NAME,
+        operation: operationName,
+        status: "failure",
+        elapsedMs: roundElapsed(performance.now() - startedAt),
+        queueDepth: writeQueue.length,
+        attempt: attempt + 1,
+        retries: attempt,
         error: lastError.message,
       });
 
@@ -185,7 +244,31 @@ async function executeWrite<T>(
  */
 export function queueWrite<T>(operation: WriteOperation<T>): Promise<WriteResult<T>> {
   return new Promise((resolve, reject) => {
+    // When a start was requested with enforcement, writes are refused until
+    // the schema has been verified – a stale database must not be written to.
+    if (enforceStart && !poolStarted) {
+      const issues = lastSchemaReport?.issues ?? [
+        "startWriterPool() has not completed successfully",
+      ];
+      reject(
+        new WriterPoolSchemaError(
+          `database_writer_pool is not started – refusing write "${operation.name || "unknown"}": ${issues.join("; ")}`,
+          issues,
+        ),
+      );
+      return;
+    }
+
     writeQueue.push({ operation, resolve, reject });
+
+    logWriterPoolDiagnostics({
+      pool: POOL_NAME,
+      operation: operation.name || "unknown",
+      status: "started",
+      elapsedMs: 0,
+      queueDepth: writeQueue.length,
+    });
+
     processWriteQueue().catch((err) => {
       logger.error("Error processing write queue", {
         error: err instanceof Error ? err.message : String(err),
@@ -321,4 +404,307 @@ export function createReadWriteOperation<T>(
     name,
     execute: operation,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Polling diagnostics (#328)
+// ---------------------------------------------------------------------------
+
+const POOL_NAME = "database_writer_pool";
+
+export interface WriterPoolDiagnostics {
+  pool: string;
+  operation: string;
+  status: "started" | "success" | "failure" | "retry";
+  /** Wall-clock duration of the operation in milliseconds. */
+  elapsedMs: number;
+  payloadSizeBytes?: number;
+  queueDepth?: number;
+  attempt?: number;
+  retries?: number;
+  error?: string;
+}
+
+/** Byte size of a JSON-serialized payload, matching indexer_runner's helper. */
+export function writerPoolPayloadSizeBytes(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value ?? null), "utf8");
+  } catch {
+    // Circular or non-serializable results must not break a write.
+    return 0;
+  }
+}
+
+/** Round to microsecond precision so sub-millisecond writes stay readable. */
+function roundElapsed(elapsedMs: number): number {
+  return Math.round(Math.max(0, elapsedMs) * 1000) / 1000;
+}
+
+/**
+ * Emit a database_writer_pool diagnostics debug log.
+ *
+ * The message string always carries `elapsedMs=` (and `payloadSizeBytes=` /
+ * `queueDepth=` when known) so log-scraping validation can assert timing
+ * values are present; the same values are repeated in the structured meta
+ * object for log processors.
+ */
+export function logWriterPoolDiagnostics(
+  diagnostics: WriterPoolDiagnostics,
+): void {
+  const parts = [
+    `${diagnostics.pool} poll diagnostics`,
+    `operation=${diagnostics.operation}`,
+    `status=${diagnostics.status}`,
+    `elapsedMs=${diagnostics.elapsedMs}`,
+  ];
+  if (diagnostics.payloadSizeBytes !== undefined) {
+    parts.push(`payloadSizeBytes=${diagnostics.payloadSizeBytes}`);
+  }
+  if (diagnostics.queueDepth !== undefined) {
+    parts.push(`queueDepth=${diagnostics.queueDepth}`);
+  }
+  if (diagnostics.attempt !== undefined) {
+    parts.push(`attempt=${diagnostics.attempt}`);
+  }
+  logger.debug(parts.join(" "), diagnostics);
+}
+
+// ---------------------------------------------------------------------------
+// Migration verification hooks (#331)
+// ---------------------------------------------------------------------------
+
+export class WriterPoolSchemaError extends Error {
+  readonly issues: string[];
+
+  constructor(message: string, issues: string[]) {
+    super(message);
+    this.name = "WriterPoolSchemaError";
+    this.issues = issues;
+  }
+}
+
+export interface WriterPoolSchemaReport {
+  valid: boolean;
+  /** Migration versions recorded as applied. */
+  appliedVersions: number[];
+  /** Migration versions the code ships but the database has not applied. */
+  missingVersions: number[];
+  /** Human-readable reasons the schema is considered out of sync. */
+  issues: string[];
+}
+
+/**
+ * A custom check run during `startWriterPool`. Return one or more issue
+ * strings to fail the start, or nothing/an empty array to pass. A hook that
+ * throws is reported as an issue rather than escaping the start call.
+ */
+export type MigrationVerificationHook = (
+  db: ReturnType<typeof getDb>,
+) => string[] | string | void;
+
+const migrationHooks = new Map<string, MigrationVerificationHook>();
+
+/**
+ * Register a named schema check run by `startWriterPool` after the built-in
+ * verification. Registering the same name twice replaces the earlier hook.
+ */
+export function registerMigrationVerificationHook(
+  name: string,
+  hook: MigrationVerificationHook,
+): void {
+  migrationHooks.set(name, hook);
+}
+
+export function unregisterMigrationVerificationHook(name: string): boolean {
+  return migrationHooks.delete(name);
+}
+
+export function clearMigrationVerificationHooks(): void {
+  migrationHooks.clear();
+}
+
+export function getMigrationVerificationHookNames(): string[] {
+  return [...migrationHooks.keys()];
+}
+
+/**
+ * Verify the database schema the pool writes through: the migrations table
+ * exists, every shipped migration is applied, the expected tables and columns
+ * are present, and any registered hooks pass.
+ *
+ * Returns a report instead of throwing so callers can log or degrade; use
+ * `assertWriterPoolSchemaReady` to fail fast.
+ */
+export function verifyWriterPoolSchema(): WriterPoolSchemaReport {
+  const issues: string[] = [];
+  let appliedVersions: number[] = [];
+  let missingVersions: number[] = [];
+
+  try {
+    verifySchemaUpToDate();
+  } catch (err) {
+    issues.push(err instanceof Error ? err.message : String(err));
+  }
+
+  try {
+    const db = getDb();
+    appliedVersions = (
+      db
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all() as Array<{ version: number }>
+    ).map((row) => row.version);
+    const applied = new Set(appliedVersions);
+    missingVersions = getShippedMigrationVersions().filter(
+      (version) => !applied.has(version),
+    );
+  } catch {
+    // verifySchemaUpToDate has already reported the missing table.
+    missingVersions = getShippedMigrationVersions();
+  }
+
+  const integrity = verifySchemaIntegrity();
+  if (!integrity.valid) {
+    issues.push(
+      ...integrity.missingTables.map((table) => `missing table: ${table}`),
+      ...Object.entries(integrity.missingColumns).map(
+        ([table, columns]) => `missing columns in ${table}: ${columns.join(", ")}`,
+      ),
+      ...integrity.errors,
+    );
+  }
+
+  for (const [name, hook] of migrationHooks) {
+    try {
+      const result = hook(getDb());
+      const hookIssues =
+        typeof result === "string" ? [result] : Array.isArray(result) ? result : [];
+      issues.push(...hookIssues.map((issue) => `${name}: ${issue}`));
+    } catch (err) {
+      issues.push(
+        `${name}: hook threw ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return {
+    valid: issues.length === 0,
+    appliedVersions,
+    missingVersions,
+    issues,
+  };
+}
+
+/**
+ * Verify the schema and throw `WriterPoolSchemaError` when it is out of sync.
+ */
+export function assertWriterPoolSchemaReady(): WriterPoolSchemaReport {
+  const report = verifyWriterPoolSchema();
+  if (!report.valid) {
+    throw new WriterPoolSchemaError(
+      `database_writer_pool cannot start – database schema is out of sync: ${report.issues.join("; ")}`,
+      report.issues,
+    );
+  }
+  return report;
+}
+
+export interface WriterPoolStartOptions {
+  /**
+   * Reject queued writes until a start succeeds. Defaults to false so callers
+   * that never call `startWriterPool` keep working exactly as before.
+   */
+  enforce?: boolean;
+}
+
+let poolStarted = false;
+let enforceStart = false;
+let lastSchemaReport: WriterPoolSchemaReport | null = null;
+
+/**
+ * Validate the schema and mark the pool ready for writes.
+ *
+ * Throws `WriterPoolSchemaError` when the database state is out of sync, so a
+ * process started against a stale database fails immediately instead of
+ * writing through a schema it does not understand.
+ */
+export function startWriterPool(
+  options: WriterPoolStartOptions = {},
+): WriterPoolSchemaReport {
+  const startedAt = performance.now();
+
+  logWriterPoolDiagnostics({
+    pool: POOL_NAME,
+    operation: "start_writer_pool",
+    status: "started",
+    elapsedMs: 0,
+    queueDepth: writeQueue.length,
+  });
+
+  try {
+    const report = assertWriterPoolSchemaReady();
+
+    poolStarted = true;
+    enforceStart = options.enforce ?? false;
+    lastSchemaReport = report;
+
+    logWriterPoolDiagnostics({
+      pool: POOL_NAME,
+      operation: "start_writer_pool",
+      status: "success",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      queueDepth: writeQueue.length,
+    });
+    logger.info("database_writer_pool started", {
+      pool: POOL_NAME,
+      appliedVersions: report.appliedVersions,
+      enforce: enforceStart,
+    });
+
+    return report;
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+
+    poolStarted = false;
+    lastSchemaReport =
+      err instanceof WriterPoolSchemaError
+        ? { valid: false, appliedVersions: [], missingVersions: [], issues: err.issues }
+        : null;
+
+    logWriterPoolDiagnostics({
+      pool: POOL_NAME,
+      operation: "start_writer_pool",
+      status: "failure",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      error,
+    });
+    logger.error("database_writer_pool failed to start", {
+      pool: POOL_NAME,
+      error,
+    });
+
+    throw err;
+  }
+}
+
+/** Stop the pool. Queued writes are rejected again when `enforce` was set. */
+export function stopWriterPool(): void {
+  poolStarted = false;
+  logger.info("database_writer_pool stopped", { pool: POOL_NAME });
+}
+
+export function isWriterPoolStarted(): boolean {
+  return poolStarted;
+}
+
+/** The report from the most recent start attempt, or null if never started. */
+export function getWriterPoolSchemaReport(): WriterPoolSchemaReport | null {
+  return lastSchemaReport;
+}
+
+/** Reset start/enforcement state and registered hooks. Intended for tests. */
+export function resetWriterPoolStartState(): void {
+  poolStarted = false;
+  enforceStart = false;
+  lastSchemaReport = null;
+  migrationHooks.clear();
 }
