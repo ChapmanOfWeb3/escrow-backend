@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import Database from "better-sqlite3";
 import { setDb, runMigrations } from "../src/indexer/db.js";
 import {
@@ -21,13 +22,15 @@ describe("FailoverRecovery – poll diagnostics logging", () => {
   });
 
   it("logs a debug diagnostic string containing elapsed time and payload size", () => {
-    const debugSpy = jest.spyOn(logger, "debug").mockImplementation(() => logger);
+    const debugSpy = jest
+      .spyOn(logger, "debug")
+      .mockImplementation((() => logger) as never);
 
     const startedAt = Date.now() - 42;
     logPollDiagnostics("https://rpc.example.com", startedAt, 2048);
 
     expect(debugSpy).toHaveBeenCalledTimes(1);
-    const [message, meta] = debugSpy.mock.calls[0];
+    const [message, meta] = (debugSpy.mock.calls as unknown as Array<[string, any]>)[0];
     expect(message).toEqual(expect.stringContaining("elapsedMs="));
     expect(message).toEqual(expect.stringContaining("payloadSizeBytes=2048"));
     expect(meta).toMatchObject({
