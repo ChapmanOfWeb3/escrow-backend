@@ -15,7 +15,9 @@
   "exclude": [
     "node_modules",
     "dist",
-    "__tests__/ledger-range-tracker-improvements.test.ts"
+    "__tests__/ledger-range-tracker-improvements.test.ts",
+    "__tests__/indexer-metrics-collector-concurrency.test.ts",
+    "__tests__/failover-recovery-backoff-retry.test.ts"
   ],
   "ts-node": {
     "esm": true

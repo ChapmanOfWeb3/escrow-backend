@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import { retryWithBackoff } from "../src/indexer/failover-recovery.js";
 
 describe("FailoverRecovery – retryWithBackoff", () => {
@@ -20,7 +21,9 @@ describe("FailoverRecovery – retryWithBackoff", () => {
       }) as unknown as typeof setTimeout);
 
     const timeoutError = new Error("ETIMEDOUT");
-    const operation = jest.fn().mockRejectedValue(timeoutError);
+    const operation = jest
+      .fn<() => Promise<unknown>>()
+      .mockRejectedValue(timeoutError);
 
     await expect(
       retryWithBackoff(operation, 4, 100)
@@ -35,7 +38,7 @@ describe("FailoverRecovery – retryWithBackoff", () => {
 
   it("returns the result once the operation succeeds within max attempts", async () => {
     const operation = jest
-      .fn()
+      .fn<() => Promise<string>>()
       .mockRejectedValueOnce(new Error("ETIMEDOUT"))
       .mockResolvedValueOnce("ok");
 

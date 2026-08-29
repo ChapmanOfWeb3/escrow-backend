@@ -470,3 +470,73 @@ export function collectIndexerMetrics(
     throw err;
   }
 }
+
+// ---------------------------------------------------------------------------
+// SQLite index structures for collector lookups (#335)
+// ---------------------------------------------------------------------------
+
+export const INDEXER_METRICS_INDEXES = {
+  eventsByType: "idx_events_event_type",
+  lastEventAt: "idx_events_created_at",
+  activeContracts: "idx_monitored_contracts_active",
+} as const;
+
+export const INDEXER_METRICS_QUERIES = {
+  lastLedger:
+    "SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'",
+  totalEvents: "SELECT COUNT(*) as count FROM events",
+  lastEventAt: "SELECT MAX(created_at) as last_at FROM events",
+  eventsByType:
+    "SELECT event_type, COUNT(*) as count FROM events GROUP BY event_type",
+  activeContracts:
+    "SELECT COUNT(*) as count FROM monitored_contracts WHERE active = 1",
+  subscriptions: "SELECT COUNT(*) as count FROM webhook_subscriptions",
+} as const;
+
+export function verifyIndexerMetricsIndexes(
+  targetDb?: Database.Database,
+): { valid: boolean; present: string[]; missing: string[] } {
+  const database = targetDb || getDb();
+  const names = new Set(
+    (
+      database
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name),
+  );
+  const expected = Object.values(INDEXER_METRICS_INDEXES);
+  const present = expected.filter((name) => names.has(name));
+  const missing = expected.filter((name) => !names.has(name));
+  return { valid: missing.length === 0, present, missing };
+}
+
+export function explainIndexerMetricsQueryPlan(
+  sql: string,
+  targetDb?: Database.Database,
+): Array<Record<string, unknown>> {
+  const database = targetDb || getDb();
+  return database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<
+    Record<string, unknown>
+  >;
+}
+
+export function metricsQueryPlanUsesIndex(
+  plan: Array<Record<string, unknown>>,
+  indexName: string,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && value.includes(indexName),
+    ),
+  );
+}
+
+export function metricsQueryPlanUsesTempBTree(
+  plan: Array<Record<string, unknown>>,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && /USE TEMP B-TREE/i.test(value),
+    ),
+  );
+}

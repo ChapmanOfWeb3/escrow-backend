@@ -7,6 +7,7 @@ import {
   withSchemaRetry,
   withSchemaRetrySync,
   isSchemaRetryableError,
+  SCHEMA_MANAGER_INDEXES,
 } from "../src/indexer/db.js";
 import { jest } from "@jest/globals";
 import logger from "../src/utils/logger.js";
@@ -490,12 +491,14 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
         expect(result).toBe("recovered");
         expect(calls).toBe(3);
 
-        const retryWarns = warnSpy.mock.calls.filter(
-          ([msg]) => msg === "schema_test failed, retrying",
-        );
+        const retryWarns = warnSpy.mock.calls.filter((call) => {
+          const [msg] = call as unknown as [string, { backoffMs: number }];
+          return msg === "schema_test failed, retrying";
+        });
         expect(retryWarns.length).toBe(2);
-        for (const [, meta] of retryWarns) {
-          delays.push((meta as { backoffMs: number }).backoffMs);
+        for (const call of retryWarns) {
+          const [, meta] = call as unknown as [string, { backoffMs: number }];
+          delays.push(meta.backoffMs);
         }
         expect(delays[0]).toBe(10);
         expect(delays[1]).toBe(20);
