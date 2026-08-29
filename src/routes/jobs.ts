@@ -34,6 +34,8 @@ import {
   byWalletSecurityHeaders,
   claimAutoReleaseCors,
   claimAutoReleaseSecurityHeaders,
+  buildTxCors,
+  buildTxSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
@@ -908,6 +910,8 @@ router.post(
 // ---------------------------------------------------------------------------
 router.post(
   "/build-tx",
+  buildTxCors,
+  buildTxSecurityHeaders,
   // buildTxRateLimit supersedes the generic strictLimiter for this route.
   buildTxRateLimit,
   // Schema validation for POST /api/jobs/build-tx payload
