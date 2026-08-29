@@ -18,6 +18,7 @@ import logger from "../utils/logger.js";
  * - Built-in retry logic for transient conflicts
  * - Migration verification hooks that validate the schema before starting (#331)
  * - High-frequency debug diagnostics for write speeds and payload sizes (#328)
+ * - Consecutive failure / stall threshold alerting (#329)
  */
 
 export interface WriteOperation<T> {
@@ -85,11 +86,11 @@ async function processWriteQueue(): Promise<void> {
 
     // If new items were added while processing, process them
     if (writeQueue.length > 0) {
-      processWriteQueue().catch((err) =>
-        logger.error("Error processing write queue", {
-          error: err instanceof Error ? err.message : String(err),
-        })
-      );
+      processWriteQueue().catch((err) => {
+        const error = err instanceof Error ? err.message : String(err);
+        logger.error("Error processing write queue", { error });
+        defaultMonitor.recordFailure("queue", { error, operation: "drain_write_queue" });
+      });
     }
   }
 }
@@ -112,6 +113,8 @@ async function executeWrite<T>(
   const startedAt = performance.now();
   let lastError: Error | null = null;
   let retryCount = 0;
+
+  defaultMonitor.checkStall();
 
   logWriterPoolDiagnostics({
     pool: POOL_NAME,
@@ -145,6 +148,8 @@ async function executeWrite<T>(
           executionTimeMs,
         });
       }
+
+      defaultMonitor.recordSuccess();
 
       logWriterPoolDiagnostics({
         pool: POOL_NAME,
@@ -204,6 +209,13 @@ async function executeWrite<T>(
         retries: attempt,
         executionTimeMs,
         error: lastError.message,
+      });
+      defaultMonitor.recordFailure("write", {
+        error: lastError.message,
+        operation: operationName,
+        retries: attempt,
+        executionTimeMs,
+        queueDepth: writeQueue.length,
       });
       logWriterPoolDiagnostics({
         pool: POOL_NAME,
@@ -270,9 +282,9 @@ export function queueWrite<T>(operation: WriteOperation<T>): Promise<WriteResult
     });
 
     processWriteQueue().catch((err) => {
-      logger.error("Error processing write queue", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      const error = err instanceof Error ? err.message : String(err);
+      logger.error("Error processing write queue", { error });
+      defaultMonitor.recordFailure("queue", { error, operation: "drain_write_queue" });
     });
   });
 }
@@ -467,6 +479,208 @@ export function logWriterPoolDiagnostics(
     parts.push(`attempt=${diagnostics.attempt}`);
   }
   logger.debug(parts.join(" "), diagnostics);
+}
+
+// ---------------------------------------------------------------------------
+// Consecutive failure / stall alerting (#329)
+// ---------------------------------------------------------------------------
+
+/** Consecutive write failures before a warning alert is raised. */
+export const DEFAULT_WRITER_POOL_FAILURE_THRESHOLD = 3;
+
+/** Elapsed ms without a successful write before a stall alert is raised. */
+export const DEFAULT_WRITER_POOL_STALL_THRESHOLD_MS = 120_000;
+
+export type WriterPoolFailureType = "write" | "queue" | "stall";
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    logger.warn("database_writer_pool ignoring invalid threshold config", {
+      pool: POOL_NAME,
+      variable: name,
+      received: raw,
+      fallback,
+    });
+    return fallback;
+  }
+  return value;
+}
+
+/**
+ * Read alert thresholds from `WRITER_POOL_FAILURE_THRESHOLD` and
+ * `WRITER_POOL_STALL_THRESHOLD_MS`. Invalid values fall back to the defaults
+ * with a warning rather than throwing – alerting must not take writes down.
+ */
+export function getWriterPoolAlertConfig(): {
+  failureThreshold: number;
+  stallThresholdMs: number;
+} {
+  return {
+    failureThreshold: readPositiveIntEnv(
+      "WRITER_POOL_FAILURE_THRESHOLD",
+      DEFAULT_WRITER_POOL_FAILURE_THRESHOLD,
+    ),
+    stallThresholdMs: readPositiveIntEnv(
+      "WRITER_POOL_STALL_THRESHOLD_MS",
+      DEFAULT_WRITER_POOL_STALL_THRESHOLD_MS,
+    ),
+  };
+}
+
+export interface WriterPoolMonitorOptions {
+  name?: string;
+  failureThreshold?: number;
+  stallThresholdMs?: number;
+}
+
+/**
+ * Tracks consecutive write failures and write stalls, raising a warning
+ * alert once the configured counts are reached (#329).
+ *
+ * Every failure is logged as an error; the warning alert fires only when the
+ * consecutive-failure threshold is first reached so the same outage is not
+ * re-alerted on every subsequent attempt. A successful write clears the state.
+ */
+export class WriterPoolFailureMonitor {
+  readonly pool: string;
+  readonly failureThreshold: number;
+  readonly stallThresholdMs: number;
+
+  private consecutiveFailures = 0;
+  private lastSuccessfulAt: number | null = null;
+  private alertActive = false;
+  private stallAlerted = false;
+
+  constructor(options: WriterPoolMonitorOptions = {}) {
+    const env = getWriterPoolAlertConfig();
+    this.pool = options.name ?? POOL_NAME;
+    this.failureThreshold = options.failureThreshold ?? env.failureThreshold;
+    this.stallThresholdMs = options.stallThresholdMs ?? env.stallThresholdMs;
+  }
+
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  getLastSuccessfulAt(): number | null {
+    return this.lastSuccessfulAt;
+  }
+
+  isAlertActive(): boolean {
+    return this.alertActive;
+  }
+
+  /**
+   * Record a failed write. Returns the new consecutive-failure count.
+   * Emits an error every time and a warning alert only when the configured
+   * threshold is first reached (no duplicate alerts while already over).
+   */
+  recordFailure(
+    failureType: WriterPoolFailureType,
+    details: {
+      error?: string;
+      operation?: string;
+      retries?: number;
+      executionTimeMs?: number;
+      queueDepth?: number;
+    } = {},
+  ): number {
+    this.consecutiveFailures += 1;
+
+    const payload = {
+      pool: this.pool,
+      failureType,
+      operation: details.operation,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      retries: details.retries,
+      executionTimeMs: details.executionTimeMs,
+      queueDepth: details.queueDepth,
+      error: details.error,
+    };
+
+    logger.error("database_writer_pool operation failed", payload);
+
+    if (this.consecutiveFailures === this.failureThreshold) {
+      this.alertActive = true;
+      logger.warn(
+        "database_writer_pool alert: consecutive failure threshold reached",
+        {
+          ...payload,
+          action:
+            "Inspect SQLite writer contention, disk health, and queued operations; alerting clears automatically after the next successful write.",
+        },
+      );
+    }
+
+    return this.consecutiveFailures;
+  }
+
+  /** Record a successful write, clearing any active failure or stall alert. */
+  recordSuccess(): void {
+    const hadFailures = this.consecutiveFailures > 0 || this.alertActive;
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = Date.now();
+    if (hadFailures) {
+      logger.info("database_writer_pool recovered after consecutive failures", {
+        pool: this.pool,
+      });
+    }
+    this.alertActive = false;
+    this.stallAlerted = false;
+  }
+
+  /**
+   * Warn when no successful write has landed inside the stall window.
+   * Does not increment the consecutive-failure counter. A stall is reported
+   * once per quiet period so the same condition is not re-logged on every
+   * subsequent write attempt.
+   */
+  checkStall(): boolean {
+    if (this.lastSuccessfulAt === null) return false;
+    const elapsedMs = Date.now() - this.lastSuccessfulAt;
+    if (elapsedMs <= this.stallThresholdMs) return false;
+    if (this.stallAlerted) return true;
+
+    this.stallAlerted = true;
+    logger.warn("database_writer_pool alert: write stall threshold reached", {
+      pool: this.pool,
+      failureType: "stall" as const,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      stallThresholdMs: this.stallThresholdMs,
+      elapsedMs,
+      queueDepth: writeQueue.length,
+      action:
+        "No successful database_writer_pool write within the stall window; inspect queue depth, lock contention, and disk health.",
+    });
+    return true;
+  }
+
+  reset(): void {
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = null;
+    this.alertActive = false;
+    this.stallAlerted = false;
+  }
+}
+
+let defaultMonitor = new WriterPoolFailureMonitor();
+
+/** The monitor backing queued write operations. */
+export function getWriterPoolFailureMonitor(): WriterPoolFailureMonitor {
+  return defaultMonitor;
+}
+
+/**
+ * Clear writer-pool alert state and re-read the threshold configuration.
+ * Intended for tests and for reloads after a config change.
+ */
+export function resetWriterPoolFailureState(): void {
+  defaultMonitor = new WriterPoolFailureMonitor();
 }
 
 // ---------------------------------------------------------------------------
@@ -707,4 +921,5 @@ export function resetWriterPoolStartState(): void {
   enforceStart = false;
   lastSchemaReport = null;
   migrationHooks.clear();
+  resetWriterPoolFailureState();
 }
