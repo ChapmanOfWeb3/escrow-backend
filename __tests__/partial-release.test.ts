@@ -15,7 +15,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
   },
 }));
 
-const { default: router } = await import("../src/routes/jobs.js");
+const { default: router, resetPartialReleaseCache } = await import("../src/routes/jobs.js");
 const { resetPartialReleaseRateLimitBuckets } = await import(
   "../src/middleware/job-contract-rate-limit.js"
 );
@@ -35,6 +35,7 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
     resetPartialReleaseRateLimitBuckets();
+    resetPartialReleaseCache();
 
     mockGetAccount.mockResolvedValue({
       accountId: () => VALID_ADDRESS,
@@ -298,7 +299,11 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
     });
 
     afterEach(() => {
-      process.env.API_KEY = originalApiKey;
+      if (originalApiKey === undefined) {
+        delete process.env.API_KEY;
+      } else {
+        process.env.API_KEY = originalApiKey;
+      }
     });
 
     it("returns 401 when API_KEY is set and no key is provided", async () => {
@@ -392,6 +397,49 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
       expect(res.headers["x-ratelimit-limit"]).toBeDefined();
       expect(res.headers["x-ratelimit-remaining"]).toBeDefined();
       expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+    });
+  });
+
+  // --- ISSUE #116: Node-Cache in-memory caching ---
+  describe("Node-Cache in-memory caching (Issue #116)", () => {
+    beforeEach(() => {
+      mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    });
+
+    it("serves concurrent requests from the in-flight cache, hitting Soroban only once", async () => {
+      const app = buildApp();
+      
+      let resolvePrepare: (val: any) => void;
+      mockPrepareTransaction.mockReturnValue(
+        new Promise((resolve) => {
+          resolvePrepare = resolve;
+        })
+      );
+
+      const req1 = request(app).post(ENDPOINT).send(VALID_BODY);
+      const req2 = request(app).post(ENDPOINT).send(VALID_BODY);
+
+      await new Promise((r) => setTimeout(r, 50));
+      resolvePrepare!({ toXDR: () => "AAAAAQ==" });
+
+      const [res1, res2] = await Promise.all([req1, req2]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res1.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+      expect(res2.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+      expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("serves subsequent requests from NodeCache, hitting Soroban only once", async () => {
+      const app = buildApp();
+      
+      const res1 = await request(app).post(ENDPOINT).send(VALID_BODY);
+      const res2 = await request(app).post(ENDPOINT).send(VALID_BODY);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
     });
   });
 });

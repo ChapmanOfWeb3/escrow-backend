@@ -153,6 +153,20 @@ export function resetTimeRemainingCache(): void {
   inFlightTimeRemainingRequests.clear();
 }
 
+const PARTIAL_RELEASE_CACHE_TTL = parseInt(
+  process.env.PARTIAL_RELEASE_CACHE_TTL_S || "30",
+  10,
+);
+export const partialReleaseCache = new NodeCache({
+  stdTTL: PARTIAL_RELEASE_CACHE_TTL,
+  useClones: false,
+});
+const inFlightPartialReleaseRequests = new Map<string, Promise<string>>();
+export function resetPartialReleaseCache(): void {
+  partialReleaseCache.flushAll();
+  inFlightPartialReleaseRequests.clear();
+}
+
 // ---------------------------------------------------------------------------
 // Simulation error helpers  (#83)
 // ---------------------------------------------------------------------------
@@ -1045,46 +1059,83 @@ router.post(
         sourceAddress,
       });
 
-      const contract = new Contract(contractId as string);
-
-      let account;
-      try {
-        account = await server.getAccount(sourceAddress as string);
-      } catch (err: any) {
-        const errMsg = String(err?.message || err);
-        const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
-        sendError(res, status, message);
+      const cacheKey = `partialRelease:${contractId}:${index}:${amount}:${sourceAddress}`;
+      const cached = partialReleaseCache.get<string>(cacheKey);
+      if (cached !== undefined) {
+        logger.info("Partial-release XDR served from cache", { contractId, index });
+        res.json({ success: true, xdr: cached });
         return;
       }
 
-      const amountNum = BigInt(amount);
+      let requestPromise = inFlightPartialReleaseRequests.get(cacheKey);
+      const servedFromInFlight = Boolean(requestPromise);
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(contract.call(
-          "approve_partial",
-          Address.fromString(sourceAddress).toScVal(),
-          nativeToScVal(Number(index), { type: "u32" }),
-          nativeToScVal(amountNum, { type: "i128" })
-        ))
-        .setTimeout(30)
-        .build();
+      if (!requestPromise) {
+        requestPromise = (async (): Promise<string> => {
+          const contract = new Contract(contractId as string);
 
-      let prepared;
-      try {
-        prepared = await server.prepareTransaction(tx);
-      } catch (err: any) {
-        const errMsg = String(err?.message || err);
-        const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
-        sendError(res, status, message);
-        return;
+          let account;
+          try {
+            account = await server.getAccount(sourceAddress as string);
+          } catch (err: any) {
+            const errMsg = String(err?.message || err);
+            const { status, message } = classifySimError(errMsg);
+            logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+            throw { status, message };
+          }
+
+          const amountNum = BigInt(amount);
+
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASE,
+          })
+            .addOperation(contract.call(
+              "approve_partial",
+              Address.fromString(sourceAddress).toScVal(),
+              nativeToScVal(Number(index), { type: "u32" }),
+              nativeToScVal(amountNum, { type: "i128" })
+            ))
+            .setTimeout(30)
+            .build();
+
+          let prepared;
+          try {
+            prepared = await server.prepareTransaction(tx);
+          } catch (err: any) {
+            const errMsg = String(err?.message || err);
+            const { status, message } = classifySimError(errMsg);
+            logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+            throw { status, message };
+          }
+
+          const xdr = prepared.toXDR();
+          partialReleaseCache.set(cacheKey, xdr);
+          return xdr;
+        })();
+
+        inFlightPartialReleaseRequests.set(cacheKey, requestPromise);
       }
 
-      res.json({ success: true, xdr: prepared.toXDR() });
+      let xdr: string;
+      try {
+        xdr = await requestPromise;
+      } catch (err: any) {
+        partialReleaseCache.del(cacheKey);
+        if (err && err.status) {
+          sendError(res, err.status, err.message);
+          return;
+        }
+        throw err;
+      } finally {
+        inFlightPartialReleaseRequests.delete(cacheKey);
+      }
+
+      if (servedFromInFlight) {
+        logger.info("Partial-release XDR served from in-flight cache", { contractId, index });
+      }
+
+      res.json({ success: true, xdr });
     } catch (err: any) {
       const errMsg = String(err?.message || err);
       logger.error("Unexpected error in partial release", { error: errMsg });
