@@ -1,3 +1,4 @@
+import type Database from "better-sqlite3";
 import {
   getDb,
   getShippedMigrationVersions,
@@ -527,10 +528,139 @@ export function getMigrationVerificationHookNames(): string[] {
   return [...migrationHooks.keys()];
 }
 
+// ---------------------------------------------------------------------------
+// SQLite index structures for write-path lookups (#326)
+// ---------------------------------------------------------------------------
+//
+// The pool serializes writes against the shared indexer schema. The indexes
+// below cover the lookup / filter / uniqueness patterns those writes actually
+// use (keyed UPDATE/DELETE, INSERT OR IGNORE conflict checks, read-then-write
+// existence probes). Unique constraints already provide covering indexes for
+// several of those paths; they are listed separately so we do not create
+// redundant secondary indexes that would only slow the write-heavy queue.
+
+/** Named indexes the writer pool's lookups depend on. */
+export const WRITER_POOL_INDEXES = {
+  eventContractLedger: "idx_events_contract_ledger",
+  webhookByContract: "idx_webhook_subscriptions_contract",
+  webhookByUrl: "idx_webhook_subscriptions_webhook_url",
+  activeContracts: "idx_monitored_contracts_active",
+} as const;
+
+/**
+ * Unique / primary-key indexes created by table constraints. These already
+ * cover equality lookups; adding a second B-tree on the same columns would
+ * be redundant and would tax every INSERT/UPDATE/DELETE.
+ */
+export const WRITER_POOL_UNIQUE_INDEXES = {
+  eventDedup: "sqlite_autoindex_events_1",
+  indexerStateKey: "sqlite_autoindex_indexer_state_1",
+  monitoredContractId: "sqlite_autoindex_monitored_contracts_1",
+  webhookContractUrl: "sqlite_autoindex_webhook_subscriptions_1",
+} as const;
+
+/** Parameterized lookup SQL exercised by writer-pool write paths. */
+export const WRITER_POOL_QUERIES = {
+  eventDedup:
+    "SELECT id FROM events WHERE contract_id = ? AND ledger_sequence = ? AND event_type = ?",
+  eventContractLedger:
+    "SELECT id FROM events WHERE contract_id = ? AND ledger_sequence = ?",
+  ledgerPointer:
+    "SELECT value FROM indexer_state WHERE key = ?",
+  updateLedger:
+    "UPDATE indexer_state SET value = ? WHERE key = ?",
+  contractById:
+    "SELECT * FROM monitored_contracts WHERE contract_id = ?",
+  updateContract:
+    "UPDATE monitored_contracts SET active = 0 WHERE contract_id = ?",
+  activeContracts:
+    "SELECT contract_id FROM monitored_contracts WHERE active = 1",
+  webhookByContract:
+    "SELECT * FROM webhook_subscriptions WHERE contract_id = ?",
+  webhookByContractUrl:
+    "SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?",
+  webhookByUrl:
+    "SELECT * FROM webhook_subscriptions WHERE webhook_url = ?",
+  deleteWebhookByUrl:
+    "DELETE FROM webhook_subscriptions WHERE webhook_url = ?",
+  schemaVersionLookup:
+    "SELECT version FROM schema_migrations WHERE version = ?",
+} as const;
+
+export interface WriterPoolIndexReport {
+  valid: boolean;
+  present: string[];
+  missing: string[];
+}
+
+function listIndexNames(database: Database.Database): string[] {
+  return (
+    database
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+      .all() as Array<{ name: string }>
+  ).map((row) => row.name);
+}
+
+/**
+ * Confirm every named and uniqueness index the writer pool relies on exists.
+ */
+export function verifyWriterPoolIndexes(
+  targetDb?: Database.Database,
+): WriterPoolIndexReport {
+  const database = targetDb ?? getDb();
+  const names = new Set(listIndexNames(database));
+  const expected = [
+    ...Object.values(WRITER_POOL_INDEXES),
+    ...Object.values(WRITER_POOL_UNIQUE_INDEXES),
+  ];
+  const present = expected.filter((name) => names.has(name));
+  const missing = expected.filter((name) => !names.has(name));
+  return { valid: missing.length === 0, present, missing };
+}
+
+/**
+ * Return SQLite EXPLAIN QUERY PLAN rows for a writer-pool lookup.
+ */
+export function explainWriterPoolQueryPlan(
+  sql: string,
+  params: unknown[] = [],
+  targetDb?: Database.Database,
+): Array<Record<string, unknown>> {
+  const database = targetDb ?? getDb();
+  return database
+    .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+    .all(...params) as Array<Record<string, unknown>>;
+}
+
+/** True when any EXPLAIN QUERY PLAN detail references `indexName`. */
+export function writerPoolQueryPlanUsesIndex(
+  plan: Array<Record<string, unknown>>,
+  indexName: string,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && value.includes(indexName),
+    ),
+  );
+}
+
+/** True when the planner would build a temporary B-tree (sort / group). */
+export function writerPoolQueryPlanUsesTempBTree(
+  plan: Array<Record<string, unknown>>,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) =>
+        typeof value === "string" &&
+        /USE TEMP B-TREE/i.test(value),
+    ),
+  );
+}
+
 /**
  * Verify the database schema the pool writes through: the migrations table
- * exists, every shipped migration is applied, the expected tables and columns
- * are present, and any registered hooks pass.
+ * exists, every shipped migration is applied, the expected tables, columns,
+ * and write-path indexes are present, and any registered hooks pass.
  *
  * Returns a report instead of throwing so callers can log or degrade; use
  * `assertWriterPoolSchemaReady` to fail fast.
@@ -570,6 +700,19 @@ export function verifyWriterPoolSchema(): WriterPoolSchemaReport {
         ([table, columns]) => `missing columns in ${table}: ${columns.join(", ")}`,
       ),
       ...integrity.errors,
+    );
+  }
+
+  try {
+    const indexReport = verifyWriterPoolIndexes();
+    if (!indexReport.valid) {
+      issues.push(
+        ...indexReport.missing.map((name) => `missing index: ${name}`),
+      );
+    }
+  } catch (err) {
+    issues.push(
+      `writer-pool indexes unreadable: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 

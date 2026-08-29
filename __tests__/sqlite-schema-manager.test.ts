@@ -337,7 +337,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         const versions = (cleanDb
           .prepare("SELECT version FROM schema_migrations ORDER BY version")
           .all() as Array<{ version: number }>).map((r) => r.version);
-        expect(versions).toEqual([1, 2, 3]);
+        expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7]);
 
         const ledger = cleanDb
           .prepare("SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'")

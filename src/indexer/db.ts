@@ -162,6 +162,14 @@ const MIGRATIONS: Migration[] = [
         ON events (event_type);
     `,
   },
+  {
+    version: 7,
+    description: "add database_writer_pool write-path lookup indexes (#326)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_webhook_url
+        ON webhook_subscriptions (webhook_url);
+    `,
+  },
 ];
 
 /**
