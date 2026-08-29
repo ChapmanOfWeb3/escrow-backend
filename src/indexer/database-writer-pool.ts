@@ -1,8 +1,10 @@
 import {
   getDb,
+  insertEvent,
   getShippedMigrationVersions,
   verifySchemaIntegrity,
   verifySchemaUpToDate,
+  type EventRow,
 } from "./db.js";
 import logger from "../utils/logger.js";
 
@@ -16,6 +18,7 @@ import logger from "../utils/logger.js";
  * - Automatic rollback on failures
  * - Queue-based serialization to prevent writer contention
  * - Built-in retry logic for transient conflicts
+ * - In-memory queue locks for concurrent event notifications (#327)
  * - Migration verification hooks that validate the schema before starting (#331)
  * - High-frequency debug diagnostics for write speeds and payload sizes (#328)
  */
@@ -407,6 +410,305 @@ export function createReadWriteOperation<T>(
 }
 
 // ---------------------------------------------------------------------------
+// In-memory event queue locks (#327)
+// ---------------------------------------------------------------------------
+
+/** Default ceiling on event rows held in memory before an overflow is raised. */
+export const DEFAULT_WRITER_POOL_EVENT_QUEUE_MAX_SIZE = 10_000;
+
+export class WriterPoolEventQueueOverflowError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WriterPoolEventQueueOverflowError";
+  }
+}
+
+/**
+ * Persist a single event row. Returns true when a new row was written and
+ * false when the store already held it. Defaults to a `queueWrite` +
+ * `INSERT OR IGNORE` so inserts still go through the writer pool.
+ */
+export type WriterPoolEventPersistFn = (
+  event: EventRow,
+) => boolean | Promise<boolean>;
+
+export interface WriterPoolEventQueueOptions {
+  persist?: WriterPoolEventPersistFn;
+  maxQueueSize?: number;
+  /** Instance name used in queue diagnostics. */
+  name?: string;
+}
+
+export interface WriterPoolEventEnqueueResult {
+  queuedCount: number;
+  duplicateCount: number;
+}
+
+export interface WriterPoolEventFlushResult {
+  processedCount: number;
+  insertedCount: number;
+  duplicateCount: number;
+}
+
+export interface WriterPoolEventSubmitResult {
+  queuedCount: number;
+  insertedCount: number;
+  duplicateCount: number;
+}
+
+/** Identity used by the events table UNIQUE(contract_id, ledger_sequence, event_type). */
+export function writerPoolEventIdentityKey(
+  event: Pick<EventRow, "contractId" | "eventType" | "ledgerSequence">,
+): string {
+  return `${event.contractId}|${event.ledgerSequence}|${event.eventType}`;
+}
+
+function validatePositiveInt(name: string, value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer, received ${String(value)}`);
+  }
+  return value;
+}
+
+/**
+ * Persist through the writer pool so concurrent notifications share the same
+ * transaction + retry path as every other `queueWrite` caller.
+ */
+async function defaultPersistEvent(event: EventRow): Promise<boolean> {
+  const result = await queueWrite({
+    name: "insert-event",
+    execute: () =>
+      insertEvent(
+        event.contractId,
+        event.eventType,
+        event.ledgerSequence,
+        event.timestamp,
+        event.dataJson,
+      ),
+  });
+  if (!result.success) {
+    throw result.error ?? new Error("insert-event failed");
+  }
+  return Boolean(result.data);
+}
+
+/**
+ * Bounded in-memory queue that serializes event inserts per event identity.
+ *
+ * Concurrent `database_writer_pool` notifications routinely carry the same
+ * event (overlapping poll windows, retried pages, several writers in one
+ * process). Without a lock, two callers can both observe "not indexed yet"
+ * and both insert. The queue closes that window: every row is drained under
+ * a lock keyed on `contractId|ledgerSequence|eventType`, and the persisted-
+ * key set is checked inside that lock, so exactly one caller writes each
+ * event. Unrelated events still persist concurrently.
+ */
+export class WriterPoolEventQueue {
+  readonly name: string;
+  readonly maxQueueSize: number;
+
+  private readonly persist: WriterPoolEventPersistFn;
+  private readonly pending: EventRow[] = [];
+  private readonly pendingKeys = new Set<string>();
+  private readonly persistedKeys = new Set<string>();
+  private readonly lockTails = new Map<string, Promise<void>>();
+  private readonly heldLocks = new Set<string>();
+  private queueMutex: Promise<void> = Promise.resolve();
+
+  constructor(options: WriterPoolEventQueueOptions = {}) {
+    this.name = options.name ?? "database_writer_pool";
+    this.persist = options.persist ?? defaultPersistEvent;
+    this.maxQueueSize = validatePositiveInt(
+      "maxQueueSize",
+      options.maxQueueSize ?? DEFAULT_WRITER_POOL_EVENT_QUEUE_MAX_SIZE,
+    );
+  }
+
+  /** Rows currently waiting to be flushed. */
+  get size(): number {
+    return this.pending.length;
+  }
+
+  /** Event locks held right now – exposed for concurrency assertions. */
+  get heldLockCount(): number {
+    return this.heldLocks.size;
+  }
+
+  /** Distinct event identities this queue has already persisted. */
+  get persistedKeyCount(): number {
+    return this.persistedKeys.size;
+  }
+
+  hasPersisted(
+    event: Pick<EventRow, "contractId" | "eventType" | "ledgerSequence">,
+  ): boolean {
+    return this.persistedKeys.has(writerPoolEventIdentityKey(event));
+  }
+
+  /** Drop all queue state. Intended for tests and process restarts. */
+  reset(): void {
+    this.pending.length = 0;
+    this.pendingKeys.clear();
+    this.persistedKeys.clear();
+    this.lockTails.clear();
+    this.heldLocks.clear();
+    this.queueMutex = Promise.resolve();
+  }
+
+  /**
+   * Serialize mutations of the queue structure itself, so concurrent
+   * enqueue/flush callers never interleave a read and a write of `pending`.
+   */
+  private async withQueueMutex<T>(fn: () => T): Promise<T> {
+    const previous = this.queueMutex;
+    let release!: () => void;
+    this.queueMutex = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await previous;
+      return fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Serialize work for one event identity. Unrelated keys run concurrently and
+   * the lock is always released, including when `fn` throws.
+   */
+  private async withEventLock<T>(
+    key: string,
+    fn: () => Promise<T> | T,
+  ): Promise<T> {
+    const previous = this.lockTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(
+      () => gate,
+      () => gate,
+    );
+    this.lockTails.set(key, tail);
+
+    try {
+      await previous.catch(() => undefined);
+      this.heldLocks.add(key);
+      return await fn();
+    } finally {
+      this.heldLocks.delete(key);
+      release();
+      if (this.lockTails.get(key) === tail) {
+        this.lockTails.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Queue rows for insertion, dropping any already queued or already
+   * persisted. Throws `WriterPoolEventQueueOverflowError` past `maxQueueSize`.
+   */
+  async enqueue(events: EventRow[]): Promise<WriterPoolEventEnqueueResult> {
+    return this.withQueueMutex(() => {
+      let queuedCount = 0;
+      let duplicateCount = 0;
+
+      for (const event of events) {
+        const key = writerPoolEventIdentityKey(event);
+        if (this.pendingKeys.has(key) || this.persistedKeys.has(key)) {
+          duplicateCount++;
+          continue;
+        }
+        if (this.pending.length >= this.maxQueueSize) {
+          throw new WriterPoolEventQueueOverflowError(
+            `${this.name} event queue is full (maxQueueSize=${this.maxQueueSize})`,
+          );
+        }
+        this.pendingKeys.add(key);
+        this.pending.push(event);
+        queuedCount++;
+      }
+
+      return { queuedCount, duplicateCount };
+    });
+  }
+
+  /** Drain the queue, persisting each row under its own event lock. */
+  async flush(): Promise<WriterPoolEventFlushResult> {
+    let processedCount = 0;
+    let insertedCount = 0;
+    let duplicateCount = 0;
+
+    for (;;) {
+      const next = await this.withQueueMutex(() => this.pending.shift());
+      if (!next) break;
+
+      const key = writerPoolEventIdentityKey(next);
+      processedCount++;
+
+      await this.withEventLock(key, async () => {
+        try {
+          if (this.persistedKeys.has(key)) {
+            duplicateCount++;
+            return;
+          }
+          const inserted = await this.persist(next);
+          this.persistedKeys.add(key);
+          if (inserted) {
+            insertedCount++;
+          } else {
+            duplicateCount++;
+          }
+        } finally {
+          this.pendingKeys.delete(key);
+        }
+      });
+    }
+
+    return { processedCount, insertedCount, duplicateCount };
+  }
+
+  /** Enqueue and flush in one step – the entry point for event notifications. */
+  async submit(events: EventRow[]): Promise<WriterPoolEventSubmitResult> {
+    const enqueued = await this.enqueue(events);
+    const flushed = await this.flush();
+
+    const result: WriterPoolEventSubmitResult = {
+      queuedCount: enqueued.queuedCount,
+      insertedCount: flushed.insertedCount,
+      duplicateCount: enqueued.duplicateCount + flushed.duplicateCount,
+    };
+
+    logger.debug("database_writer_pool event queue submit", {
+      queue: this.name,
+      submitted: events.length,
+      ...result,
+    });
+
+    return result;
+  }
+}
+
+const defaultEventQueue = new WriterPoolEventQueue();
+
+/** The process-wide queue used by `submitEventNotifications`. */
+export function getWriterPoolEventQueue(): WriterPoolEventQueue {
+  return defaultEventQueue;
+}
+
+/**
+ * Index a batch of event notifications through the locked memory queue and
+ * the writer pool. Concurrent callers sharing an event identity collapse to
+ * a single insert; unrelated identities proceed in parallel.
+ */
+export function submitEventNotifications(
+  events: EventRow[],
+): Promise<WriterPoolEventSubmitResult> {
+  return defaultEventQueue.submit(events);
+}
+
+// ---------------------------------------------------------------------------
 // Polling diagnostics (#328)
 // ---------------------------------------------------------------------------
 
@@ -701,10 +1003,11 @@ export function getWriterPoolSchemaReport(): WriterPoolSchemaReport | null {
   return lastSchemaReport;
 }
 
-/** Reset start/enforcement state and registered hooks. Intended for tests. */
+/** Reset start/enforcement state, registered hooks, and event-queue locks. Intended for tests. */
 export function resetWriterPoolStartState(): void {
   poolStarted = false;
   enforceStart = false;
   lastSchemaReport = null;
   migrationHooks.clear();
+  defaultEventQueue.reset();
 }
