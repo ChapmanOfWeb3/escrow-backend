@@ -26,6 +26,35 @@ afterAll(() => {
 });
 
 describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
+  describe("Address Validation (#118)", () => {
+    it("returns 400 for an invalid contractId format", async () => {
+      const res = await request(app)
+        .get("/api/jobs/not-a-valid-contract/milestones/0/time-remaining")
+        .expect(400);
+      expect(res.body).toMatchObject({
+        success: false,
+        error: "ValidationError",
+        details: expect.arrayContaining([
+          expect.objectContaining({ field: "contractId" }),
+        ]),
+      });
+    });
+
+    it("returns 400 when contractId is a stellar account (G...)", async () => {
+      const VALID_ACCOUNT = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
+      const res = await request(app)
+        .get(`/api/jobs/${VALID_ACCOUNT}/milestones/0/time-remaining`)
+        .expect(400);
+      expect(res.body).toMatchObject({
+        success: false,
+        error: "ValidationError",
+        details: expect.arrayContaining([
+          expect.objectContaining({ field: "contractId" }),
+        ]),
+      });
+    });
+  });
+
   describe("#120 – CORS and Security Headers", () => {
     const originalAllowedOrigins = process.env.ALLOWED_ORIGINS;
 
