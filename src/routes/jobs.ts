@@ -1016,10 +1016,10 @@ router.post(
 router.post(
   "/:contractId/milestones/:index/partial-release",
   partialReleaseRateLimit,
-  validate(contractMilestoneParamsSchema, "params", (req) =>
+  validateWithFields(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for partial-release", { params: req.params }),
   ),
-  validate(partialReleaseBodySchema, "body", (req) =>
+  validateWithFields(partialReleaseBodySchema, "body", (req) =>
     logger.warn("Invalid body for partial-release", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
