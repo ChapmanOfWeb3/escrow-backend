@@ -439,6 +439,23 @@ export function verifySchemaUpToDate(): void {
 // Schema verification hooks (#264)
 // ---------------------------------------------------------------------------
 
+/**
+ * Index names created by the schema manager migrations. Exported so modules
+ * and tests can assert the exact lookup indexes the schema manager relies on
+ * without hardcoding names (#259).
+ */
+export const SCHEMA_MANAGER_INDEXES = [
+  "idx_events_contract_id",
+  "idx_events_ledger_sequence",
+  "idx_events_contract_ledger",
+  "idx_events_contract_type",
+  "idx_webhook_subscriptions_contract",
+  "idx_events_ledger_event_type",
+  "idx_monitored_contracts_active",
+  "idx_events_created_at",
+  "idx_events_contract_type_ledger",
+] as const;
+
 export interface SchemaVerificationResult {
   valid: boolean;
   missingTables: string[];

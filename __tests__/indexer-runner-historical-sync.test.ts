@@ -25,7 +25,9 @@ jest.unstable_mockModule("../src/indexer/webhook-delivery.js", () => ({
 }));
 
 const mockGetLatestLedger = jest.fn<() => Promise<{ sequence: number }>>();
-const mockGetEvents = jest.fn<() => Promise<{ events: any[] }>>();
+const mockGetEvents = jest.fn<
+  (opts?: unknown) => Promise<{ events: any[] }>
+>();
 
 jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
   Server: jest.fn().mockImplementation(() => ({
