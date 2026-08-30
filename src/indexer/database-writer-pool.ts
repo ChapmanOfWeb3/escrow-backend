@@ -29,6 +29,7 @@ import logger from "../utils/logger.js";
  * - Migration verification hooks that validate the schema before starting (#331)
  * - High-frequency debug diagnostics for write speeds and payload sizes (#328)
  * - Dynamic historical start/end ledger ranges for custom event imports (#330)
+ * - Exponential backoff retry for RPC connection timeout errors
  */
 
 export interface WriteOperation<T> {
@@ -41,7 +42,74 @@ export interface WriteResult<T> {
   data?: T;
   error?: Error;
   retries: number;
+  rpcRetries: number;
   executionTimeMs: number;
+}
+
+/**
+ * Configuration for exponential backoff retry on RPC connection timeout errors.
+ * Follows the same naming conventions as RpcRetryConfig in rpc-poller-client.
+ */
+export interface WriterPoolRpcRetryConfig {
+  maxRetries: number;
+  initialBackoffMs: number;
+  backoffMultiplier: number;
+  maxBackoffMs: number;
+}
+
+const DEFAULT_RPC_RETRY_CONFIG: WriterPoolRpcRetryConfig = {
+  maxRetries: 5,
+  initialBackoffMs: 1000,
+  backoffMultiplier: 2,
+  maxBackoffMs: 30_000,
+};
+
+let rpcRetryConfig: WriterPoolRpcRetryConfig = { ...DEFAULT_RPC_RETRY_CONFIG };
+
+const RPC_RETRYABLE_PATTERNS = [
+  "timeout",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "network",
+  "status 429",
+  "status 503",
+  "status 502",
+  "request timeout",
+  "connect timeout",
+];
+
+export function isRpcTimeoutError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return RPC_RETRYABLE_PATTERNS.some((p) => msg.includes(p.toLowerCase()));
+}
+
+export function computeRpcBackoffMs(
+  attempt: number,
+  config: Pick<WriterPoolRpcRetryConfig, "initialBackoffMs" | "backoffMultiplier" | "maxBackoffMs">
+): number {
+  return Math.min(
+    config.initialBackoffMs * Math.pow(config.backoffMultiplier, attempt),
+    config.maxBackoffMs
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function setWriterPoolRpcRetryConfig(config: Partial<WriterPoolRpcRetryConfig>): void {
+  rpcRetryConfig = { ...rpcRetryConfig, ...config };
+}
+
+export function getWriterPoolRpcRetryConfig(): WriterPoolRpcRetryConfig {
+  return { ...rpcRetryConfig };
+}
+
+export function resetWriterPoolRpcRetryConfig(): void {
+  rpcRetryConfig = { ...DEFAULT_RPC_RETRY_CONFIG };
 }
 
 /**
@@ -108,12 +176,13 @@ async function processWriteQueue(): Promise<void> {
 /**
  * Execute a single write operation inside a transaction.
  * Automatically retries on transient failures (e.g., database locked).
+ * This handles DB-level retries; RPC-level retries are handled by the outer wrapper.
  *
  * @param operation The write operation to execute
- * @param maxRetries Maximum number of retry attempts
- * @returns WriteResult with success status, data, error, and metrics
+ * @param maxRetries Maximum number of retry attempts for DB conflicts
+ * @returns WriteResult with success status, data, error, and metrics (rpcRetries always 0)
  */
-async function executeWrite<T>(
+async function executeWriteWithDbRetry<T>(
   operation: WriteOperation<T>,
   maxRetries: number = 3
 ): Promise<WriteResult<T>> {
@@ -172,19 +241,18 @@ async function executeWrite<T>(
         success: true,
         data: result,
         retries: attempt,
+        rpcRetries: 0,
         executionTimeMs,
       };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       retryCount = attempt;
 
-      // Check if error is retryable (database locked)
       const isRetryable =
         lastError.message.includes("database is locked") ||
         lastError.message.includes("SQLITE_BUSY");
 
       if (attempt < maxRetries && isRetryable) {
-        // Exponential backoff: 10ms, 50ms, 250ms
         const backoffMs = Math.min(10 * Math.pow(5, attempt), 1000);
         logger.debug("Write operation failed, retrying", {
           operationName,
@@ -207,7 +275,6 @@ async function executeWrite<T>(
         continue;
       }
 
-      // Non-retryable error or max retries exceeded
       const executionTimeMs = Date.now() - startTime;
 
       logger.error("Write operation failed", {
@@ -231,18 +298,87 @@ async function executeWrite<T>(
         success: false,
         error: lastError,
         retries: attempt,
+        rpcRetries: 0,
         executionTimeMs,
       };
     }
   }
 
-  // Should not reach here, but handle just in case
   const executionTimeMs = Date.now() - startTime;
   return {
     success: false,
     error: lastError || new Error("Unknown write failure"),
     retries: retryCount,
+    rpcRetries: 0,
     executionTimeMs,
+  };
+}
+
+/**
+ * Execute a write operation with two layers of retry:
+ * 1. Outer: exponential backoff retry for RPC connection timeout errors (configurable)
+ * 2. Inner: exponential backoff retry for SQLite database locked conflicts
+ *
+ * Only RPC timeout patterns are retried at the outer level. All other errors
+ * (constraint violations, syntax errors, etc.) are propagated immediately
+ * after the inner DB-retry layer completes.
+ *
+ * @param operation The write operation to execute
+ * @param dbMaxRetries Maximum number of DB-conflict retries per RPC attempt
+ * @returns WriteResult with success status, retries breakdown, and metrics
+ */
+async function executeWrite<T>(
+  operation: WriteOperation<T>,
+  dbMaxRetries: number = 3
+): Promise<WriteResult<T>> {
+  const operationName = operation.name || "unknown";
+  let rpcRetryCount = 0;
+  let lastResult: WriteResult<T> | null = null;
+
+  for (let rpcAttempt = 0; rpcAttempt <= rpcRetryConfig.maxRetries; rpcAttempt++) {
+    const result = await executeWriteWithDbRetry(operation, dbMaxRetries);
+    lastResult = result;
+
+    if (result.success) {
+      if (rpcAttempt > 0) {
+        logger.info("Write operation succeeded after RPC retry", {
+          operationName,
+          rpcRetries: rpcAttempt,
+          executionTimeMs: result.executionTimeMs,
+        });
+      }
+      return { ...result, rpcRetries: rpcAttempt };
+    }
+
+    if (
+      rpcAttempt < rpcRetryConfig.maxRetries &&
+      result.error &&
+      isRpcTimeoutError(result.error)
+    ) {
+      const delay = computeRpcBackoffMs(rpcAttempt, rpcRetryConfig);
+      logger.warn("Write operation failed with RPC timeout, retrying", {
+        operationName,
+        attempt: rpcAttempt + 1,
+        maxRetries: rpcRetryConfig.maxRetries,
+        backoffMs: delay,
+        error: result.error.message,
+      });
+
+      await sleep(delay);
+      rpcRetryCount = rpcAttempt + 1;
+      continue;
+    }
+
+    return { ...result, rpcRetries: rpcAttempt };
+  }
+
+  return {
+    ...(lastResult || {
+      success: false,
+      retries: 0,
+      executionTimeMs: 0,
+    }),
+    rpcRetries: rpcRetryCount,
   };
 }
 
