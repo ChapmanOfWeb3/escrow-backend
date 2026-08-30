@@ -8,14 +8,17 @@ import {
   getActiveContractIds,
   registerContract,
   adjustPollerInterval,
-  getCurrentPollIntervalMs,
+  getCurrentPollIntervalMs as getDbPollIntervalMs,
   resetPollerThrottleState,
   verifySchemaUpToDate,
   assertSchemaValid,
   type EventRow,
 } from "./db.js";
 import { RpcPollerClient } from "./rpc-poller-client.js";
-import { IndexerRunnerFailureMonitor } from "./indexer_runner.js";
+import {
+  IndexerRunnerFailureMonitor,
+  adjustIndexerRunnerPollInterval,
+} from "./indexer_runner.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
 import { fetchEventsWithRetry } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
@@ -107,8 +110,12 @@ export function nextPollIntervalMs(
   return Math.min(currentIntervalMs * POLL_INTERVAL_BACKOFF, POLL_INTERVAL_MAX_MS);
 }
 
-/** The interval the poll loop is currently using. */
-export { getCurrentPollIntervalMs };
+let currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
+
+/** The interval the poll loop is currently waiting between cycles. */
+export function getCurrentPollIntervalMs(): number {
+  return currentPollIntervalMs;
+}
 
 /** Map an RPC event notification onto the row shape `events` stores. */
 function toEventRow(event: any, fallbackContractId: string): EventRow {
@@ -431,8 +438,9 @@ export async function pollEvents(): Promise<boolean> {
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await rpcClient.getLatestLedger()).sequence;
     if (currentLedger <= lastLedger) {
-      // --- Dynamic throttling: idle cycle (#265) ---
+      // --- Dynamic throttling: idle cycle (#265, #256) ---
       adjustPollerInterval(0);
+      adjustIndexerRunnerPollInterval(0);
       return false;
     }
 
@@ -463,6 +471,7 @@ export async function pollEvents(): Promise<boolean> {
 
     // --- Dynamic poller throttling (#265) ---
     const throttleState = adjustPollerInterval(events.events.length);
+    adjustIndexerRunnerPollInterval(events.events.length);
 
     logger.info("Processed indexer poll", {
       eventCount: events.events.length,
@@ -513,11 +522,17 @@ export async function pollEvents(): Promise<boolean> {
 let pollerTimeout: NodeJS.Timeout | null = null;
 let pollerRunning = false;
 
+/** One poll plus the interval adjustment its outcome implies. */
+async function runPollCycle(): Promise<void> {
+  const sawActivity = await pollEvents();
+  currentPollIntervalMs = nextPollIntervalMs(currentPollIntervalMs, sawActivity);
+}
+
 async function pollLoop() {
   if (!pollerRunning) return;
-  await pollEvents();
-  const interval = getCurrentPollIntervalMs();
-  pollerTimeout = setTimeout(pollLoop, interval);
+  await runPollCycle();
+  if (!pollerRunning) return;
+  pollerTimeout = setTimeout(pollLoop, currentPollIntervalMs);
 }
 
 export function startPoller() {
@@ -528,11 +543,18 @@ export function startPoller() {
   assertSchemaValid();
 
   pollerRunning = true;
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
   logger.info("Starting event indexer poller", {
-    intervalMs: getCurrentPollIntervalMs(),
+    intervalMs: currentPollIntervalMs,
   });
-  pollEvents();
-  pollerTimeout = setTimeout(pollLoop, getCurrentPollIntervalMs());
+
+  // The first cycle runs immediately; the loop is scheduled off its outcome so
+  // the very first idle poll already widens the wait.
+  void runPollCycle().then(() => {
+    if (pollerRunning) {
+      pollerTimeout = setTimeout(pollLoop, currentPollIntervalMs);
+    }
+  });
 }
 
 export function stopPoller() {
@@ -542,4 +564,5 @@ export function stopPoller() {
     pollerTimeout = null;
   }
   resetPollerThrottleState();
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
 }
