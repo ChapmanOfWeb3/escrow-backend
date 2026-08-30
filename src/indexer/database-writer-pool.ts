@@ -1532,6 +1532,11 @@ export function resetWriterPoolStartState(): void {
   lastSchemaReport = null;
   migrationHooks.clear();
   resetWriterPoolHistoricalRangeConfig();
+
+  // The queue's "already persisted" cache describes one specific database.
+  // Carrying it across a restart (or a setDb swap) would make the pool skip
+  // inserts for rows the new database has never seen.
+  defaultEventQueue.reset();
 }
 
 // ---------------------------------------------------------------------------

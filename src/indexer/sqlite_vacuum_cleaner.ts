@@ -363,6 +363,16 @@ export function runVacuumCleanup(
 
   logger.info("Starting sqlite vacuum cleanup", { retentionDays });
 
+  // Opening boundary of the cycle; the closing one is emitted on both the
+  // success and failure paths so every cycle is bracketed in the logs.
+  logVacuumPollDiagnostics({
+    component: VACUUM_COMPONENT_NAME,
+    operation: "vacuum_cleanup",
+    status: "started",
+    elapsedMs: 0,
+    retentionDays,
+  });
+
   // Step 1: transactional prune. If this throws, record the failure (which
   // alerts once the consecutive-failure threshold is reached) and propagate
   // immediately — VACUUM is intentionally skipped.
