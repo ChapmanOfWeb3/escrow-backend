@@ -349,6 +349,44 @@ export const updateWhitelistBodySchema = z
 
 export type UpdateWhitelistBody = z.infer<typeof updateWhitelistBodySchema>;
 
+/**
+ * POST /:contractId/whitelist/update accepts two historical body shapes:
+ *
+ * - the single-token form `{ token, action, adminAddress }`
+ *   (`whitelistUpdateBodySchema`), and
+ * - the bulk form `{ addresses | tokens }` (`updateWhitelistBodySchema`).
+ *
+ * A plain `z.union` would collapse both branches into one `invalid_union`
+ * issue with an empty path, and the route's error responses are asserted
+ * field-by-field. So dispatch on the shape instead and forward the chosen
+ * branch's issues verbatim, which keeps `details[].field` populated.
+ *
+ * An ambiguous body (neither `addresses` nor `tokens` present) is reported
+ * against the single-token form, so an empty `{}` lists token/action/
+ * adminAddress as missing.
+ */
+export const whitelistUpdateRequestSchema = z
+  .object({})
+  .passthrough()
+  .superRefine((data, ctx) => {
+    const body = (data ?? {}) as Record<string, unknown>;
+    const isBulkForm = "addresses" in body || "tokens" in body;
+    const branch = isBulkForm
+      ? updateWhitelistBodySchema
+      : whitelistUpdateBodySchema;
+
+    const result = branch.safeParse(body);
+    if (!result.success) {
+      for (const issue of result.error.issues) {
+        ctx.addIssue(issue);
+      }
+    }
+  });
+
+export type WhitelistUpdateRequestBody =
+  | WhitelistUpdateBody
+  | UpdateWhitelistBody;
+
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;
 export type BuildTxBody = z.infer<typeof buildTxBodySchema>;

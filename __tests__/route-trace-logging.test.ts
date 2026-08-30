@@ -141,7 +141,10 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release – clean
     const meta = errorCalls[0][1];
     expect(meta).toMatchObject({
       contractId: VALID_CONTRACT,
-      index: "0",
+      // `milestoneIndexSchema` transforms the path param to a number and the
+      // validate() middleware writes the parsed params back onto req.params,
+      // so the handler logs the coerced value rather than the raw string.
+      index: 0,
     });
     expect(meta.error).toContain("secret internal");
   });

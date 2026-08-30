@@ -54,10 +54,13 @@ import {
   createJobDraftBodySchema,
   createJobDraftLegacyBodySchema,
   whitelistUpdateBodySchema,
+  whitelistUpdateRequestSchema,
   type ByWalletQuery,
   type CreateJobDraftBody,
   type CreateJobDraftLegacyBody,
+  type UpdateWhitelistBody,
   type WhitelistUpdateBody,
+  type WhitelistUpdateRequestBody,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -700,13 +703,17 @@ router.post(
   validate(contractIdParamsSchema, "params", (req) =>
     logger.warn("Invalid contractId provided for whitelist update", { contractId: req.params.contractId }),
   ),
-  validate(updateWhitelistBodySchema, "body", (req) =>
+  validate(whitelistUpdateRequestSchema, "body", (req) =>
     logger.warn("Invalid body provided for whitelist update", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
     const contractId = req.params.contractId as string;
-    const { addresses, tokens } = req.body as UpdateWhitelistBody;
-    const targetAddresses = addresses ?? tokens ?? [];
+    const body = req.body as WhitelistUpdateRequestBody;
+    const { addresses, tokens } = body as UpdateWhitelistBody;
+    const { token, action, adminAddress } = body as WhitelistUpdateBody;
+    // Bulk form supplies addresses/tokens; the single-token form supplies one.
+    const isSingleTokenForm = token !== undefined;
+    const targetAddresses = addresses ?? tokens ?? (token ? [token] : []);
 
     logger.info("Updating whitelist", { contractId, count: targetAddresses.length });
 
@@ -716,6 +723,62 @@ router.post(
       if (providedKey !== requiredApiKey) {
         logger.warn("Unauthorized request for whitelist update", { contractId });
         sendError(res, 401, "Unauthorized");
+        return;
+      }
+    }
+
+    // The single-token form (`{ token, action, adminAddress }`) builds and
+    // returns an unsigned transaction for the caller to sign, rather than
+    // verifying the contract and echoing the address list back like the bulk
+    // form below does.
+    if (isSingleTokenForm) {
+      logger.info("Processing whitelist update", { contractId, token, action });
+
+      try {
+        const contract = new Contract(contractId);
+        const account = await server.getAccount(
+          adminAddress || process.env.DEPLOYER_ADDRESS || "",
+        );
+        const method =
+          action === "remove"
+            ? "remove_whitelisted_token"
+            : "add_whitelisted_token";
+
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            contract.call(
+              method,
+              new Address(adminAddress).toScVal(),
+              new Address(token).toScVal(),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        const prepared = await server.prepareTransaction(tx);
+        const xdr = prepared.toXDR();
+
+        whitelistCache.del(contractId);
+        logger.info("Whitelist update transaction built", { contractId, token, action });
+        sendSuccess(res, { xdr });
+        return;
+      } catch (err: any) {
+        const message = err?.message ?? String(err);
+        if (/unauthorized|invalid authentication/i.test(message)) {
+          logger.warn("Unauthorized request for whitelist update", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+        if (/not found/i.test(message) && !/account not found/i.test(message)) {
+          logger.warn("Job not found for whitelist update", { contractId });
+          sendError(res, 404, "Job not found");
+          return;
+        }
+        logger.error("Failed to update whitelist", { contractId, error: message });
+        sendError(res, 500, "Internal server error");
         return;
       }
     }
