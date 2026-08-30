@@ -894,15 +894,32 @@ export interface EventRow {
 }
 
 /**
+ * Emit a sqlite_schema_manager poll diagnostics debug log. Always includes
+ * elapsedMs so log-based validation can assert timing fields are present (#261).
+ */
+export function logSchemaManagerPollDiagnostics(
+  operation: string,
+  startedAtMs: number,
+  payloadSizeBytes: number,
+): void {
+  const elapsedMs = Date.now() - startedAtMs;
+  logger.debug(
+    `sqlite_schema_manager poll diagnostics operation=${operation} elapsedMs=${elapsedMs} payloadSizeBytes=${payloadSizeBytes}`,
+    { operation, elapsedMs, payloadSizeBytes },
+  );
+}
+
+/**
  * Atomically insert a batch of events AND advance the ledger pointer.
  * If any insertion fails the entire batch and the ledger update are rolled back,
  * so the indexer pointer never advances past un-committed data (#84).
  */
 export function insertEventBatch(events: EventRow[], newLedger: number): void {
   const db = getDb();
+  const startedAt = Date.now();
 
   const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events 
+    INSERT OR IGNORE INTO events
     (contract_id, event_type, ledger_sequence, timestamp, data_json)
     VALUES (?, ?, ?, ?, ?)
   `);
@@ -925,6 +942,12 @@ export function insertEventBatch(events: EventRow[], newLedger: number): void {
   });
 
   batchTransaction();
+
+  logSchemaManagerPollDiagnostics(
+    "insertEventBatch",
+    startedAt,
+    Buffer.byteLength(JSON.stringify(events), "utf8"),
+  );
 }
 
 /**

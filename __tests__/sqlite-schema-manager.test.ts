@@ -481,12 +481,15 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
         expect(result).toBe("recovered");
         expect(calls).toBe(3);
 
-        const retryWarns = (warnSpy.mock.calls as Array<[unknown, { backoffMs: number }]>).filter(
+        const warnCalls = warnSpy.mock.calls as unknown as Array<
+          [string, { backoffMs: number }]
+        >;
+        const retryWarns = warnCalls.filter(
           ([msg]) => msg === "schema_test failed, retrying",
         );
         expect(retryWarns.length).toBe(2);
-        for (const args of retryWarns) {
-          delays.push((args[1] as { backoffMs: number }).backoffMs);
+        for (const [, meta] of retryWarns) {
+          delays.push(meta.backoffMs);
         }
         expect(delays[0]).toBe(10);
         expect(delays[1]).toBe(20);
