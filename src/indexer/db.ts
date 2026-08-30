@@ -175,10 +175,19 @@ const MIGRATIONS: Migration[] = [
   },
   {
     version: 6,
-    description: "add indexer_metrics_collector aggregation index (#335)",
+    description: "add sqlite_vacuum_cleaner lookup indexes (#344)",
     up: `
-      CREATE INDEX IF NOT EXISTS idx_events_event_type
-        ON events (event_type);
+      CREATE INDEX IF NOT EXISTS idx_events_created_at
+        ON events (created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_sequence
+        ON events (ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_created_at_ledger
+        ON events (created_at, ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_created_at
+        ON events (ledger_sequence, created_at);
     `,
   },
 ];

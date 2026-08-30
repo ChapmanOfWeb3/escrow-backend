@@ -482,3 +482,87 @@ export function assertVacuumSchemaValid(db: Database.Database): void {
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Issue 5: SQLite index structures for vacuum cleaner lookups (#344)
+// ---------------------------------------------------------------------------
+
+/**
+ * Index names backing the vacuum cleaner's row lookups.
+ *
+ * The cleaner finds stale rows through two predicates:
+ *   1. retention-pruning by `created_at`  → covered by idx_events_created_at
+ *      (and idx_events_created_at_ledger for the composite layout).
+ *   2. ledger-range pruning by `ledger_sequence` → covered by
+ *      idx_events_ledger_sequence (and idx_events_ledger_created_at).
+ *
+ * Exporting the names lets tests run EXPLAIN QUERY PLAN and assert the indexes
+ * are actually used, and lets operators inspect the schema (#344).
+ */
+export const VACUUM_CLEANER_INDEXES = {
+  eventsCreatedAt: "idx_events_created_at",
+  eventsLedgerSequence: "idx_events_ledger_sequence",
+  eventsCreatedAtLedger: "idx_events_created_at_ledger",
+  eventsLedgerCreatedAt: "idx_events_ledger_created_at",
+} as const;
+
+/** All index names managed by the vacuum cleaner. */
+export function getVacuumIndexNames(): string[] {
+  return Object.values(VACUUM_CLEANER_INDEXES);
+}
+
+/**
+ * Ensure every index the vacuum cleaner relies on exists, creating any missing
+ * ones idempotently. Used alongside the schema manager migrations so the cleaner
+ * can self-heal a database that predates migration 6 (#344).
+ *
+ * @returns The names of the indexes that are now present.
+ */
+export function ensureVacuumIndexes(db: Database.Database): string[] {
+  db.exec(
+    `
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsCreatedAt}
+      ON events (created_at);
+
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsLedgerSequence}
+      ON events (ledger_sequence);
+
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsCreatedAtLedger}
+      ON events (created_at, ledger_sequence);
+
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsLedgerCreatedAt}
+      ON events (ledger_sequence, created_at);
+    `,
+  );
+  return getVacuumIndexNames();
+}
+
+/**
+ * Run SQLite's EXPLAIN QUERY PLAN for a parameterized statement against the
+ * given connection. Mirrors ledger_range_tracker's helper so tests can assert
+ * the vacuum cleaner's indexes are utilized for lookups (#344).
+ */
+export function vacuumExplainQueryPlan(
+  db: Database.Database,
+  sql: string,
+  ...params: unknown[]
+): Array<Record<string, unknown>> {
+  return db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<
+    Record<string, unknown>
+  >;
+}
+
+/**
+ * True when any EXPLAIN QUERY PLAN detail row references the expected index
+ * name. Mirrors ledger_range_tracker's helper (#344).
+ */
+export function vacuumQueryPlanUsesIndex(
+  plan: Array<Record<string, unknown>>,
+  indexName: string,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && value.includes(indexName),
+    ),
+  );
+}
