@@ -3,6 +3,7 @@ import {
   getDb,
   getLastIndexedLedger,
   getShippedMigrationVersions,
+  insertEvent,
   verifySchemaIntegrity,
   verifySchemaUpToDate,
   type EventRow,

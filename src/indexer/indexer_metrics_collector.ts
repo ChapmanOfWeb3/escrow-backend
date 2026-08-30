@@ -162,6 +162,9 @@ export interface IndexerMetricsDiagnostics {
   rowCount?: number;
   totalEvents?: number;
   lastIndexedLedger?: number;
+  /** Inclusive ledger window, set by the historical-sync collection path. */
+  startLedger?: number;
+  endLedger?: number;
   error?: string;
 }
 

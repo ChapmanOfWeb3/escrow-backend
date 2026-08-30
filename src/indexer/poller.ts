@@ -9,10 +9,12 @@ import {
   registerContract,
   adjustPollerInterval,
   getCurrentPollIntervalMs,
+  resetPollerThrottleState,
   verifySchemaUpToDate,
   assertSchemaValid,
   type EventRow,
 } from "./db.js";
+import { RpcPollerClient } from "./rpc-poller-client.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
 import { fetchEventsWithRetry } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
@@ -42,7 +44,88 @@ const rpcClient = new RpcPollerClient(RPC_URL, {
   ),
 });
 
-const failureMonitor = getIndexerRunnerFailureMonitor();
+// ---------------------------------------------------------------------------
+// Failure and stall tracking for the poll loop (#253, #271)
+// ---------------------------------------------------------------------------
+// Consecutive failures escalate to an alert once the threshold is reached, and
+// a poll loop that stops succeeding for longer than the stall threshold is
+// reported even while individual polls keep "working".
+
+const DEFAULT_FAILURE_THRESHOLD = 3;
+const DEFAULT_STALL_THRESHOLD_MS = 120_000;
+
+function readPositiveIntEnv(names: string[], fallback: number): number {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined) continue;
+    const parsed = parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return fallback;
+}
+
+class IndexerRunnerFailureMonitor {
+  private consecutiveFailures = 0;
+  private lastSuccessfulAt: number | null = null;
+  private stallAlerted = false;
+
+  get stallThresholdMs(): number {
+    return readPositiveIntEnv(
+      ["INDEXER_RUNNER_STALL_THRESHOLD_MS", "POLLER_STALL_THRESHOLD_MS"],
+      DEFAULT_STALL_THRESHOLD_MS,
+    );
+  }
+
+  getFailureThreshold(): number {
+    return readPositiveIntEnv(
+      ["INDEXER_RUNNER_FAILURE_THRESHOLD", "POLLER_FAILURE_THRESHOLD"],
+      DEFAULT_FAILURE_THRESHOLD,
+    );
+  }
+
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  getLastSuccessfulAt(): number | null {
+    return this.lastSuccessfulAt;
+  }
+
+  recordSuccess(): void {
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = Date.now();
+    this.stallAlerted = false;
+  }
+
+  recordFailure(): number {
+    this.consecutiveFailures += 1;
+    return this.consecutiveFailures;
+  }
+
+  /** Warn once per stall episode when no poll has succeeded in the window. */
+  checkStall(): void {
+    if (this.lastSuccessfulAt === null) return;
+    const elapsed = Date.now() - this.lastSuccessfulAt;
+    if (elapsed <= this.stallThresholdMs) return;
+    if (this.stallAlerted) return;
+
+    this.stallAlerted = true;
+    logger.warn("Poller stall detected – no successful poll for threshold period", {
+      elapsedMs: elapsed,
+      stallThresholdMs: this.stallThresholdMs,
+      consecutiveFailures: this.consecutiveFailures,
+    });
+  }
+
+  /** Reset in place – callers hold a reference to this instance. */
+  reset(): void {
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = null;
+    this.stallAlerted = false;
+  }
+}
+
+const failureMonitor = new IndexerRunnerFailureMonitor();
 
 export function getConsecutiveFailures(): number {
   return failureMonitor.getConsecutiveFailures();
@@ -53,7 +136,29 @@ export function getLastSuccessfulPollAt(): number | null {
 }
 
 export function resetFailureState(): void {
-  resetIndexerRunnerFailureState();
+  failureMonitor.reset();
+}
+
+/** Map an RPC event notification onto the row shape `events` stores. */
+function toEventRow(event: any, fallbackContractId: string): EventRow {
+  return {
+    contractId: event.contractId?.contractId?.() ?? fallbackContractId,
+    eventType: scValToNative(event.topic[0]) as string,
+    ledgerSequence: event.ledger,
+    timestamp: event.ledgerClosedAt
+      ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
+      : Math.floor(Date.now() / 1000),
+    dataJson: JSON.stringify(scValToNative(event.value)),
+  };
+}
+
+/** Debug line carrying poll duration and payload size for one cycle (#270). */
+function logPollDiagnostics(elapsedMs: number, batch: EventRow[]): void {
+  logger.debug("Indexer poll diagnostics", {
+    elapsedMs: Math.round(elapsedMs),
+    payloadSizeBytes: JSON.stringify(batch).length,
+    eventCount: batch.length,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +258,7 @@ export async function pollEvents(): Promise<boolean> {
     verifySchemaUpToDate();
 
     const lastLedger = getLastIndexedLedger();
-    const currentLedger = (await server.getLatestLedger()).sequence;
+    const currentLedger = (await rpcClient.getLatestLedger()).sequence;
     if (currentLedger <= lastLedger) {
       // --- Dynamic throttling: idle cycle (#265) ---
       adjustPollerInterval(0);
@@ -165,7 +270,7 @@ export async function pollEvents(): Promise<boolean> {
     logger.info("Polling events", { startLedger, currentLedger });
 
     const eventsStart = performance.now();
-    const events = await fetchEventsWithRetry(server, {
+    const events = await fetchEventsWithRetry(rpcClient.rpcServer, {
       startLedger,
       contractIds,
       limit: 100,
@@ -193,8 +298,7 @@ export async function pollEvents(): Promise<boolean> {
     await enqueueEventInsert(batch, currentLedger);
 
     const totalElapsed = performance.now() - pollStart;
-    consecutiveFailures = 0;
-    lastSuccessfulPollAt = Date.now();
+    failureMonitor.recordSuccess();
 
     // --- Dynamic poller throttling (#265) ---
     const throttleState = adjustPollerInterval(events.events.length);
@@ -217,7 +321,7 @@ export async function pollEvents(): Promise<boolean> {
     return true;
   } catch (err) {
     const totalElapsed = performance.now() - pollStart;
-    consecutiveFailures += 1;
+    const consecutiveFailures = failureMonitor.recordFailure();
 
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),
@@ -273,5 +377,5 @@ export function stopPoller() {
     clearTimeout(pollerTimeout);
     pollerTimeout = null;
   }
-  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
+  resetPollerThrottleState();
 }

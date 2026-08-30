@@ -75,12 +75,6 @@ export const INDEXER_RUNNER_INDEXES = {
 } as const;
 
 /** Index names created by the schema-manager migration (#259). */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
 // ---------------------------------------------------------------------------
@@ -201,12 +195,6 @@ const MIGRATIONS: Migration[] = [
 ];
 
 /** Index names created by the SQLite schema manager lookup-index migration (#259). */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 /**
  * Migration versions this build ships, ascending. Callers compare these
  * against `schema_migrations` to detect a database that is behind the code.
@@ -216,12 +204,6 @@ export function getShippedMigrationVersions(): number[] {
 }
 
 /** Index names created by the version-5 migration (#259), for test assertions. */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
 // Retries transient SQLite / connection / timeout failures during migrations.
@@ -997,33 +979,10 @@ export function insertEventBatch(events: EventRow[], newLedger: number): void {
  *
  * Returns the number of rows actually inserted (excludes rows ignored as
  * duplicates).
+ *
+ * Superseded by the range-validating overload defined later in this file,
+ * which every caller uses.
  */
-export function insertHistoricalEventBatch(events: EventRow[]): number {
-  const db = getDb();
-
-  const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const batchTransaction = db.transaction(() => {
-    let inserted = 0;
-    for (const ev of events) {
-      const result = insertStmt.run(
-        ev.contractId,
-        ev.eventType,
-        ev.ledgerSequence,
-        ev.timestamp,
-        ev.dataJson
-      );
-      if (result.changes > 0) inserted++;
-    }
-    return inserted;
-  });
-
-  return batchTransaction();
-}
 
 // ---------------------------------------------------------------------------
 // In-memory event queue locks for concurrent inserts (#260)
@@ -1162,33 +1121,10 @@ export async function insertEventBatchLocked(
  *
  * Returns the number of rows actually inserted (excludes rows ignored as
  * duplicates).
+ *
+ * Superseded by the range-validating overload defined later in this file,
+ * which every caller uses.
  */
-export function insertHistoricalEventBatch(events: EventRow[]): number {
-  const db = getDb();
-
-  const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const batchTransaction = db.transaction(() => {
-    let inserted = 0;
-    for (const ev of events) {
-      const result = insertStmt.run(
-        ev.contractId,
-        ev.eventType,
-        ev.ledgerSequence,
-        ev.timestamp,
-        ev.dataJson
-      );
-      if (result.changes > 0) inserted++;
-    }
-    return inserted;
-  });
-
-  return batchTransaction();
-}
 
 // ---------------------------------------------------------------------------
 // Event queries
