@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { getDb } from "./db.js";
+import { getDb, getShippedMigrationVersions } from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -468,5 +468,135 @@ export function collectIndexerMetrics(
     });
 
     throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Migration verification hooks
+// ---------------------------------------------------------------------------
+
+/** Tables and columns that the metrics collector depends on to operate. */
+const INDEXER_METRICS_REQUIRED_SCHEMA: Record<string, string[]> = {
+  events: [
+    "id",
+    "contract_id",
+    "event_type",
+    "ledger_sequence",
+    "timestamp",
+    "data_json",
+    "created_at",
+  ],
+  indexer_state: ["key", "value"],
+  schema_migrations: ["version", "description", "applied_at"],
+};
+
+export interface IndexerMetricsSchemaValidationResult {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  missingMigrations: number[];
+  errors: string[];
+}
+
+/**
+ * Validate that the database schema is in sync before the metrics collector
+ * starts. Checks three things:
+ *
+ * 1. Every required table exists.
+ * 2. Every required column exists on its table.
+ * 3. Every migration version shipped by the code is recorded as applied in
+ *    `schema_migrations` (no version gaps or missing migrations).
+ *
+ * This does NOT run migrations — it only inspects. Returns a detailed result
+ * so callers can surface specific problems.
+ */
+export function validateIndexerMetricsSchema(
+  targetDb?: Database.Database,
+): IndexerMetricsSchemaValidationResult {
+  const db = targetDb || getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const errors: string[] = [];
+
+  for (const [tableName, requiredCols] of Object.entries(
+    INDEXER_METRICS_REQUIRED_SCHEMA,
+  )) {
+    const tableRow = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+      )
+      .get(tableName) as { name: string } | undefined;
+
+    if (!tableRow) {
+      missingTables.push(tableName);
+      continue;
+    }
+
+    const columns = db
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all() as Array<{ name: string }>;
+    const columnNames = new Set(columns.map((c) => c.name));
+
+    const missing = requiredCols.filter((col) => !columnNames.has(col));
+    if (missing.length > 0) {
+      missingColumns[tableName] = missing;
+    }
+  }
+
+  // Check that every shipped migration version is recorded as applied.
+  const missingMigrations: number[] = [];
+  const migrationsTable = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+    )
+    .get() as { name: string } | undefined;
+
+  if (migrationsTable) {
+    const shipped = getShippedMigrationVersions();
+    const appliedRows = db
+      .prepare("SELECT version FROM schema_migrations")
+      .all() as Array<{ version: number }>;
+    const applied = new Set(appliedRows.map((r) => r.version));
+    for (const version of shipped) {
+      if (!applied.has(version)) {
+        missingMigrations.push(version);
+      }
+    }
+    if (missingMigrations.length > 0) {
+      errors.push(
+        `Missing applied migrations: ${missingMigrations.join(", ")}`,
+      );
+    }
+  }
+
+  const valid =
+    missingTables.length === 0 &&
+    Object.keys(missingColumns).length === 0 &&
+    missingMigrations.length === 0 &&
+    errors.length === 0;
+
+  return { valid, missingTables, missingColumns, missingMigrations, errors };
+}
+
+/**
+ * Throws if the database schema is not in sync. Call this at startup before
+ * scheduling any metrics collection so the process fails fast with a clear
+ * message rather than hitting obscure SQL errors later.
+ */
+export function assertIndexerMetricsSchemaValid(
+  targetDb?: Database.Database,
+): void {
+  const result = validateIndexerMetricsSchema(targetDb);
+  if (!result.valid) {
+    const reasons = [
+      ...result.missingTables.map((t) => `missing table: ${t}`),
+      ...Object.entries(result.missingColumns).map(
+        ([t, cols]) => `missing columns in ${t}: ${cols.join(", ")}`,
+      ),
+      ...result.errors,
+    ];
+    throw new Error(
+      `indexer_metrics_collector cannot start — database schema is out of sync: ${reasons.join("; ")}`,
+    );
   }
 }
