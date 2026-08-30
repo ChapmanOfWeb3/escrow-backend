@@ -37,10 +37,13 @@ import {
   claimAutoReleaseSecurityHeaders,
   updateWhitelistCors,
   updateWhitelistSecurityHeaders,
+  buildTxCors,
+  buildTxSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
 import type { RequestWithValidatedQuery } from "../middleware/validate.js";
+import { createJobDraftValidation } from "../middleware/create-job-draft-validation.js";
 import {
   contractIdParamsSchema,
   contractMilestoneParamsSchema,
@@ -144,6 +147,20 @@ const inFlightTimeRemainingRequests = new Map<string, Promise<number>>();
 export function resetTimeRemainingCache(): void {
   timeRemainingCache.flushAll();
   inFlightTimeRemainingRequests.clear();
+}
+
+const PARTIAL_RELEASE_CACHE_TTL = parseInt(
+  process.env.PARTIAL_RELEASE_CACHE_TTL_S || "30",
+  10,
+);
+export const partialReleaseCache = new NodeCache({
+  stdTTL: PARTIAL_RELEASE_CACHE_TTL,
+  useClones: false,
+});
+const inFlightPartialReleaseRequests = new Map<string, Promise<string>>();
+export function resetPartialReleaseCache(): void {
+  partialReleaseCache.flushAll();
+  inFlightPartialReleaseRequests.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -340,36 +357,17 @@ router.options("/create-job-draft", createJobDraftCors);
  * the first could ever run, so the second PR's rate limiter was dead code and
  * its tests failed. They are collapsed here into one route that honours both
  * contracts: the body is validated against whichever schema matches the field
- * naming used, and the response carries both shapes.
+ * naming used, and the response carries both shapes. The Zod request-shape
+ * validation itself lives in the reusable `createJobDraftValidation`
+ * middleware (see `middleware/create-job-draft-validation.ts`).
  */
-function createJobDraftRouteValidator(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
-  const body = req.body as Record<string, unknown> | undefined;
-  const usesAddressSuffix =
-    !!body &&
-    typeof body === "object" &&
-    ["clientAddress", "freelancerAddress", "arbiterAddress", "tokenAddress"].some(
-      (field) => field in body,
-    );
-
-  const schema = usesAddressSuffix
-    ? createJobDraftLegacyBodySchema
-    : createJobDraftBodySchema;
-
-  validate(schema, "body", (r) =>
-    logger.warn("Invalid create-job-draft request body", { body: r.body }),
-  )(req, res, next);
-}
 
 router.post(
   "/create-job-draft",
   createJobDraftCors,
   createJobDraftSecurityHeaders,
   createJobDraftRateLimit,
-  createJobDraftRouteValidator,
+  createJobDraftValidation,
   (req: Request, res: Response) => {
     const traceId = randomUUID();
     const pathVars = { route: "/api/jobs/create-job-draft" };
@@ -842,6 +840,8 @@ router.post(
 // ---------------------------------------------------------------------------
 router.post(
   "/build-tx",
+  buildTxCors,
+  buildTxSecurityHeaders,
   // buildTxRateLimit supersedes the generic strictLimiter for this route.
   buildTxRateLimit,
   // Schema validation for POST /api/jobs/build-tx payload
@@ -1162,48 +1162,75 @@ router.post(
         return;
       }
 
-      const amountNum = BigInt(amount);
+      let requestPromise = inFlightPartialReleaseRequests.get(cacheKey);
+      const servedFromInFlight = Boolean(requestPromise);
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(contract.call(
-          "approve_partial",
-          Address.fromString(sourceAddress).toScVal(),
-          nativeToScVal(Number(index), { type: "u32" }),
-          nativeToScVal(amountNum, { type: "i128" })
-        ))
-        .setTimeout(30)
-        .build();
+      if (!requestPromise) {
+        requestPromise = (async (): Promise<string> => {
+          const contract = new Contract(contractId as string);
 
-      let prepared;
-      try {
-        prepared = await server.prepareTransaction(tx);
-      } catch (err: any) {
-        const errMsg = String(err?.message || err);
-        const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to prepare transaction for partial release", {
-          traceId,
-          contractId,
-          index,
-          error: errMsg,
-          stack: err?.stack,
-        });
-        sendError(res, status, message);
-        return;
+          let account;
+          try {
+            account = await server.getAccount(sourceAddress as string);
+          } catch (err: any) {
+            const errMsg = String(err?.message || err);
+            const { status, message } = classifySimError(errMsg);
+            logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+            throw { status, message };
+          }
+
+          const amountNum = BigInt(amount);
+
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASE,
+          })
+            .addOperation(contract.call(
+              "approve_partial",
+              Address.fromString(sourceAddress).toScVal(),
+              nativeToScVal(Number(index), { type: "u32" }),
+              nativeToScVal(amountNum, { type: "i128" })
+            ))
+            .setTimeout(30)
+            .build();
+
+          let prepared;
+          try {
+            prepared = await server.prepareTransaction(tx);
+          } catch (err: any) {
+            const errMsg = String(err?.message || err);
+            const { status, message } = classifySimError(errMsg);
+            logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+            throw { status, message };
+          }
+
+          const xdr = prepared.toXDR();
+          partialReleaseCache.set(cacheKey, xdr);
+          return xdr;
+        })();
+
+        inFlightPartialReleaseRequests.set(cacheKey, requestPromise);
       }
 
-      logger.debug("Partial-release response sent", {
-        traceId,
-        contractId,
-        index,
-        status: 200,
-        success: true,
-        xdrLength: prepared.toXDR().length,
-      });
+      let xdr: string;
+      try {
+        xdr = await requestPromise;
+      } catch (err: any) {
+        partialReleaseCache.del(cacheKey);
+        if (err && err.status) {
+          sendError(res, err.status, err.message);
+          return;
+        }
+        throw err;
+      } finally {
+        inFlightPartialReleaseRequests.delete(cacheKey);
+      }
 
-      res.json({ success: true, xdr: prepared.toXDR() });
+      if (servedFromInFlight) {
+        logger.info("Partial-release XDR served from in-flight cache", { contractId, index });
+      }
+
+      res.json({ success: true, xdr });
     } catch (err: any) {
       const errMsg = String(err?.message || err);
       // Structured, server-side-only error detail – the client receives a clean

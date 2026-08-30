@@ -5,6 +5,25 @@ import logger from "../utils/logger.js";
 // SQLite vacuum cleaner (#193)
 // ---------------------------------------------------------------------------
 //
+// Extended features:
+//   - Dynamic polling frequency (Issue 1): adjustVacuumPollingInterval()
+//     increases wait delays when the database is idle (no rows pruned),
+//     backing off up to MAX_VACUUM_POLL_INTERVAL_MS.
+//
+//   - Dynamic ledger range imports (Issue 3): pruneEventsInLedgerRange()
+//     accepts custom start/end ledger values so callers can import and prune
+//     arbitrary historical windows.
+//
+//   - Schema migration check utilities (Issue 4): validateVacuumSchema()
+//     verifies the required tables/columns exist before the cleaner starts,
+//     failing fast when the database state is out of sync.
+//
+//   - Polling diagnostics logs (Issue 5): every pruning step, the VACUUM
+//     command, and the whole cleanup cycle emit a debug log whose message
+//     carries `elapsedMs=` so operators can spot slow cleanup runs without
+//     enabling a profiler, mirroring indexer_runner / indexer_metrics_collector
+//     (#346).
+//
 // This module prunes stale rows from the `events` table and reclaims the
 // disk space they occupied.
 //
@@ -70,6 +89,106 @@ export const ERROR_CODES = {
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
+// ---------------------------------------------------------------------------
+// Issue 5: Polling diagnostics logs (#346)
+// ---------------------------------------------------------------------------
+
+const VACUUM_COMPONENT_NAME = "sqlite_vacuum_cleaner";
+
+export interface VacuumPollDiagnostics {
+  component: string;
+  operation: string;
+  status: "started" | "success" | "failure";
+  /** Wall-clock duration of the operation in milliseconds. */
+  elapsedMs: number;
+  /** Number of event rows deleted by a pruning step. */
+  prunedEvents?: number;
+  retentionDays?: number;
+  startLedger?: number;
+  endLedger?: number;
+  error?: string;
+}
+
+/** Round to microsecond precision so sub-millisecond operations stay readable. */
+function roundVacuumElapsed(elapsedMs: number): number {
+  return Math.round(Math.max(0, elapsedMs) * 1000) / 1000;
+}
+
+/**
+ * Emit a sqlite_vacuum_cleaner diagnostics debug log.
+ *
+ * The message string always carries `elapsedMs=` (plus `prunedEvents=` when a
+ * pruning step ran) so log-scraping validation can assert timing values are
+ * present; the same values are repeated in the structured meta object for log
+ * processors.
+ */
+export function logVacuumPollDiagnostics(
+  diagnostics: VacuumPollDiagnostics,
+): void {
+  const parts = [
+    `${diagnostics.component} poll diagnostics`,
+    `operation=${diagnostics.operation}`,
+    `status=${diagnostics.status}`,
+    `elapsedMs=${diagnostics.elapsedMs}`,
+  ];
+  if (diagnostics.prunedEvents !== undefined) {
+    parts.push(`prunedEvents=${diagnostics.prunedEvents}`);
+  }
+  if (diagnostics.retentionDays !== undefined) {
+    parts.push(`retentionDays=${diagnostics.retentionDays}`);
+  }
+  if (diagnostics.startLedger !== undefined) {
+    parts.push(`startLedger=${diagnostics.startLedger}`);
+  }
+  if (diagnostics.endLedger !== undefined) {
+    parts.push(`endLedger=${diagnostics.endLedger}`);
+  }
+  logger.debug(parts.join(" "), diagnostics);
+}
+
+/**
+ * Time a vacuum operation and emit its diagnostics. A numeric result is
+ * reported as `prunedEvents`; failures are logged with the elapsed time and
+ * the error before being rethrown for the caller to handle as before.
+ */
+function timeVacuumOperation<T>(
+  operation: string,
+  details: Omit<
+    VacuumPollDiagnostics,
+    "component" | "operation" | "status" | "elapsedMs" | "error"
+  >,
+  fn: () => T,
+): T {
+  const startedAt = performance.now();
+  try {
+    const result = fn();
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation,
+      status: "success",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      prunedEvents: typeof result === "number" ? result : undefined,
+      ...details,
+    });
+    return result;
+  } catch (err) {
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation,
+      status: "failure",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      error: err instanceof Error ? err.message : String(err),
+      ...details,
+    });
+    throw err;
+  }
+}
+
+/** Extract a message from an unknown thrown value. */
+function vacuumErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * Validates a retentionDays value. Must be a finite, positive integer.
  * Zero, negative, non-integer, NaN, and Infinity values are all rejected —
@@ -118,19 +237,25 @@ export function pruneOldEvents(db: Database.Database, retentionDays: number): nu
     throw new Error(validation.error);
   }
 
-  const deleteStmt = db.prepare(
-    `DELETE FROM events WHERE created_at < datetime('now', '-' || ? || ' days')`
+  // The DELETE statement and its transaction wrapper are timed together so a
+  // prepare/execution failure is attributed to the prune_old_events stage and
+  // emitted as a failure diagnostic before propagating.
+  const pruneTransaction = (days: number): number => {
+    const deleteStmt = db.prepare(
+      `DELETE FROM events WHERE created_at < datetime('now', '-' || ? || ' days')`
+    );
+    const tx = db.transaction((d: number) => {
+      const result = deleteStmt.run(d);
+      return result.changes;
+    });
+    return tx(days);
+  };
+
+  return timeVacuumOperation(
+    "prune_old_events",
+    { retentionDays },
+    () => pruneTransaction(retentionDays),
   );
-
-  const pruneTransaction = db.transaction((days: number) => {
-    const result = deleteStmt.run(days);
-    return result.changes;
-  });
-
-  // better-sqlite3's transaction wrapper commits the callback's statements
-  // together, or rolls all of them back if it throws — propagate any error
-  // as-is so callers know pruning did not complete.
-  return pruneTransaction(retentionDays);
 }
 
 /**
@@ -144,7 +269,7 @@ export function pruneOldEvents(db: Database.Database, retentionDays: number): nu
  * as a separate, later step.
  */
 export function runVacuum(db: Database.Database): void {
-  db.exec("VACUUM");
+  timeVacuumOperation("run_vacuum", {}, () => db.exec("VACUUM"));
 }
 
 /**
@@ -166,17 +291,65 @@ export function runVacuumCleanup(
   options: VacuumCleanupOptions = {}
 ): VacuumCleanupResult {
   const retentionDays = options.retentionDays ?? DEFAULT_RETENTION_DAYS;
+  const monitor = defaultVacuumFailureMonitor;
+
+  monitor.checkStall();
+
+  const startedAt = performance.now();
 
   logger.info("Starting sqlite vacuum cleanup", { retentionDays });
 
-  // Step 1: transactional prune. If this throws, we intentionally do not
-  // catch it here — propagate immediately and skip VACUUM entirely.
-  const prunedEvents = pruneOldEvents(db, retentionDays);
+  // Step 1: transactional prune. If this throws, record the failure (which
+  // alerts once the consecutive-failure threshold is reached) and propagate
+  // immediately — VACUUM is intentionally skipped.
+  let prunedEvents: number;
+  try {
+    prunedEvents = pruneOldEvents(db, retentionDays);
+  } catch (err) {
+    monitor.recordFailure("prune", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation: "vacuum_cleanup",
+      status: "failure",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      retentionDays,
+      error: vacuumErrorMessage(err),
+    });
+    throw err;
+  }
 
   // Step 2: non-transactional VACUUM, only reached once pruning committed.
-  runVacuum(db);
+  try {
+    runVacuum(db);
+  } catch (err) {
+    monitor.recordFailure("vacuum", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation: "vacuum_cleanup",
+      status: "failure",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      retentionDays,
+      error: vacuumErrorMessage(err),
+    });
+    throw err;
+  }
+
+  monitor.recordSuccess();
 
   logger.info("Completed sqlite vacuum cleanup", { prunedEvents });
+
+  logVacuumPollDiagnostics({
+    component: VACUUM_COMPONENT_NAME,
+    operation: "vacuum_cleanup",
+    status: "success",
+    elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+    retentionDays,
+    prunedEvents,
+  });
 
   return { prunedEvents, vacuumed: true };
 }
@@ -206,6 +379,187 @@ export async function runVacuumCleanupConcurrent(
     vacuumLockActive = false;
     release!();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Failure alerting (#347)
+// ---------------------------------------------------------------------------
+
+/** Consecutive cleanup failures before a warning alert is raised. */
+export const DEFAULT_VACUUM_FAILURE_THRESHOLD = 3;
+
+/**
+ * Elapsed ms without a successful cleanup before a stall alert is raised.
+ * Defaults to twice the default vacuum polling interval (1 hour), so a
+ * missed cycle or two doesn't immediately alert.
+ */
+export const DEFAULT_VACUUM_STALL_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+export type VacuumFailureType = "prune" | "vacuum" | "stall";
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    logger.warn("sqlite_vacuum_cleaner ignoring invalid threshold config", {
+      variable: name,
+      received: raw,
+      fallback,
+    });
+    return fallback;
+  }
+  return value;
+}
+
+/**
+ * Reads alert thresholds from `VACUUM_FAILURE_THRESHOLD` and
+ * `VACUUM_STALL_THRESHOLD_MS`. Invalid values fall back to the defaults with
+ * a warning rather than throwing — telemetry config must not take the
+ * cleaner down.
+ */
+export function getVacuumAlertConfig(): {
+  failureThreshold: number;
+  stallThresholdMs: number;
+} {
+  return {
+    failureThreshold: readPositiveIntEnv(
+      "VACUUM_FAILURE_THRESHOLD",
+      DEFAULT_VACUUM_FAILURE_THRESHOLD,
+    ),
+    stallThresholdMs: readPositiveIntEnv(
+      "VACUUM_STALL_THRESHOLD_MS",
+      DEFAULT_VACUUM_STALL_THRESHOLD_MS,
+    ),
+  };
+}
+
+export interface VacuumFailureMonitorOptions {
+  failureThreshold?: number;
+  stallThresholdMs?: number;
+}
+
+/**
+ * Tracks consecutive vacuum-cleanup failures and cleanup stalls, raising a
+ * warning alert once the configured counts are reached (#347).
+ *
+ * Every failure is logged as an error; the warning alert fires from the
+ * threshold onwards so a persistent outage keeps surfacing rather than
+ * alerting once and going quiet. A successful cleanup clears the state.
+ */
+export class VacuumFailureMonitor {
+  readonly failureThreshold: number;
+  readonly stallThresholdMs: number;
+
+  private consecutiveFailures = 0;
+  private lastSuccessfulAt: number | null = null;
+  private alertActive = false;
+
+  constructor(options: VacuumFailureMonitorOptions = {}) {
+    const env = getVacuumAlertConfig();
+    this.failureThreshold = options.failureThreshold ?? env.failureThreshold;
+    this.stallThresholdMs = options.stallThresholdMs ?? env.stallThresholdMs;
+  }
+
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  getLastSuccessfulAt(): number | null {
+    return this.lastSuccessfulAt;
+  }
+
+  isAlertActive(): boolean {
+    return this.alertActive;
+  }
+
+  /**
+   * Record a failed cleanup step. Returns the new consecutive-failure count.
+   * Emits an error every time and a warning alert from the threshold onwards.
+   */
+  recordFailure(
+    failureType: VacuumFailureType,
+    details: { error?: string } = {},
+  ): number {
+    this.consecutiveFailures += 1;
+
+    const payload = {
+      failureType,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      error: details.error,
+    };
+
+    logger.error("sqlite_vacuum_cleaner operation failed", payload);
+
+    if (this.consecutiveFailures >= this.failureThreshold) {
+      this.alertActive = true;
+      logger.warn(
+        "sqlite_vacuum_cleaner alert: consecutive failure threshold reached",
+        {
+          ...payload,
+          action:
+            "Inspect the sqlite database and disk health; alerting clears automatically after the next successful cleanup.",
+        },
+      );
+    }
+
+    return this.consecutiveFailures;
+  }
+
+  /** Record a successful cleanup, clearing any active alert. */
+  recordSuccess(): void {
+    const hadFailures = this.consecutiveFailures > 0 || this.alertActive;
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = Date.now();
+    if (hadFailures) {
+      logger.info("sqlite_vacuum_cleaner recovered after failures", {});
+    }
+    this.alertActive = false;
+  }
+
+  /**
+   * Warn when no successful cleanup has landed inside the stall window.
+   * Does not touch the consecutive-failure counter, so a later success still
+   * recovers cleanly. Returns true when a stall was reported.
+   */
+  checkStall(): boolean {
+    if (this.lastSuccessfulAt === null) return false;
+    const elapsedMs = Date.now() - this.lastSuccessfulAt;
+    if (elapsedMs <= this.stallThresholdMs) return false;
+
+    logger.warn("sqlite_vacuum_cleaner alert: stall threshold reached", {
+      failureType: "stall" as const,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      stallThresholdMs: this.stallThresholdMs,
+      elapsedMs,
+      action:
+        "No successful vacuum cleanup within the stall window; inspect the poller and database health.",
+    });
+    return true;
+  }
+
+  reset(): void {
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = null;
+    this.alertActive = false;
+  }
+}
+
+let defaultVacuumFailureMonitor = new VacuumFailureMonitor();
+
+/** The monitor backing `runVacuumCleanup`. */
+export function getVacuumFailureMonitor(): VacuumFailureMonitor {
+  return defaultVacuumFailureMonitor;
+}
+
+/**
+ * Clear vacuum cleaner alert state and re-read the threshold configuration.
+ * Intended for tests and for reloads after a config change.
+ */
+export function resetVacuumFailureMonitorState(): void {
+  defaultVacuumFailureMonitor = new VacuumFailureMonitor();
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +734,11 @@ export function pruneEventsInLedgerRange(
     return result.changes;
   });
 
-  const prunedEvents = tx() as number;
+  const prunedEvents = timeVacuumOperation(
+    "prune_ledger_range",
+    { startLedger, endLedger },
+    tx,
+  ) as number;
 
   logger.info("Pruned events in ledger range", {
     startLedger,
@@ -481,4 +839,208 @@ export function assertVacuumSchemaValid(db: Database.Database): void {
       `Vacuum cleaner cannot start — database schema is out of sync: ${reasons.join("; ")}`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Exponential backoff retry (#343)
+// ---------------------------------------------------------------------------
+
+/** Retry configuration for vacuum operations subject to connection dropouts. */
+export interface VacuumRetryConfig {
+  /** Maximum number of retry attempts after the initial failure (default: 5). */
+  maxRetries: number;
+  /** Initial delay in ms after the first failure (default: 1000). */
+  initialBackoffMs: number;
+  /** Multiplier applied to the backoff on each consecutive failure (default: 2). */
+  backoffMultiplier: number;
+  /** Ceiling delay in ms (default: 30000). */
+  maxBackoffMs: number;
+}
+
+/** Default retry configuration for vacuum connection dropouts. */
+export const DEFAULT_VACUUM_RETRY_CONFIG: VacuumRetryConfig = {
+  maxRetries: 5,
+  initialBackoffMs: 1000,
+  backoffMultiplier: 2,
+  maxBackoffMs: 30_000,
+};
+
+/** Error-string fragments that indicate a transient, retryable failure. */
+export const VACUUM_RETRYABLE_PATTERNS = [
+  "timeout",
+  "SQLITE_BUSY",
+  "SQLITE_LOCKED",
+  "database is locked",
+  "database is busy",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "connect timeout",
+  "connection reset",
+  "connection refused",
+  "connection dropped",
+  "RPC connection",
+] as const;
+
+/**
+ * Returns true when `err` looks like a transient RPC connection timeout or
+ * SQLite lock that is worth retrying.
+ */
+export function isVacuumRetryableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return (VACUUM_RETRYABLE_PATTERNS as readonly string[]).some((p) =>
+    msg.includes(p.toLowerCase()),
+  );
+}
+
+/**
+ * Compute the backoff delay (ms) for a given attempt index.
+ * attempt 0 → initialBackoffMs, attempt 1 → initialBackoffMs * multiplier, etc.,
+ * capped at maxBackoffMs.
+ */
+export function computeVacuumBackoffMs(
+  attempt: number,
+  config: Pick<VacuumRetryConfig, "initialBackoffMs" | "backoffMultiplier" | "maxBackoffMs">,
+): number {
+  return Math.min(
+    config.initialBackoffMs * Math.pow(config.backoffMultiplier, attempt),
+    config.maxBackoffMs,
+  );
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a synchronous vacuum operation with exponential backoff retry.
+ * Uses `sleepSync` (Atomics.wait) so the delay is truly blocking — appropriate
+ * for the synchronous better-sqlite3 calls used throughout this module.
+ *
+ * Only errors flagged by `isVacuumRetryableError` are retried; all other errors
+ * propagate immediately. After `maxRetries` consecutive retries have been
+ * exhausted the last error is rethrown.
+ */
+export function withVacuumRetrySync<T>(
+  fn: () => T,
+  config: Partial<VacuumRetryConfig> = {},
+  context: string = "sqlite_vacuum_cleaner",
+): T {
+  const cfg = { ...DEFAULT_VACUUM_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isVacuumRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeVacuumBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      sleepSync(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
+/**
+ * Async variant of vacuum retry for callers that prefer Promise-based backoff.
+ * Otherwise identical semantics to `withVacuumRetrySync`.
+ */
+export async function withVacuumRetry<T>(
+  fn: () => Promise<T> | T,
+  config: Partial<VacuumRetryConfig> = {},
+  context: string = "sqlite_vacuum_cleaner",
+): Promise<T> {
+  const cfg = { ...DEFAULT_VACUUM_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isVacuumRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeVacuumBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      await sleep(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
+/**
+ * Run `runVacuum` wrapped in exponential backoff retry so transient RPC
+ * connection timeouts and SQLite lock dropouts don't abort the cycle.
+ *
+ * Pruning is intentionally NOT retried here — it runs inside a transaction
+ * that either commits or rolls back atomically. Only the separate VACUUM step
+ * (which is non-transactional and most susceptible to "database is locked"
+ * errors from concurrent writers) gets the retry treatment.
+ */
+export function runVacuumWithRetry(
+  db: Database.Database,
+  retryConfig: Partial<VacuumRetryConfig> = {},
+): void {
+  withVacuumRetrySync(
+    () => runVacuum(db),
+    retryConfig,
+    "sqlite_vacuum_cleaner.run_vacuum",
+  );
+}
+
+/**
+ * Run a full vacuum-cleanup cycle with retry on the VACUUM step.
+ *
+ * Pruning runs once (no retry — a failed prune rolls back atomically and
+ * should not be blindly retried). The VACUUM step is retried with
+ * exponential backoff for transient connection dropouts.
+ */
+export function runVacuumCleanupWithRetry(
+  db: Database.Database,
+  options: VacuumCleanupOptions = {},
+  retryConfig: Partial<VacuumRetryConfig> = {},
+): VacuumCleanupResult {
+  const retentionDays = options.retentionDays ?? DEFAULT_RETENTION_DAYS;
+
+  logger.info("Starting sqlite vacuum cleanup (with retry)", {
+    retentionDays,
+  });
+
+  const prunedEvents = pruneOldEvents(db, retentionDays);
+
+  runVacuumWithRetry(db, retryConfig);
+
+  logger.info("Completed sqlite vacuum cleanup (with retry)", { prunedEvents });
+
+  return { prunedEvents, vacuumed: true };
 }

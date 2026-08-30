@@ -1,6 +1,11 @@
 import { getDb } from "./db.js";
 import logger from "../utils/logger.js";
 
+/** Index names used by sync-ranges lookups – validated via EXPLAIN QUERY PLAN (#250). */
+export const SYNC_RANGES_INDEXES = {
+  ledgers: "idx_sync_ranges_ledgers",
+} as const;
+
 /**
  * DuplicatePrevention manages unique constraint enforcement for event ingestion
  * with support for dynamic historical sync ranges.
@@ -285,6 +290,9 @@ export function initializeSyncRangesTable(): void {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(start_ledger, end_ledger)
     );
+
+    CREATE INDEX IF NOT EXISTS ${SYNC_RANGES_INDEXES.ledgers}
+      ON sync_ranges (start_ledger, end_ledger);
   `);
 }
 
@@ -417,22 +425,23 @@ export function deleteEventsInRange(
   endLedger: number,
 ): number {
   const db = getDb();
-  const result = db
-    .prepare(
-      `DELETE FROM events
-       WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
-    )
-    .run(startLedger, endLedger);
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare(
+        `DELETE FROM events
+         WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+      )
+      .run(startLedger, endLedger);
 
-  const hasSyncRanges = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sync_ranges'")
-    .get();
-  if (hasSyncRanges) {
-    db.prepare(
-      `DELETE FROM sync_ranges
-       WHERE start_ledger >= ? AND end_ledger <= ?`,
-    ).run(startLedger, endLedger);
-  }
+    const hasSyncRanges = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sync_ranges'")
+      .get();
+    if (hasSyncRanges) {
+      db.prepare(
+        `DELETE FROM sync_ranges
+         WHERE start_ledger >= ? AND end_ledger <= ?`,
+      ).run(startLedger, endLedger);
+    }
 
     return result.changes;
   });

@@ -7,16 +7,17 @@ import {
   type EventRow,
 } from "../src/indexer/db.js";
 import {
-  IndexerMetricsEventQueue,
-  IndexerMetricsQueueOverflowError,
-  DEFAULT_METRICS_QUEUE_MAX_SIZE,
-  collectIndexerMetrics,
-  collectIndexerMetricsAsync,
-  getIndexerMetricsQueue,
-  metricsEventIdentityKey,
-  recordEventNotifications,
-  resetIndexerMetricsCollectorState,
-} from "../src/indexer/indexer_metrics_collector.js";
+  WriterPoolEventQueue,
+  WriterPoolEventQueueOverflowError,
+  DEFAULT_WRITER_POOL_EVENT_QUEUE_MAX_SIZE,
+  writerPoolEventIdentityKey,
+  submitEventNotifications,
+  getWriterPoolEventQueue,
+  resetWriterPoolStartState,
+  queueWrite,
+  flushWriteQueue,
+  type WriteOperation,
+} from "../src/indexer/database-writer-pool.js";
 
 const CONTRACT_ID = "CTEST0000000000000000000000000000000000000000000000000001";
 const EVENT_TYPES = ["initialized", "funded", "approved"];
@@ -49,30 +50,33 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
-  afterEach(() => {
-    resetIndexerMetricsCollectorState();
+describe("database_writer_pool – concurrent event insert locks (#327)", () => {
+  afterEach(async () => {
+    await flushWriteQueue();
+    resetWriterPoolStartState();
   });
 
-  describe("metricsEventIdentityKey", () => {
+  describe("writerPoolEventIdentityKey", () => {
     it("keys on the events table's uniqueness triple", () => {
-      expect(metricsEventIdentityKey(row(7, "funded"))).toBe(
+      expect(writerPoolEventIdentityKey(row(7, "funded"))).toBe(
         `${CONTRACT_ID}|7|funded`,
       );
     });
 
     it("distinguishes ledger, type and contract", () => {
-      const base = metricsEventIdentityKey(row(7, "funded"));
-      expect(metricsEventIdentityKey(row(8, "funded"))).not.toBe(base);
-      expect(metricsEventIdentityKey(row(7, "approved"))).not.toBe(base);
-      expect(metricsEventIdentityKey(row(7, "funded", "COTHER"))).not.toBe(base);
+      const base = writerPoolEventIdentityKey(row(7, "funded"));
+      expect(writerPoolEventIdentityKey(row(8, "funded"))).not.toBe(base);
+      expect(writerPoolEventIdentityKey(row(7, "approved"))).not.toBe(base);
+      expect(writerPoolEventIdentityKey(row(7, "funded", "COTHER"))).not.toBe(
+        base,
+      );
     });
   });
 
-  describe("IndexerMetricsEventQueue", () => {
+  describe("WriterPoolEventQueue", () => {
     it("persists a batch once and reports the counts", async () => {
       const persisted: EventRow[] = [];
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: (event) => {
           persisted.push(event);
           return true;
@@ -94,7 +98,7 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
 
     it("collapses duplicates inside a single batch", async () => {
       let persistCalls = 0;
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: () => {
           persistCalls++;
           return true;
@@ -111,9 +115,9 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
 
     it("persists each event exactly once under concurrent submits", async () => {
       const persistCounts = new Map<string, number>();
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: async (event) => {
-          const key = metricsEventIdentityKey(event);
+          const key = writerPoolEventIdentityKey(event);
           // Yield inside the critical section: without a lock this is exactly
           // where a second caller would slip in and insert the same row.
           await sleep(2);
@@ -141,9 +145,9 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
     it("never runs two persists for the same event at the same time", async () => {
       const inFlight = new Set<string>();
       let overlaps = 0;
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: async (event) => {
-          const key = metricsEventIdentityKey(event);
+          const key = writerPoolEventIdentityKey(event);
           if (inFlight.has(key)) overlaps++;
           inFlight.add(key);
           await sleep(2);
@@ -164,7 +168,7 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
     it("lets unrelated events persist concurrently", async () => {
       let active = 0;
       let peak = 0;
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: async () => {
           active++;
           peak = Math.max(peak, active);
@@ -184,7 +188,7 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
     });
 
     it("counts a persist that reports no write as a duplicate", async () => {
-      const queue = new IndexerMetricsEventQueue({ persist: () => false });
+      const queue = new WriterPoolEventQueue({ persist: () => false });
 
       const result = await queue.submit([row(9)]);
 
@@ -194,7 +198,7 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
 
     it("releases the lock when a persist throws", async () => {
       let calls = 0;
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: () => {
           calls++;
           if (calls === 1) throw new Error("database is locked");
@@ -207,11 +211,21 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
 
       const retry = await queue.submit([row(4)]);
       expect(retry.insertedCount).toBe(1);
+      expect(queue.heldLockCount).toBe(0);
+    });
+
+    it("releases the lock after a successful persist", async () => {
+      const queue = new WriterPoolEventQueue({ persist: () => true });
+
+      await queue.submit([row(1), row(2)]);
+
+      expect(queue.heldLockCount).toBe(0);
+      expect(queue.size).toBe(0);
     });
 
     it("queues notifications before a flush and drains them once", async () => {
       const persisted: EventRow[] = [];
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: (event) => {
           persisted.push(event);
           return true;
@@ -236,7 +250,7 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
 
     it("does not re-persist an event enqueued again after a flush", async () => {
       let persistCalls = 0;
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: () => {
           persistCalls++;
           return true;
@@ -254,7 +268,7 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
 
     it("drains safely when flushes run concurrently", async () => {
       let persistCalls = 0;
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: async () => {
           persistCalls++;
           await sleep(1);
@@ -271,25 +285,25 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
     });
 
     it("rejects an enqueue past maxQueueSize", async () => {
-      const queue = new IndexerMetricsEventQueue({
+      const queue = new WriterPoolEventQueue({
         persist: () => true,
         maxQueueSize: 3,
       });
 
       await expect(queue.enqueue(rows(1, 5))).rejects.toThrow(
-        IndexerMetricsQueueOverflowError,
+        WriterPoolEventQueueOverflowError,
       );
       expect(queue.size).toBe(3);
     });
 
     it("rejects an invalid maxQueueSize", () => {
-      expect(() => new IndexerMetricsEventQueue({ maxQueueSize: 0 })).toThrow(
+      expect(() => new WriterPoolEventQueue({ maxQueueSize: 0 })).toThrow(
         /maxQueueSize must be a positive integer/,
       );
     });
 
     it("clears all state on reset", async () => {
-      const queue = new IndexerMetricsEventQueue({ persist: () => true });
+      const queue = new WriterPoolEventQueue({ persist: () => true });
       await queue.submit(rows(1, 3));
 
       queue.reset();
@@ -297,24 +311,93 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
       expect(queue.size).toBe(0);
       expect(queue.persistedKeyCount).toBe(0);
       expect(queue.hasPersisted(row(1, "initialized"))).toBe(false);
+      expect(queue.heldLockCount).toBe(0);
     });
 
     it("exposes the default queue ceiling", () => {
-      expect(DEFAULT_METRICS_QUEUE_MAX_SIZE).toBe(10_000);
+      expect(DEFAULT_WRITER_POOL_EVENT_QUEUE_MAX_SIZE).toBe(10_000);
+    });
+
+    it("survives repeated waves of concurrent identical batches", async () => {
+      const persistCounts = new Map<string, number>();
+      const queue = new WriterPoolEventQueue({
+        persist: async (event) => {
+          const key = writerPoolEventIdentityKey(event);
+          await sleep(1);
+          persistCounts.set(key, (persistCounts.get(key) ?? 0) + 1);
+          return true;
+        },
+      });
+
+      const batch = rows(1, 6, 2);
+      for (let wave = 0; wave < 4; wave++) {
+        await Promise.all(Array.from({ length: 5 }, () => queue.submit(batch)));
+      }
+
+      expect(persistCounts.size).toBe(12);
+      expect([...persistCounts.values()].every((n) => n === 1)).toBe(true);
+      expect(queue.heldLockCount).toBe(0);
+    });
+  });
+
+  describe("queueWrite lock release", () => {
+    it("releases the write-queue lock after a failed operation so later writes proceed", async () => {
+      const failOp: WriteOperation<void> = {
+        name: "failing-lock-release",
+        execute: () => {
+          throw new Error("intentional writer failure");
+        },
+      };
+
+      const failed = await queueWrite(failOp);
+      expect(failed.success).toBe(false);
+
+      const recovered = await queueWrite({
+        name: "after-failure",
+        execute: () => 1,
+      });
+      expect(recovered.success).toBe(true);
+      expect(recovered.data).toBe(1);
+    });
+
+    it("does not serialize unrelated event identities through the event lock", async () => {
+      let active = 0;
+      let peak = 0;
+      const queue = new WriterPoolEventQueue({
+        persist: async () => {
+          active++;
+          peak = Math.max(peak, active);
+          await sleep(8);
+          active--;
+          return true;
+        },
+      });
+
+      await Promise.all(
+        Array.from({ length: 6 }, (_, i) =>
+          queue.submit([row(100 + i, "funded")]),
+        ),
+      );
+
+      expect(peak).toBeGreaterThan(1);
+      expect(queue.heldLockCount).toBe(0);
     });
   });
 
   describe("with a real SQLite store", () => {
     let testDb: Database.Database;
 
-    beforeEach(() => {
+    beforeEach(async () => {
       testDb = new Database(":memory:");
       setDb(testDb);
       runMigrations();
-      resetIndexerMetricsCollectorState();
+      resetWriterPoolStartState();
+      await flushWriteQueue();
     });
 
-    afterEach(() => {
+    afterEach(async () => {
+      await flushWriteQueue();
+      resetWriterPoolStartState();
       closeDb();
     });
 
@@ -326,7 +409,7 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
       const batch = rows(1, 10, 2);
 
       const results = await Promise.all(
-        Array.from({ length: 6 }, () => recordEventNotifications(batch)),
+        Array.from({ length: 6 }, () => submitEventNotifications(batch)),
       );
 
       expect(eventCount()).toBe(20);
@@ -342,29 +425,25 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
       expect(perLedger.every((r) => r.c === 2)).toBe(true);
     });
 
-    it("keeps the metrics snapshot consistent with the de-duplicated rows", async () => {
-      const batch = rows(1, 5, 3);
+    it("keeps concurrent event notifications free of duplicate rows", async () => {
+      const batch = rows(1, 8, 3);
 
       await Promise.all([
-        recordEventNotifications(batch),
-        recordEventNotifications(batch),
-        recordEventNotifications(batch),
+        submitEventNotifications(batch),
+        submitEventNotifications(batch),
+        submitEventNotifications(batch),
+        submitEventNotifications(batch),
       ]);
 
-      const metrics = collectIndexerMetrics(testDb);
-      expect(metrics.totalEvents).toBe(15);
-      expect(metrics.eventsByType).toEqual({
-        initialized: 5,
-        funded: 5,
-        approved: 5,
-      });
+      expect(eventCount()).toBe(24);
+      expect(getWriterPoolEventQueue().heldLockCount).toBe(0);
     });
 
     it("is idempotent across sequential submissions of the same window", async () => {
       const batch = rows(100, 104, 3);
 
-      const first = await recordEventNotifications(batch);
-      const second = await recordEventNotifications(batch);
+      const first = await submitEventNotifications(batch);
+      const second = await submitEventNotifications(batch);
 
       expect(first.insertedCount).toBe(15);
       expect(second.insertedCount).toBe(0);
@@ -375,9 +454,9 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
     it("still de-duplicates after a state reset, because the store rejects the row", async () => {
       const batch = rows(200, 202, 2);
 
-      await recordEventNotifications(batch);
-      resetIndexerMetricsCollectorState();
-      const second = await recordEventNotifications(batch);
+      await submitEventNotifications(batch);
+      resetWriterPoolStartState();
+      const second = await submitEventNotifications(batch);
 
       expect(second.insertedCount).toBe(0);
       expect(second.duplicateCount).toBe(6);
@@ -387,57 +466,87 @@ describe("indexer_metrics_collector – concurrent call locks (#336)", () => {
     it("does not double-count rows written outside the queue", async () => {
       insertEvent(CONTRACT_ID, "funded", 1, 1_700_000_001, "{}");
 
-      const result = await recordEventNotifications([row(1, "funded")]);
+      const result = await submitEventNotifications([row(1, "funded")]);
 
       expect(result.insertedCount).toBe(0);
       expect(result.duplicateCount).toBe(1);
       expect(eventCount()).toBe(1);
     });
 
-    it("shares one snapshot between concurrent collectIndexerMetricsAsync callers", async () => {
-      await recordEventNotifications(rows(1, 4, 2));
+    it("does not duplicate when notifications race queueWrite inserts", async () => {
+      const batch = rows(50, 54, 2);
 
-      const snapshots = await Promise.all([
-        collectIndexerMetricsAsync(testDb),
-        collectIndexerMetricsAsync(testDb),
-        collectIndexerMetricsAsync(testDb),
+      await Promise.all([
+        submitEventNotifications(batch),
+        submitEventNotifications(batch),
+        queueWrite({
+          name: "direct-insert-event",
+          execute: () =>
+            insertEvent(
+              CONTRACT_ID,
+              "funded",
+              52,
+              1_700_000_052,
+              JSON.stringify({ ledger: 52, eventType: "funded" }),
+            ),
+        }),
       ]);
 
-      expect(snapshots[0]).toBe(snapshots[1]);
-      expect(snapshots[1]).toBe(snapshots[2]);
-      expect(snapshots[0].totalEvents).toBe(8);
+      expect(eventCount()).toBe(10);
     });
 
-    it("drains queued notifications before collecting", async () => {
-      await getIndexerMetricsQueue().enqueue(rows(1, 3, 2));
-      expect(getIndexerMetricsQueue().size).toBe(6);
+    it("survives repeated concurrent submissions of the same window", async () => {
+      const batch = rows(300, 304, 2);
 
-      const metrics = await collectIndexerMetricsAsync(testDb);
+      for (let wave = 0; wave < 3; wave++) {
+        await Promise.all(
+          Array.from({ length: 8 }, () => submitEventNotifications(batch)),
+        );
+      }
 
-      expect(getIndexerMetricsQueue().size).toBe(0);
-      expect(metrics.totalEvents).toBe(6);
+      expect(eventCount()).toBe(10);
+      expect(getWriterPoolEventQueue().heldLockCount).toBe(0);
+      expect(getWriterPoolEventQueue().size).toBe(0);
     });
 
-    it("starts a fresh collection once the previous one settled", async () => {
-      const first = await collectIndexerMetricsAsync(testDb);
-      await recordEventNotifications(rows(1, 2, 1));
-      const second = await collectIndexerMetricsAsync(testDb);
+    it("propagates persist failures and still allows a later retry", async () => {
+      const queue = new WriterPoolEventQueue({
+        persist: async (event) => {
+          const result = await queueWrite({
+            name: "insert-event-may-fail",
+            execute: () => {
+              if (event.ledgerSequence === 1 && event.eventType === "boom") {
+                throw new Error("constraint boom");
+              }
+              return insertEvent(
+                event.contractId,
+                event.eventType,
+                event.ledgerSequence,
+                event.timestamp,
+                event.dataJson,
+              );
+            },
+          });
+          if (!result.success) {
+            throw result.error ?? new Error("insert failed");
+          }
+          return Boolean(result.data);
+        },
+      });
 
-      expect(second).not.toBe(first);
-      expect(first.totalEvents).toBe(0);
-      expect(second.totalEvents).toBe(2);
-    });
+      await expect(
+        queue.submit([
+          {
+            ...row(1, "boom"),
+            eventType: "boom",
+          },
+        ]),
+      ).rejects.toThrow("constraint boom");
+      expect(queue.heldLockCount).toBe(0);
 
-    it("keeps concurrent notifications and collections consistent", async () => {
-      const [, , metrics] = await Promise.all([
-        recordEventNotifications(rows(1, 6, 2)),
-        recordEventNotifications(rows(1, 6, 2)),
-        collectIndexerMetricsAsync(testDb),
-      ]);
-
-      expect(eventCount()).toBe(12);
-      expect(metrics.totalEvents).toBeLessThanOrEqual(12);
-      expect(getIndexerMetricsQueue().persistedKeyCount).toBe(12);
+      const retry = await queue.submit([row(2, "funded")]);
+      expect(retry.insertedCount).toBe(1);
+      expect(eventCount()).toBe(1);
     });
   });
 });

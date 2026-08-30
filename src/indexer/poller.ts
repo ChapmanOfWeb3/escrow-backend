@@ -1,8 +1,10 @@
 import { Server } from "@stellar/stellar-sdk/rpc";
+import type { Api } from "@stellar/stellar-sdk/rpc";
 import { scValToNative } from "@stellar/stellar-sdk";
 import {
   getLastIndexedLedger,
   insertEventBatch,
+  insertHistoricalEventBatch,
   getActiveContractIds,
   registerContract,
   adjustPollerInterval,
@@ -17,7 +19,28 @@ import logger from "../utils/logger.js";
 
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
-const server = new Server(RPC_URL);
+
+// ---------------------------------------------------------------------------
+// RPC exponential backoff retry (#249)
+// ---------------------------------------------------------------------------
+// All RPC calls in the indexer poll loop go through RpcPollerClient, which
+// retries transient failures (timeouts, connection resets, rate limits, 5xx)
+// with a doubling backoff up to maxRetries, then resets on success.
+const rpcClient = new RpcPollerClient(RPC_URL, {
+  maxRetries: parseInt(process.env.INDEXER_RPC_MAX_RETRIES || "5", 10),
+  initialBackoffMs: parseInt(
+    process.env.INDEXER_RPC_INITIAL_BACKOFF_MS || "1000",
+    10,
+  ),
+  backoffMultiplier: parseInt(
+    process.env.INDEXER_RPC_BACKOFF_MULTIPLIER || "2",
+    10,
+  ),
+  maxBackoffMs: parseInt(
+    process.env.INDEXER_RPC_MAX_BACKOFF_MS || "30000",
+    10,
+  ),
+});
 
 const failureMonitor = getIndexerRunnerFailureMonitor();
 
@@ -77,10 +100,20 @@ export function enqueueEventInsert(
  * ledger pointer update (#84) – so a mid-poll crash cannot advance the pointer
  * without committing the accompanying events.
  *
- * Returns whether the ledger actually advanced, so startPoller() can throttle
- * its polling frequency up or down based on ledger processing load (#274).
+ * Returns whether the network showed activity (a new ledger closed since the
+ * last poll). The caller uses this to drive the dynamic polling interval
+ * (see nextPollIntervalMs()) – NOTE this only affects how *often* we poll,
+ * never *what* gets written. Duplicate prevention itself is guaranteed by the
+ * UNIQUE(contract_id, ledger_sequence, event_type) constraint + INSERT OR
+ * IGNORE in db.ts, and every poll always resumes from the last committed
+ * ledger pointer (lastLedger + 1) regardless of how much time has passed
+ * since the previous poll. So a longer interval can only delay *when* an
+ * event is detected – it cannot cause an event to be missed, double-counted,
+ * or processed out of order.
  */
 export async function pollEvents(): Promise<boolean> {
+  const pollStartedAt = performance.now();
+
   // --- Resolve active contract IDs from the DB (#85) ---
   let contractIds: string[] = getActiveContractIds();
 
@@ -132,7 +165,7 @@ export async function pollEvents(): Promise<boolean> {
     logger.info("Polling events", { startLedger, currentLedger });
 
     const eventsStart = performance.now();
-    const events = await server.getEvents({
+    const events = await fetchEventsWithRetry(server, {
       startLedger,
       contractIds,
       limit: 100,
@@ -150,15 +183,9 @@ export async function pollEvents(): Promise<boolean> {
     });
 
     // Build the batch to be written atomically (#84)
-    const batch: EventRow[] = events.events.map((event) => ({
-      contractId: event.contractId?.contractId() ?? contractIds[0],
-      eventType: scValToNative(event.topic[0]) as string,
-      ledgerSequence: event.ledger,
-      timestamp: event.ledgerClosedAt
-        ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
-        : Math.floor(Date.now() / 1000),
-      dataJson: JSON.stringify(event.value),
-    }));
+    const batch: EventRow[] = events.events.map((event) =>
+      toEventRow(event, contractIds[0])
+    );
 
     // Persist the batch and advance the ledger pointer atomically (#84).
     // Concurrent indexer_runner executions share a memory queue lock so their
@@ -178,6 +205,8 @@ export async function pollEvents(): Promise<boolean> {
       elapsedMs: Math.round(totalElapsed),
       pollIntervalMs: throttleState.currentIntervalMs,
     });
+
+    logPollDiagnostics(performance.now() - pollStartedAt, batch);
 
     deliverWebhooks(startLedger, currentLedger).catch((err) =>
       logger.error("Error delivering webhooks", {
@@ -244,4 +273,5 @@ export function stopPoller() {
     clearTimeout(pollerTimeout);
     pollerTimeout = null;
   }
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
 }

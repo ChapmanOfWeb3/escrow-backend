@@ -9,6 +9,11 @@ import {
   isWriteQueueProcessing,
   createSqlOperation,
   createReadWriteOperation,
+  isRpcTimeoutError,
+  computeRpcBackoffMs,
+  setWriterPoolRpcRetryConfig,
+  getWriterPoolRpcRetryConfig,
+  resetWriterPoolRpcRetryConfig,
   type WriteOperation,
 } from "../src/indexer/database-writer-pool.js";
 
@@ -817,6 +822,317 @@ describe("DatabaseWriterPool – Concurrent Write Operations", () => {
         testDb.prepare("SELECT COUNT(*) as cnt FROM events WHERE contract_id = ?").get("C-OK") as { cnt: number }
       ).cnt;
       expect(count).toBe(0);
+    });
+  });
+
+  // RPC connection timeout retry: helpers
+  // -------------------------------------------------------------------------
+
+  describe("computeRpcBackoffMs – exponential backoff calculation", () => {
+    const baseConfig = {
+      initialBackoffMs: 1000,
+      backoffMultiplier: 2,
+      maxBackoffMs: 30000,
+    };
+
+    it("returns initial backoff for attempt 0", () => {
+      expect(computeRpcBackoffMs(0, baseConfig)).toBe(1000);
+    });
+
+    it("increases exponentially with each subsequent attempt", () => {
+      expect(computeRpcBackoffMs(0, baseConfig)).toBe(1000);
+      expect(computeRpcBackoffMs(1, baseConfig)).toBe(2000);
+      expect(computeRpcBackoffMs(2, baseConfig)).toBe(4000);
+      expect(computeRpcBackoffMs(3, baseConfig)).toBe(8000);
+      expect(computeRpcBackoffMs(4, baseConfig)).toBe(16000);
+      const d0 = computeRpcBackoffMs(0, baseConfig);
+      const d1 = computeRpcBackoffMs(1, baseConfig);
+      const d2 = computeRpcBackoffMs(2, baseConfig);
+      expect(d1).toBeGreaterThan(d0);
+      expect(d2).toBeGreaterThan(d1);
+    });
+
+    it("caps at maxBackoffMs", () => {
+      expect(computeRpcBackoffMs(5, baseConfig)).toBe(30000);
+      expect(computeRpcBackoffMs(10, baseConfig)).toBe(30000);
+      expect(computeRpcBackoffMs(100, baseConfig)).toBe(30000);
+    });
+
+    it("respects custom multiplier", () => {
+      const cfg3x = { ...baseConfig, backoffMultiplier: 3 };
+      expect(computeRpcBackoffMs(0, cfg3x)).toBe(1000);
+      expect(computeRpcBackoffMs(1, cfg3x)).toBe(3000);
+      expect(computeRpcBackoffMs(2, cfg3x)).toBe(9000);
+    });
+
+    it("respects custom initial backoff and max", () => {
+      const cfgCustom = { initialBackoffMs: 500, backoffMultiplier: 2, maxBackoffMs: 4000 };
+      expect(computeRpcBackoffMs(0, cfgCustom)).toBe(500);
+      expect(computeRpcBackoffMs(1, cfgCustom)).toBe(1000);
+      expect(computeRpcBackoffMs(2, cfgCustom)).toBe(2000);
+      expect(computeRpcBackoffMs(3, cfgCustom)).toBe(4000);
+      expect(computeRpcBackoffMs(4, cfgCustom)).toBe(4000);
+    });
+  });
+
+  describe("isRpcTimeoutError – retryable error detection", () => {
+    it("matches all RPC connection timeout patterns", () => {
+      const patterns = [
+        "timeout",
+        "ECONNRESET",
+        "ECONNREFUSED",
+        "ETIMEDOUT",
+        "socket hang up",
+        "network error",
+        "status 429",
+        "status 503",
+        "status 502",
+        "request timeout",
+        "connect timeout",
+      ];
+      for (const pattern of patterns) {
+        expect(isRpcTimeoutError(new Error(pattern))).toBe(true);
+        expect(isRpcTimeoutError(new Error("prefix " + pattern + " suffix"))).toBe(true);
+        expect(isRpcTimeoutError(new Error(pattern.toUpperCase()))).toBe(true);
+      }
+    });
+
+    it("does not match non-timeout errors", () => {
+      const nonRetryable = [
+        "UNIQUE constraint failed",
+        "SQLITE_CONSTRAINT",
+        "syntax error",
+        "invalid argument",
+        "no such table",
+        "permission denied",
+        "Intentional failure",
+      ];
+      for (const msg of nonRetryable) {
+        expect(isRpcTimeoutError(new Error(msg))).toBe(false);
+      }
+    });
+
+    it("returns false for non-Error values", () => {
+      expect(isRpcTimeoutError("timeout")).toBe(false);
+      expect(isRpcTimeoutError(undefined)).toBe(false);
+      expect(isRpcTimeoutError(null)).toBe(false);
+      expect(isRpcTimeoutError({ message: "timeout" })).toBe(false);
+    });
+  });
+
+  describe("WriterPoolRpcRetryConfig – config management", () => {
+    afterEach(() => {
+      resetWriterPoolRpcRetryConfig();
+    });
+
+    it("exposes sensible defaults", () => {
+      const cfg = getWriterPoolRpcRetryConfig();
+      expect(cfg.maxRetries).toBe(5);
+      expect(cfg.initialBackoffMs).toBe(1000);
+      expect(cfg.backoffMultiplier).toBe(2);
+      expect(cfg.maxBackoffMs).toBe(30000);
+    });
+
+    it("applies partial overrides via setWriterPoolRpcRetryConfig", () => {
+      setWriterPoolRpcRetryConfig({ maxRetries: 3, initialBackoffMs: 500 });
+      const cfg = getWriterPoolRpcRetryConfig();
+      expect(cfg.maxRetries).toBe(3);
+      expect(cfg.initialBackoffMs).toBe(500);
+      expect(cfg.backoffMultiplier).toBe(2);
+      expect(cfg.maxBackoffMs).toBe(30000);
+    });
+
+    it("returns a defensive copy from getWriterPoolRpcRetryConfig", () => {
+      const cfg1 = getWriterPoolRpcRetryConfig();
+      cfg1.maxRetries = 999;
+      const cfg2 = getWriterPoolRpcRetryConfig();
+      expect(cfg2.maxRetries).toBe(5);
+    });
+
+    it("resetWriterPoolRpcRetryConfig restores defaults", () => {
+      setWriterPoolRpcRetryConfig({ maxRetries: 1, initialBackoffMs: 10, maxBackoffMs: 100 });
+      resetWriterPoolRpcRetryConfig();
+      const cfg = getWriterPoolRpcRetryConfig();
+      expect(cfg.maxRetries).toBe(5);
+      expect(cfg.initialBackoffMs).toBe(1000);
+      expect(cfg.maxBackoffMs).toBe(30000);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // RPC connection timeout retry: integration with queueWrite
+  // -------------------------------------------------------------------------
+
+  describe("queueWrite – RPC connection timeout retry", () => {
+    beforeEach(() => {
+      setWriterPoolRpcRetryConfig({
+        maxRetries: 3,
+        initialBackoffMs: 1,
+        backoffMultiplier: 2,
+        maxBackoffMs: 10,
+      });
+    });
+
+    afterEach(() => {
+      resetWriterPoolRpcRetryConfig();
+    });
+
+    it("succeeds on first attempt without RPC retry", async () => {
+      let calls = 0;
+      const op: WriteOperation<number> = {
+        name: "first-attempt-ok",
+        execute: (db) => {
+          calls++;
+          const r = db.prepare("INSERT INTO test_data (value) VALUES (?)").run("ok");
+          return r.changes;
+        },
+      };
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(true);
+      expect(result.retries).toBe(0);
+      expect(result.rpcRetries).toBe(0);
+      expect(calls).toBe(1);
+    });
+
+    it("retries on repeated RPC timeouts and increases delay exponentially", async () => {
+      let calls = 0;
+      const op: WriteOperation<void> = {
+        name: "always-timeout",
+        execute: () => {
+          calls++;
+          throw new Error("ETIMEDOUT: request to RPC timed out");
+        },
+      };
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(false);
+      expect(result.rpcRetries).toBe(3);
+      expect(calls).toBe(4);
+
+      const config = getWriterPoolRpcRetryConfig();
+      const expected0 = computeRpcBackoffMs(0, config);
+      const expected1 = computeRpcBackoffMs(1, config);
+      const expected2 = computeRpcBackoffMs(2, config);
+      expect(expected1).toBeGreaterThan(expected0);
+      expect(expected2).toBeGreaterThan(expected1);
+    });
+
+    it("stops retrying after max attempts and surfaces the timeout error", async () => {
+      let calls = 0;
+      setWriterPoolRpcRetryConfig({
+        maxRetries: 2,
+        initialBackoffMs: 1,
+        backoffMultiplier: 2,
+        maxBackoffMs: 10,
+      });
+
+      const op: WriteOperation<void> = {
+        name: "max-retries-timeout",
+        execute: () => {
+          calls++;
+          throw new Error("connect ECONNREFUSED 127.0.0.1:8000");
+        },
+      };
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(false);
+      expect(result.rpcRetries).toBe(2);
+      expect(calls).toBe(3);
+      expect(result.error).toBeDefined();
+      expect(result.error?.message).toContain("ECONNREFUSED");
+    });
+
+    it("successful retry within max attempts resolves normally", async () => {
+      let calls = 0;
+      const op: WriteOperation<number> = {
+        name: "recover-after-timeout",
+        execute: (db) => {
+          calls++;
+          if (calls === 1) throw new Error("socket hang up");
+          if (calls === 2) throw new Error("request timeout");
+          const r = db.prepare("INSERT INTO test_data (value) VALUES (?)").run("recovered");
+          return r.changes;
+        },
+      };
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(1);
+      expect(result.rpcRetries).toBe(2);
+      expect(calls).toBe(3);
+
+      const rows = testDb.prepare("SELECT * FROM test_data WHERE value = ?").all("recovered");
+      expect(rows).toHaveLength(1);
+    });
+
+    it("does not retry non-timeout errors (e.g. constraint violations)", async () => {
+      let calls = 0;
+      testDb.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_test_data_value ON test_data(value)");
+      testDb.prepare("INSERT INTO test_data (value) VALUES (?)").run("unique");
+
+      const op: WriteOperation<void> = {
+        name: "constraint-violation",
+        execute: (db) => {
+          calls++;
+          db.prepare("INSERT INTO test_data (value) VALUES (?)").run("unique");
+        },
+      };
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(false);
+      expect(result.rpcRetries).toBe(0);
+      expect(calls).toBe(1);
+      expect(result.error?.message).toMatch(/UNIQUE|constraint/i);
+    });
+
+    it("does not retry generic syntax or application errors", async () => {
+      let calls = 0;
+      const op: WriteOperation<void> = {
+        name: "syntax-error",
+        execute: (db) => {
+          calls++;
+          db.exec("INVALID SQL SYNTAX HERE");
+        },
+      };
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(false);
+      expect(result.rpcRetries).toBe(0);
+      expect(calls).toBe(1);
+    });
+
+    it("rpcRetries field is present in all result paths", async () => {
+      const successOp = createSqlOperation(
+        "rpc-field-check-insert",
+        "INSERT INTO test_data (value) VALUES (?)",
+        ["field-check"]
+      );
+      const successResult = await queueWrite(successOp);
+      expect(successResult.success).toBe(true);
+      expect("rpcRetries" in successResult).toBe(true);
+      expect(typeof successResult.rpcRetries).toBe("number");
+      expect(successResult.rpcRetries).toBeGreaterThanOrEqual(0);
+
+      let failCalls = 0;
+      const failOp: WriteOperation<void> = {
+        name: "rpc-field-check-fail",
+        execute: () => {
+          failCalls++;
+          throw new Error("timeout");
+        },
+      };
+      setWriterPoolRpcRetryConfig({ maxRetries: 1, initialBackoffMs: 1 });
+      const failResult = await queueWrite(failOp);
+      expect(failResult.success).toBe(false);
+      expect("rpcRetries" in failResult).toBe(true);
+      expect(failResult.rpcRetries).toBe(1);
     });
   });
 });
