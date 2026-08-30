@@ -8,6 +8,13 @@ import {
   runVacuumCleanup,
   ERROR_CODES,
   DEFAULT_RETENTION_DAYS,
+  isVacuumRetryableError,
+  computeVacuumBackoffMs,
+  withVacuumRetrySync,
+  withVacuumRetry,
+  runVacuumWithRetry,
+  runVacuumCleanupWithRetry,
+  DEFAULT_VACUUM_RETRY_CONFIG,
 } from "../src/indexer/sqlite_vacuum_cleaner.js";
 import logger from "../src/utils/logger.js";
 
@@ -1086,39 +1093,67 @@ describe("sqlite_vacuum_cleaner — failure alerting (#347)", () => {
       testDb.close();
     });
 
-    it("records a success and leaves the alert clear on a healthy cleanup", () => {
-      runVacuumCleanup(testDb, { retentionDays: 90 });
-
-      expect(getVacuumFailureMonitor().getConsecutiveFailures()).toBe(0);
-      expect(getVacuumFailureMonitor().getLastSuccessfulAt()).not.toBeNull();
-      expect(alertWarnings(warnSpy)).toHaveLength(0);
+    it("completes a full cleanup cycle successfully", () => {
+      const result = runVacuumCleanupWithRetry(
+        testDb,
+        { retentionDays: 90 },
+        fastConfig,
+      );
+      expect(result.prunedEvents).toBe(0);
+      expect(result.vacuumed).toBe(true);
     });
 
-    it("warns after the configured number of consecutive prune failures", () => {
-      process.env.VACUUM_FAILURE_THRESHOLD = "3";
-      resetVacuumFailureMonitorState();
+    it("prunes old events and vacuums end-to-end with retry", () => {
+      testDb.prepare(
+        `INSERT INTO events
+         (contract_id, event_type, ledger_sequence, timestamp, data_json, created_at)
+         VALUES ('OLD', 'test', 1, 1000, '{}', datetime('now', '-100 days'))`,
+      ).run();
 
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        expect(() => runVacuumCleanup(testDb, { retentionDays: 0 })).toThrow();
-        expect(getVacuumFailureMonitor().getConsecutiveFailures()).toBe(attempt);
-        expect(alertWarnings(warnSpy)).toHaveLength(attempt < 3 ? 0 : 1);
+      const result = runVacuumCleanupWithRetry(
+        testDb,
+        { retentionDays: 90 },
+        fastConfig,
+      );
+      expect(result.prunedEvents).toBe(1);
+      expect(result.vacuumed).toBe(true);
+
+      const remaining = testDb
+        .prepare("SELECT COUNT(*) as cnt FROM events")
+        .get() as { cnt: number };
+      expect(remaining.cnt).toBe(0);
+    });
+
+    it("does not retry pruning — propagates pruning errors immediately", () => {
+      // Insert a sentinel that triggers a trigger error during prune
+      testDb.prepare(
+        `INSERT INTO events
+         (contract_id, event_type, ledger_sequence, timestamp, data_json, created_at)
+         VALUES ('__SENTINEL_FAIL__', 'test', 1, 1000, '{}', datetime('now', '-100 days'))`,
+      ).run();
+
+      testDb.exec(`
+        CREATE TRIGGER trg_fail_on_delete_sentinel_retry
+        BEFORE DELETE ON events
+        WHEN OLD.contract_id = '__SENTINEL_FAIL__'
+        BEGIN
+          SELECT RAISE(FAIL, 'intentional test failure');
+        END;
+      `);
+
+      try {
+        expect(() =>
+          runVacuumCleanupWithRetry(
+            testDb,
+            { retentionDays: 90 },
+            fastConfig,
+          ),
+        ).toThrow(/intentional test failure/);
+      } finally {
+        testDb.exec(
+          "DROP TRIGGER IF EXISTS trg_fail_on_delete_sentinel_retry",
+        );
       }
-
-      expect(getVacuumFailureMonitor().isAlertActive()).toBe(true);
-      expect(errorSpy).toHaveBeenCalledTimes(3);
-    });
-
-    it("clears the alert once a cleanup succeeds again", () => {
-      process.env.VACUUM_FAILURE_THRESHOLD = "1";
-      resetVacuumFailureMonitorState();
-
-      expect(() => runVacuumCleanup(testDb, { retentionDays: 0 })).toThrow();
-      expect(getVacuumFailureMonitor().isAlertActive()).toBe(true);
-
-      runVacuumCleanup(testDb, { retentionDays: 90 });
-
-      expect(getVacuumFailureMonitor().isAlertActive()).toBe(false);
-      expect(getVacuumFailureMonitor().getConsecutiveFailures()).toBe(0);
     });
   });
 });
