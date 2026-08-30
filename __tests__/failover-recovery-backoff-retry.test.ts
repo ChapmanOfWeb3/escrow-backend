@@ -14,7 +14,7 @@ describe("FailoverRecovery – retryWithBackoff", () => {
 
     const timeoutError = new Error("ETIMEDOUT");
     const operation = jest
-      .fn<() => Promise<never>>()
+      .fn<() => Promise<string>>()
       .mockRejectedValue(timeoutError);
 
     await expect(

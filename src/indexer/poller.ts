@@ -14,11 +14,7 @@ import {
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
-import {
-  logIndexerRunnerPollDiagnostics,
-  payloadSizeBytes,
-} from "./indexer_runner.js";
-import { EVENT_TYPES } from "./event_type_filter.js";
+import { fetchEventsWithRetry } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
