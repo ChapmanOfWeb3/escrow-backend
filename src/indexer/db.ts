@@ -1018,6 +1018,130 @@ export function insertHistoricalEventBatch(events: EventRow[]): number {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory event queue locks for concurrent inserts (#260)
+// ---------------------------------------------------------------------------
+// Concurrent RPC notifications routinely carry the same event more than once
+// (retried pages, overlapping poll windows, several producers in one
+// process). insertEvent / insertEventBatch already rely on INSERT OR IGNORE +
+// the UNIQUE constraint to keep the events table itself duplicate-free, but
+// two async callers racing on the same event identity still both perform the
+// (redundant) insert work concurrently. These locked wrappers serialize per
+// event identity – keyed on contract_id|ledger_sequence|event_type – so
+// exactly one caller does the work for a given event; unrelated events still
+// persist concurrently.
+
+const eventInsertLockTails = new Map<string, Promise<void>>();
+
+/** Optional hook used by tests to observe/gate lock acquisition (#260). */
+let eventInsertLockHookForTests: ((key: string) => Promise<void>) | null = null;
+
+function eventInsertLockKey(
+  contractId: string,
+  ledgerSequence: number,
+  eventType: string
+): string {
+  return `${contractId}:${ledgerSequence}:${eventType}`;
+}
+
+/** Test helper – drop all in-memory insert locks between cases. */
+export function resetEventInsertLocksForTests(): void {
+  eventInsertLockTails.clear();
+  eventInsertLockHookForTests = null;
+}
+
+/** Test helper – observe or gate lock acquisition in concurrency tests. */
+export function setEventInsertLockHookForTests(
+  hook: ((key: string) => Promise<void>) | null
+): void {
+  eventInsertLockHookForTests = hook;
+}
+
+/** Event identities currently locked/queued – exposed for concurrency assertions. */
+export function getEventInsertLockCount(): number {
+  return eventInsertLockTails.size;
+}
+
+async function withEventInsertLock<T>(
+  key: string,
+  fn: () => T | Promise<T>
+): Promise<T> {
+  const previous = eventInsertLockTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => gate, () => gate);
+  eventInsertLockTails.set(key, tail);
+
+  try {
+    await previous.catch(() => undefined);
+    if (eventInsertLockHookForTests) {
+      await eventInsertLockHookForTests(key);
+    }
+    return await fn();
+  } finally {
+    release();
+    if (eventInsertLockTails.get(key) === tail) {
+      eventInsertLockTails.delete(key);
+    }
+  }
+}
+
+async function acquireEventLocksInOrder(
+  keys: string[],
+  fn: () => void
+): Promise<void> {
+  if (keys.length === 0) {
+    fn();
+    return;
+  }
+  const [head, ...tail] = keys;
+  await withEventInsertLock(head, () => acquireEventLocksInOrder(tail, fn));
+}
+
+/**
+ * Lock-protected variant of insertEvent for concurrent async notification
+ * producers (#260). Serializes calls that share the same (contract_id,
+ * ledger_sequence, event_type) identity, so overlapping notifications for the
+ * same event cannot race each other into duplicate work.
+ */
+export async function insertEventLocked(
+  contractId: string,
+  eventType: string,
+  ledgerSequence: number,
+  timestamp: number,
+  dataJson: string
+): Promise<boolean> {
+  const key = eventInsertLockKey(contractId, ledgerSequence, eventType);
+  return withEventInsertLock(key, () =>
+    insertEvent(contractId, eventType, ledgerSequence, timestamp, dataJson)
+  );
+}
+
+/**
+ * Lock-protected variant of insertEventBatch (#260). Acquires the lock for
+ * every distinct event identity in the batch, in sorted order, before running
+ * the batch transaction – so a concurrent insertEventLocked /
+ * insertEventBatchLocked call sharing an identity waits its turn.
+ */
+export async function insertEventBatchLocked(
+  events: EventRow[],
+  newLedger: number
+): Promise<void> {
+  const keys = [
+    ...new Set(
+      events.map((ev) =>
+        eventInsertLockKey(ev.contractId, ev.ledgerSequence, ev.eventType)
+      )
+    ),
+  ].sort();
+
+  await acquireEventLocksInOrder(keys, () => {
+    insertEventBatch(events, newLedger);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Event queries
 // ---------------------------------------------------------------------------
 
