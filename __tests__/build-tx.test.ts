@@ -447,7 +447,6 @@ describe("POST /api/jobs/build-tx â€” in-memory caching (duplicate network hits)
   });
 });
 
-<<<<<<< HEAD
 // ---------------------------------------------------------------------------
 // Winston logger traces (#109)
 // ---------------------------------------------------------------------------
@@ -647,8 +646,7 @@ describe("POST /api/jobs/build-tx â€” Winston traces (#109)", () => {
     expect(meta.contractId).toBe(VALID_BODY.contractId);
   });
 });
-=======
-describe('POST /api/jobs/build-tx – CORS and security headers', () => {
+describe('POST /api/jobs/build-tx â€“ CORS and security headers', () => {
   it('rejects requests from unauthorized origins', async () => {
     const res = await request(app)
       .post('/api/jobs/build-tx')
@@ -682,4 +680,3 @@ describe('POST /api/jobs/build-tx – CORS and security headers', () => {
   });
 });
 
->>>>>>> pr/385
