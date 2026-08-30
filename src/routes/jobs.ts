@@ -14,6 +14,7 @@ import { getJobsByWallet, getEventsByContract } from "../indexer/db.js";
 import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
+  whitelistUpdateRateLimit,
   partialReleaseRateLimit,
   buildTxRateLimit,
   timeRemainingRateLimit,
@@ -34,6 +35,8 @@ import {
   byWalletSecurityHeaders,
   claimAutoReleaseCors,
   claimAutoReleaseSecurityHeaders,
+  updateWhitelistCors,
+  updateWhitelistSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
@@ -50,9 +53,14 @@ import {
   byWalletQuerySchema,
   createJobDraftBodySchema,
   createJobDraftLegacyBodySchema,
+  whitelistUpdateBodySchema,
+  whitelistUpdateRequestSchema,
   type ByWalletQuery,
   type CreateJobDraftBody,
   type CreateJobDraftLegacyBody,
+  type UpdateWhitelistBody,
+  type WhitelistUpdateBody,
+  type WhitelistUpdateRequestBody,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
@@ -363,6 +371,16 @@ router.post(
   createJobDraftRateLimit,
   createJobDraftRouteValidator,
   (req: Request, res: Response) => {
+    const traceId = randomUUID();
+    const pathVars = { route: "/api/jobs/create-job-draft" };
+
+    logger.debug("Create-job-draft handler entered", {
+      traceId,
+      ...pathVars,
+      bodyKeys: Object.keys((req.body as Record<string, unknown>) ?? {}),
+      ip: req.ip ?? req.socket?.remoteAddress,
+    });
+
     try {
       const body = req.body as Partial<CreateJobDraftBody> &
         Partial<CreateJobDraftLegacyBody>;
@@ -394,7 +412,15 @@ router.post(
         },
       };
 
+      logger.debug("Create-job-draft draft built", {
+        traceId,
+        ...pathVars,
+        milestoneCount: body.milestones?.length ?? 0,
+      });
+
       logger.info("Job draft created", {
+        traceId,
+        ...pathVars,
         client,
         freelancer,
         arbiter,
@@ -403,8 +429,23 @@ router.post(
       });
 
       sendSuccess(res, draft);
+
+      logger.debug("Create-job-draft response sent", {
+        traceId,
+        ...pathVars,
+        status: 200,
+        success: true,
+        draftId: draft.id,
+        milestoneCount: body.milestones?.length ?? 0,
+      });
     } catch (err: any) {
-      logger.error("Failed to create job draft", { error: err?.message });
+      const message = err?.message ?? String(err);
+      logger.error("Failed to create job draft", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack: err?.stack,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
@@ -652,6 +693,151 @@ router.get(
 );
 
 // ---------------------------------------------------------------------------
+// POST /api/jobs/:contractId/whitelist/update – update whitelisted tokens
+// ---------------------------------------------------------------------------
+router.post(
+  "/:contractId/whitelist/update",
+  jobContractCors,
+  jobContractSecurityHeaders,
+  whitelistUpdateRateLimit,
+  validate(contractIdParamsSchema, "params", (req) =>
+    logger.warn("Invalid contractId provided for whitelist update", { contractId: req.params.contractId }),
+  ),
+  validate(whitelistUpdateRequestSchema, "body", (req) =>
+    logger.warn("Invalid body provided for whitelist update", { body: req.body }),
+  ),
+  async (req: Request, res: Response) => {
+    const contractId = req.params.contractId as string;
+    const body = req.body as WhitelistUpdateRequestBody;
+    const { addresses, tokens } = body as UpdateWhitelistBody;
+    const { token, action, adminAddress } = body as WhitelistUpdateBody;
+    // Bulk form supplies addresses/tokens; the single-token form supplies one.
+    const isSingleTokenForm = token !== undefined;
+    const targetAddresses = addresses ?? tokens ?? (token ? [token] : []);
+
+    logger.info("Updating whitelist", { contractId, count: targetAddresses.length });
+
+    const requiredApiKey = process.env.API_KEY;
+    if (requiredApiKey) {
+      const providedKey = req.header("x-api-key");
+      if (providedKey !== requiredApiKey) {
+        logger.warn("Unauthorized request for whitelist update", { contractId });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+    }
+
+    // The single-token form (`{ token, action, adminAddress }`) builds and
+    // returns an unsigned transaction for the caller to sign, rather than
+    // verifying the contract and echoing the address list back like the bulk
+    // form below does.
+    if (isSingleTokenForm) {
+      logger.info("Processing whitelist update", { contractId, token, action });
+
+      try {
+        const contract = new Contract(contractId);
+        const account = await server.getAccount(
+          adminAddress || process.env.DEPLOYER_ADDRESS || "",
+        );
+        const method =
+          action === "remove"
+            ? "remove_whitelisted_token"
+            : "add_whitelisted_token";
+
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            contract.call(
+              method,
+              new Address(adminAddress).toScVal(),
+              new Address(token).toScVal(),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        const prepared = await server.prepareTransaction(tx);
+        const xdr = prepared.toXDR();
+
+        whitelistCache.del(contractId);
+        logger.info("Whitelist update transaction built", { contractId, token, action });
+        sendSuccess(res, { xdr });
+        return;
+      } catch (err: any) {
+        const message = err?.message ?? String(err);
+        if (/unauthorized|invalid authentication/i.test(message)) {
+          logger.warn("Unauthorized request for whitelist update", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+        if (/not found/i.test(message) && !/account not found/i.test(message)) {
+          logger.warn("Job not found for whitelist update", { contractId });
+          sendError(res, 404, "Job not found");
+          return;
+        }
+        logger.error("Failed to update whitelist", { contractId, error: message });
+        sendError(res, 500, "Internal server error");
+        return;
+      }
+    }
+
+    try {
+      const contract = new Contract(contractId);
+      const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(contract.call("get_whitelisted_tokens"))
+        .setTimeout(30)
+        .build();
+
+      const result = await server.simulateTransaction(tx);
+
+      if ("error" in result) {
+        const errorMsg = String(result.error);
+        if (
+          !errorMsg.includes("contract error #2") &&
+          !errorMsg.includes("NotInitialized")
+        ) {
+          if (
+            /not found|NotFound|contract not found/i.test(errorMsg) ||
+            /contract error #1\b/i.test(errorMsg)
+          ) {
+            logger.warn("Job not found for whitelist update", { contractId });
+            sendError(res, 404, "Job not found");
+            return;
+          }
+          logger.error("Failed to verify contract for whitelist update", { contractId, error: errorMsg });
+          sendError(res, 500, "Internal server error");
+          return;
+        }
+      }
+
+      whitelistCache.del(contractId);
+      logger.info("Whitelist updated successfully", { contractId, count: targetAddresses.length });
+      sendSuccess(res, { contractId, addresses: targetAddresses, updated: true });
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      if (/unauthorized|invalid authentication/i.test(message)) {
+        logger.warn("Unauthorized request for whitelist update", { contractId });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+      if (/not found/i.test(message) && !/account not found/i.test(message)) {
+        logger.warn("Job not found for whitelist update", { contractId });
+        sendError(res, 404, "Job not found");
+        return;
+      }
+      logger.error("Failed to update whitelist", { contractId, error: message });
+      sendError(res, 500, "Internal server error");
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
 // POST /api/jobs/build-tx – build an unsigned transaction for the frontend
 // ---------------------------------------------------------------------------
 router.post(
@@ -663,9 +849,24 @@ router.post(
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
-    try {
-      const { contractId, method, args, sourceAddress } = req.body;
+    const { contractId, method, args, sourceAddress } = req.body;
+    const traceId = randomUUID();
+    const pathVars = { contractId, method, sourceAddress };
 
+    logger.debug("Build-tx handler entered", {
+      traceId,
+      ...pathVars,
+      params: req.params,
+      bodyKeys: Object.keys(req.body ?? {}),
+      argCount: (args || []).length,
+    });
+
+    logger.info("Build-tx request received", {
+      traceId,
+      ...pathVars,
+    });
+
+    try {
       // Validate for whitelist management methods
       if (method === "add_whitelisted_token" || method === "remove_whitelisted_token") {
         const adminArg = args.find((a: any) => a.type === "address" && a.value);
@@ -673,8 +874,22 @@ router.post(
 
         if (!adminArg || !tokenArg) {
           logger.warn("Missing admin/token args for whitelist management", {
-            contractId,
-            method,
+            traceId,
+            ...pathVars,
+          });
+          logger.debug("Build-tx error response body prepared", {
+            traceId,
+            ...pathVars,
+            success: false,
+            clientError:
+              "Both admin (address) and token (address) arguments are required for whitelist management methods",
+          });
+          logger.info("Build-tx response sent", {
+            traceId,
+            ...pathVars,
+            status: 400,
+            success: false,
+            error: "whitelist management args validation",
           });
           sendError(
             res,
@@ -687,9 +902,29 @@ router.post(
 
       const cacheKey = buildTxCacheKey(contractId, method, sourceAddress, args || []);
 
+      logger.debug("Checking build-tx cache", { traceId, ...pathVars, cacheKey });
       const cached = buildTxCache.get<string>(cacheKey);
       if (cached !== undefined) {
-        logger.info("Build-tx XDR served from cache", { contractId, method });
+        logger.info("Build-tx XDR served from cache", {
+          traceId,
+          ...pathVars,
+          source: "cache",
+          xdrLength: cached.length,
+        });
+        logger.debug("Build-tx response body prepared", {
+          traceId,
+          ...pathVars,
+          success: true,
+          xdrLength: cached.length,
+        });
+        logger.info("Build-tx response sent", {
+          traceId,
+          ...pathVars,
+          status: 200,
+          success: true,
+          cached: true,
+          xdrLength: cached.length,
+        });
         res.json({ success: true, xdr: cached });
         return;
       }
@@ -697,10 +932,36 @@ router.post(
       let requestPromise = inFlightBuildTxRequests.get(cacheKey);
       const servedFromInFlight = Boolean(requestPromise);
 
+      logger.debug("Checking in-flight build-tx requests", {
+        traceId,
+        ...pathVars,
+        cacheKey,
+      });
+
       if (!requestPromise) {
         requestPromise = (async (): Promise<string> => {
+          logger.info("Fetching build-tx XDR from Stellar RPC", {
+            traceId,
+            ...pathVars,
+          });
+
+          logger.debug("Building Stellar transaction for build-tx", {
+            traceId,
+            ...pathVars,
+            method,
+            fee: BASE_FEE,
+            timeout: 30,
+          });
           const contract = new Contract(contractId as string);
+          logger.debug("Fetching Stellar account for build-tx", {
+            traceId,
+            ...pathVars,
+          });
           const account = await server.getAccount(sourceAddress as string);
+          logger.debug("Stellar account fetched for build-tx", {
+            traceId,
+            ...pathVars,
+          });
 
           const scArgs = (args || []).map((a: any) => {
             if (a.type === "address") return Address.fromString(a.value).toScVal();
@@ -728,31 +989,110 @@ router.post(
             .setTimeout(30)
             .build();
 
+          logger.debug("Calling prepareTransaction on Stellar RPC for build-tx", {
+            traceId,
+            ...pathVars,
+          });
           const prepared = await server.prepareTransaction(tx);
           const xdr = prepared.toXDR();
+          logger.debug("Storing build-tx XDR in cache", {
+            traceId,
+            ...pathVars,
+            cacheKey,
+            xdrLength: xdr.length,
+            ttlSeconds: BUILD_TX_CACHE_TTL,
+          });
           buildTxCache.set(cacheKey, xdr);
           return xdr;
         })();
 
         inFlightBuildTxRequests.set(cacheKey, requestPromise);
+        logger.debug("In-flight build-tx promise registered", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+        });
       }
 
       let xdr: string;
       try {
         xdr = await requestPromise;
       } catch (err: any) {
+        logger.debug("RPC promise rejected for build-tx, clearing cache entry", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+          error: err?.message ?? String(err),
+        });
         buildTxCache.del(cacheKey);
         throw err;
       } finally {
         inFlightBuildTxRequests.delete(cacheKey);
+        logger.debug("In-flight build-tx promise unregistered", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+        });
       }
 
       if (servedFromInFlight) {
-        logger.info("Build-tx XDR served from in-flight cache", { contractId, method });
+        logger.info("Build-tx XDR served from in-flight cache", {
+          traceId,
+          ...pathVars,
+          source: "in-flight",
+          xdrLength: xdr.length,
+        });
       }
+
+      logger.info("Build-tx XDR built successfully", {
+        traceId,
+        ...pathVars,
+        xdrLength: xdr.length,
+      });
+      logger.debug("Build-tx response body prepared", {
+        traceId,
+        ...pathVars,
+        success: true,
+        xdrLength: xdr.length,
+      });
+      logger.info("Build-tx response sent", {
+        traceId,
+        ...pathVars,
+        status: 200,
+        success: true,
+        cached: false,
+        xdrLength: xdr.length,
+      });
+
       res.json({ success: true, xdr });
     } catch (err: any) {
-      logger.error("Failed to build transaction", { error: err?.message });
+      const message = err?.message ?? String(err);
+      const stack = err?.stack;
+      logger.debug("Build-tx error caught", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack,
+      });
+      logger.error("Failed to build build-tx transaction", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack,
+      });
+      logger.debug("Build-tx error response body prepared", {
+        traceId,
+        ...pathVars,
+        success: false,
+        clientError: "Internal server error",
+      });
+      logger.info("Build-tx response sent", {
+        traceId,
+        ...pathVars,
+        status: 500,
+        success: false,
+        error: message,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
@@ -764,13 +1104,14 @@ router.post(
 router.post(
   "/:contractId/milestones/:index/partial-release",
   partialReleaseRateLimit,
-  validate(contractMilestoneParamsSchema, "params", (req) =>
+  validateWithFields(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for partial-release", { params: req.params }),
   ),
-  validate(partialReleaseBodySchema, "body", (req) =>
+  validateWithFields(partialReleaseBodySchema, "body", (req) =>
     logger.warn("Invalid body for partial-release", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
+    const traceId = randomUUID();
     try {
       const { contractId, index } = req.params;
 
@@ -778,7 +1119,7 @@ router.post(
       if (requiredApiKey) {
         const providedKey = req.header("x-api-key");
         if (providedKey !== requiredApiKey) {
-          logger.warn("Unauthorized request", { contractId });
+          logger.warn("Unauthorized request", { traceId, contractId, index });
           sendError(res, 401, "Unauthorized");
           return;
         }
@@ -786,7 +1127,15 @@ router.post(
 
       const { amount, sourceAddress } = req.body;
 
+      logger.debug("Partial-release handler entered", {
+        traceId,
+        contractId,
+        index,
+        ip: req.ip ?? req.socket?.remoteAddress,
+      });
+
       logger.info("Processing partial-release", {
+        traceId,
         contractId,
         index,
         amount,
@@ -801,7 +1150,14 @@ router.post(
       } catch (err: any) {
         const errMsg = String(err?.message || err);
         const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+        logger.error("Failed to get account for partial release", {
+          traceId,
+          contractId,
+          index,
+          sourceAddress,
+          error: errMsg,
+          stack: err?.stack,
+        });
         sendError(res, status, message);
         return;
       }
@@ -827,15 +1183,38 @@ router.post(
       } catch (err: any) {
         const errMsg = String(err?.message || err);
         const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+        logger.error("Failed to prepare transaction for partial release", {
+          traceId,
+          contractId,
+          index,
+          error: errMsg,
+          stack: err?.stack,
+        });
         sendError(res, status, message);
         return;
       }
 
+      logger.debug("Partial-release response sent", {
+        traceId,
+        contractId,
+        index,
+        status: 200,
+        success: true,
+        xdrLength: prepared.toXDR().length,
+      });
+
       res.json({ success: true, xdr: prepared.toXDR() });
     } catch (err: any) {
       const errMsg = String(err?.message || err);
-      logger.error("Unexpected error in partial release", { error: errMsg });
+      // Structured, server-side-only error detail – the client receives a clean
+      // 500 body with no internal stack trace leakage (#117).
+      logger.error("Unexpected error in partial release", {
+        traceId,
+        contractId: req.params.contractId,
+        index: req.params.index,
+        error: errMsg,
+        stack: err?.stack,
+      });
       sendError(res, 500, "Internal server error");
     }
   }

@@ -132,7 +132,196 @@ const MIGRATIONS: Migration[] = [
         ON webhook_subscriptions (contract_id);
     `,
   },
+  {
+    version: 4,
+    description: "add ledger_range_tracker GROUP BY index (#295)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_event_type
+        ON events (ledger_sequence, event_type);
+    `,
+  },
+  {
+    version: 5,
+    description: "add sqlite_schema_manager lookup indexes (#259)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_monitored_contracts_active
+        ON monitored_contracts (active);
+
+      CREATE INDEX IF NOT EXISTS idx_events_created_at
+        ON events (created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_type_ledger
+        ON events (contract_id, event_type, ledger_sequence);
+    `,
+  },
+  {
+    version: 6,
+    description: "add indexer_metrics_collector aggregation index (#335)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+    `,
+  },
 ];
+
+/**
+ * Migration versions this build ships, ascending. Callers compare these
+ * against `schema_migrations` to detect a database that is behind the code.
+ */
+export function getShippedMigrationVersions(): number[] {
+  return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
+}
+
+// ---------------------------------------------------------------------------
+// Exponential backoff retry for schema manager (#258)
+// Retries transient SQLite / connection / timeout failures during migrations.
+// ---------------------------------------------------------------------------
+
+export interface SchemaRetryConfig {
+  /** Maximum number of retry attempts (default: 5) */
+  maxRetries: number;
+  /** Initial delay in ms after first failure (default: 50) */
+  initialBackoffMs: number;
+  /** Multiplier applied to backoff on each consecutive failure (default: 2) */
+  backoffMultiplier: number;
+  /** Ceiling delay in ms (default: 2000) */
+  maxBackoffMs: number;
+}
+
+const DEFAULT_SCHEMA_RETRY_CONFIG: SchemaRetryConfig = {
+  maxRetries: 5,
+  initialBackoffMs: 50,
+  backoffMultiplier: 2,
+  maxBackoffMs: 2000,
+};
+
+/** Retryable patterns for SQLite locks and connection/RPC-style timeouts. */
+const SCHEMA_RETRYABLE_PATTERNS = [
+  "timeout",
+  "SQLITE_BUSY",
+  "SQLITE_LOCKED",
+  "database is locked",
+  "database is busy",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "connect timeout",
+  "connection reset",
+  "connection refused",
+  "connection dropped",
+  "RPC connection",
+];
+
+export function isSchemaRetryableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  return SCHEMA_RETRYABLE_PATTERNS.some((p) =>
+    msg.toLowerCase().includes(p.toLowerCase()),
+  );
+}
+
+/**
+ * Compute the backoff delay for a given attempt number.
+ * attempt 0 → initialBackoffMs
+ * attempt 1 → initialBackoffMs * multiplier
+ * etc., capped at maxBackoffMs.
+ */
+export function computeSchemaBackoffMs(
+  attempt: number,
+  config: Pick<
+    SchemaRetryConfig,
+    "initialBackoffMs" | "backoffMultiplier" | "maxBackoffMs"
+  >,
+): number {
+  return Math.min(
+    config.initialBackoffMs * Math.pow(config.backoffMultiplier, attempt),
+    config.maxBackoffMs,
+  );
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a synchronous schema operation with exponential backoff retry.
+ * Used by runMigrations so existing sync callers stay unchanged.
+ */
+export function withSchemaRetrySync<T>(
+  fn: () => T,
+  config: Partial<SchemaRetryConfig> = {},
+  context: string = "sqlite_schema_manager",
+): T {
+  const cfg = { ...DEFAULT_SCHEMA_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isSchemaRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeSchemaBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      sleepSync(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
+/**
+ * Async variant of schema retry for callers that prefer Promise-based backoff
+ * (e.g. unit tests asserting increasing delays without blocking the event loop).
+ */
+export async function withSchemaRetry<T>(
+  fn: () => Promise<T> | T,
+  config: Partial<SchemaRetryConfig> = {},
+  context: string = "sqlite_schema_manager",
+): Promise<T> {
+  const cfg = { ...DEFAULT_SCHEMA_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isSchemaRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeSchemaBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      await sleep(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
 
 /**
  * Ensures the schema_migrations tracking table exists, then applies any
@@ -206,6 +395,45 @@ export function runMigrations(): void {
  */
 export function initSchema() {
   runMigrations();
+}
+
+/**
+ * Verifies every migration in MIGRATIONS is recorded as applied in
+ * schema_migrations. Throws if the table is missing or a version hasn't
+ * been applied yet, so callers can fail fast on a stale/out-of-sync
+ * database instead of hitting confusing SQL errors later (#282).
+ */
+export function verifySchemaUpToDate(): void {
+  const database = getDb();
+
+  const migrationsTable = database
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    )
+    .get();
+
+  if (!migrationsTable) {
+    throw new Error(
+      "Database schema is out of sync: schema_migrations table not found. Run runMigrations() first."
+    );
+  }
+
+  const appliedVersions = new Set(
+    (
+      database.prepare("SELECT version FROM schema_migrations").all() as Array<{
+        version: number;
+      }>
+    ).map((row) => row.version)
+  );
+
+  const missing = MIGRATIONS.filter((m) => !appliedVersions.has(m.version));
+  if (missing.length > 0) {
+    throw new Error(
+      `Database schema is out of sync: missing migrations ${missing
+        .map((m) => `${m.version} (${m.description})`)
+        .join(", ")}. Run runMigrations() first.`
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,27 +695,35 @@ export function setLastIndexedLedger(seq: number) {
  * Registers a contract for polling, or re-activates it if it was previously
  * deregistered. Idempotent - calling this repeatedly for the same
  * contract_id never creates duplicate rows.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function registerContract(contractId: string, label?: string): void {
   const db = getDb();
-  db.prepare(
-    `INSERT INTO monitored_contracts (contract_id, label, active)
-     VALUES (?, ?, 1)
-     ON CONFLICT(contract_id) DO UPDATE SET
-       active = 1,
-       label = COALESCE(excluded.label, monitored_contracts.label)`
-  ).run(contractId, label ?? null);
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO monitored_contracts (contract_id, label, active)
+       VALUES (?, ?, 1)
+       ON CONFLICT(contract_id) DO UPDATE SET
+         active = 1,
+         label = COALESCE(excluded.label, monitored_contracts.label)`
+    ).run(contractId, label ?? null);
+  });
+  tx();
 }
 
 /**
  * Marks a contract inactive so it's excluded from getActiveContractIds()
  * without deleting its historical event data.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function deregisterContract(contractId: string): void {
   const db = getDb();
-  db.prepare(
-    "UPDATE monitored_contracts SET active = 0 WHERE contract_id = ?"
-  ).run(contractId);
+  const tx = db.transaction(() => {
+    db.prepare(
+      "UPDATE monitored_contracts SET active = 0 WHERE contract_id = ?"
+    ).run(contractId);
+  });
+  tx();
 }
 
 /**
@@ -507,6 +743,7 @@ export function getActiveContractIds(): string[] {
 
 /**
  * Insert a single event row.  For atomic batch inserts use insertEventBatch().
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function insertEvent(
   contractId: string,
@@ -516,19 +753,22 @@ export function insertEvent(
   dataJson: string
 ): boolean {
   const db = getDb();
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO events 
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-  const result = stmt.run(
-    contractId,
-    eventType,
-    ledgerSequence,
-    timestamp,
-    dataJson
-  );
-  return result.changes > 0;
+  const tx = db.transaction(() => {
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO events 
+      (contract_id, event_type, ledger_sequence, timestamp, data_json)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const result = stmt.run(
+      contractId,
+      eventType,
+      ledgerSequence,
+      timestamp,
+      dataJson
+    );
+    return result.changes > 0;
+  });
+  return tx();
 }
 
 export interface WebhookSubscription {
@@ -537,25 +777,40 @@ export interface WebhookSubscription {
   created_at: string;
 }
 
+/**
+ * Add a global webhook subscription. Runs INSERT + SELECT inside a single
+ * transaction so the returned row always reflects what was just committed,
+ * even under concurrent writes.
+ */
 export function addWebhookSubscription(url: string): WebhookSubscription {
   const db = getDb();
-  const result = db
-    .prepare("INSERT INTO webhook_subscriptions (url) VALUES (?)")
-    .run(url);
-  const row = db
-    .prepare(
-      "SELECT id, url, created_at FROM webhook_subscriptions WHERE id = ?"
-    )
-    .get(result.lastInsertRowid);
-  return row as WebhookSubscription;
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("INSERT INTO webhook_subscriptions (url) VALUES (?)")
+      .run(url);
+    const row = db
+      .prepare(
+        "SELECT id, url, created_at FROM webhook_subscriptions WHERE id = ?"
+      )
+      .get(result.lastInsertRowid);
+    return row as WebhookSubscription;
+  });
+  return tx();
 }
 
+/**
+ * Remove a global webhook subscription by URL.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
+ */
 export function removeWebhookSubscription(url: string): boolean {
   const db = getDb();
-  const result = db
-    .prepare("DELETE FROM webhook_subscriptions WHERE url = ?")
-    .run(url);
-  return result.changes > 0;
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("DELETE FROM webhook_subscriptions WHERE url = ?")
+      .run(url);
+    return result.changes > 0;
+  });
+  return tx();
 }
 
 export function getWebhookSubscriptions(): WebhookSubscription[] {
@@ -830,29 +1085,44 @@ export interface WebhookSubscription {
   created_at: string;
 }
 
+/**
+ * Add a per-contract webhook subscription. Runs INSERT + SELECT inside a
+ * single transaction so the returned row always reflects what was just
+ * committed, even under concurrent writes.
+ */
 export function addSubscription(
   contractId: string,
   webhookUrl: string,
   eventTypes: string[]
 ): WebhookSubscription {
   const db = getDb();
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO webhook_subscriptions
-    (contract_id, webhook_url, event_types)
-    VALUES (?, ?, ?)
-  `);
-  stmt.run(contractId, webhookUrl, JSON.stringify(eventTypes));
-  return db
-    .prepare("SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
-    .get(contractId, webhookUrl) as WebhookSubscription;
+  const tx = db.transaction(() => {
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO webhook_subscriptions
+      (contract_id, webhook_url, event_types)
+      VALUES (?, ?, ?)
+    `);
+    stmt.run(contractId, webhookUrl, JSON.stringify(eventTypes));
+    return db
+      .prepare("SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
+      .get(contractId, webhookUrl) as WebhookSubscription;
+  });
+  return tx();
 }
 
+/**
+ * Remove a per-contract webhook subscription.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
+ */
 export function removeSubscription(contractId: string, webhookUrl: string): boolean {
   const db = getDb();
-  const result = db
-    .prepare("DELETE FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
-    .run(contractId, webhookUrl);
-  return result.changes > 0;
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("DELETE FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
+      .run(contractId, webhookUrl);
+    return result.changes > 0;
+  });
+  return tx();
 }
 
 export function getSubscriptions(): WebhookSubscription[] {

@@ -7,63 +7,80 @@ import {
   registerContract,
   adjustPollerInterval,
   getCurrentPollIntervalMs,
+  verifySchemaUpToDate,
+  assertSchemaValid,
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
+import { fetchEventsWithRetry } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
 
-// ---------------------------------------------------------------------------
-// Alerting thresholds (#271)
-// ---------------------------------------------------------------------------
-const CONSECUTIVE_FAILURE_THRESHOLD = parseInt(
-  process.env.POLLER_FAILURE_THRESHOLD || "3",
-  10,
-);
-
-function getStallThresholdMs(): number {
-  return parseInt(process.env.POLLER_STALL_THRESHOLD_MS || "120000", 10);
-}
-
-let consecutiveFailures = 0;
-let lastSuccessfulPollAt: number | null = null;
+const failureMonitor = getIndexerRunnerFailureMonitor();
 
 export function getConsecutiveFailures(): number {
-  return consecutiveFailures;
+  return failureMonitor.getConsecutiveFailures();
 }
 
 export function getLastSuccessfulPollAt(): number | null {
-  return lastSuccessfulPollAt;
+  return failureMonitor.getLastSuccessfulAt();
 }
 
 export function resetFailureState(): void {
-  consecutiveFailures = 0;
-  lastSuccessfulPollAt = null;
+  resetIndexerRunnerFailureState();
 }
 
-const EVENT_TYPES = [
-  "initialized",
-  "funded",
-  "delivered",
-  "approved",
-  "dispute_raised",
-  "dispute_resolved",
-  "partial_release",
-  "auto_release_claimed",
-  "token_whitelisted",
-  "token_removed",
-];
+// ---------------------------------------------------------------------------
+// Memory queue lock for concurrent event inserts (#251)
+// ---------------------------------------------------------------------------
+// A single promise chain acts as an in-memory queue so overlapping
+// indexer_runner executions serialize their writes to the events table and the
+// ledger pointer. Without this, concurrent notifications could interleave the
+// atomic batch + pointer update and produce conflicting/duplicate entries.
+let eventInsertTail: Promise<void> = Promise.resolve();
+
+/**
+ * Reset the in-memory event-insert queue lock (used by tests).
+ */
+export function resetEventInsertQueueForTests(): void {
+  eventInsertTail = Promise.resolve();
+}
+
+/**
+ * Enqueue an event batch write behind a memory queue lock.
+ *
+ * Concurrent callers are chained onto a single promise tail and executed one at
+ * a time, preserving the atomicity of `insertEventBatch` and preventing
+ * duplicate or conflicting inserts from overlapping iterations.
+ */
+export function enqueueEventInsert(
+  events: EventRow[],
+  newLedger: number,
+): Promise<void> {
+  const run = eventInsertTail.then(() => {
+    insertEventBatch(events, newLedger);
+  });
+  // Keep the queue alive even if an insert rejects so later enqueues proceed.
+  eventInsertTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
 
 /**
  * Poll events for all active contract IDs stored in monitored_contracts (#85).
  * All events fetched in a single poll are written atomically together with the
  * ledger pointer update (#84) – so a mid-poll crash cannot advance the pointer
  * without committing the accompanying events.
+ *
+ * Returns whether the ledger actually advanced, so startPoller() can throttle
+ * its polling frequency up or down based on ledger processing load (#274).
  */
-export async function pollEvents() {
+export async function pollEvents(): Promise<boolean> {
   // --- Resolve active contract IDs from the DB (#85) ---
   let contractIds: string[] = getActiveContractIds();
 
@@ -76,20 +93,19 @@ export async function pollEvents() {
 
   if (contractIds.length === 0) {
     logger.debug("No CONTRACT_IDs configured – skipping indexer poll");
-    return;
+    return false;
   }
 
-  // --- Diagnostics: stall detection before polling (#270, #271) ---
-  if (lastSuccessfulPollAt) {
-    const stallThresholdMs = getStallThresholdMs();
-    const elapsed = Date.now() - lastSuccessfulPollAt;
-    if (elapsed > stallThresholdMs) {
-      logger.warn("Poller stall detected – no successful poll for threshold period", {
-        elapsedMs: elapsed,
-        stallThresholdMs,
-        consecutiveFailures,
-      });
-    }
+  // --- Alerting: stall detection before polling (#253, #271) ---
+  failureMonitor.checkStall();
+  if (failureMonitor.getLastSuccessfulAt()) {
+    const elapsed = Date.now() - (failureMonitor.getLastSuccessfulAt() as number);
+    const stallThresholdMs = parseInt(
+      process.env.INDEXER_RUNNER_STALL_THRESHOLD_MS ||
+        process.env.POLLER_STALL_THRESHOLD_MS ||
+        String(failureMonitor.stallThresholdMs),
+      10,
+    );
     logger.debug("Poller stall diagnostics", {
       elapsedMsSinceLastSuccess: elapsed,
       stallThresholdMs,
@@ -99,12 +115,16 @@ export async function pollEvents() {
   const pollStart = performance.now();
 
   try {
+    // Validate the schema before matching events against EVENT_TYPES – a stale
+    // schema must not silently pass through the topic filter (#282).
+    verifySchemaUpToDate();
+
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await server.getLatestLedger()).sequence;
     if (currentLedger <= lastLedger) {
       // --- Dynamic throttling: idle cycle (#265) ---
       adjustPollerInterval(0);
-      return;
+      return false;
     }
 
     const startLedger = lastLedger + 1;
@@ -114,13 +134,7 @@ export async function pollEvents() {
     const eventsStart = performance.now();
     const events = await server.getEvents({
       startLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds,
-          topics: [[...EVENT_TYPES]],
-        },
-      ],
+      contractIds,
       limit: 100,
     });
     const eventsElapsed = performance.now() - eventsStart;
@@ -146,8 +160,10 @@ export async function pollEvents() {
       dataJson: JSON.stringify(event.value),
     }));
 
-    // Persist the batch and advance the ledger pointer atomically (#84)
-    insertEventBatch(batch, currentLedger);
+    // Persist the batch and advance the ledger pointer atomically (#84).
+    // Concurrent indexer_runner executions share a memory queue lock so their
+    // event inserts are serialized and cannot conflict or duplicate entries (#251).
+    await enqueueEventInsert(batch, currentLedger);
 
     const totalElapsed = performance.now() - pollStart;
     consecutiveFailures = 0;
@@ -168,6 +184,8 @@ export async function pollEvents() {
         error: err instanceof Error ? err.message : String(err),
       })
     );
+
+    return true;
   } catch (err) {
     const totalElapsed = performance.now() - pollStart;
     consecutiveFailures += 1;
@@ -178,14 +196,20 @@ export async function pollEvents() {
       elapsedMs: Math.round(totalElapsed),
     });
 
-    // --- Alerting: warn when consecutive failures hit threshold (#271) ---
-    if (consecutiveFailures >= CONSECUTIVE_FAILURE_THRESHOLD) {
+    // Keep legacy poller alert message for existing #271 tests
+    if (
+      failureMonitor.getConsecutiveFailures() >=
+      failureMonitor.getFailureThreshold()
+    ) {
       logger.error("Poller alert: consecutive failure threshold exceeded", {
-        consecutiveFailures,
-        threshold: CONSECUTIVE_FAILURE_THRESHOLD,
-        lastSuccessAt: lastSuccessfulPollAt,
+        consecutiveFailures: failureMonitor.getConsecutiveFailures(),
+        threshold: failureMonitor.getFailureThreshold(),
+        lastSuccessAt: failureMonitor.getLastSuccessfulAt(),
       });
     }
+
+    // A failed poll advanced nothing, so report no progress to the throttler.
+    return false;
   }
 }
 
@@ -201,6 +225,11 @@ async function pollLoop() {
 
 export function startPoller() {
   if (pollerRunning) return;
+
+  // Migration verification hook: fail-fast on startup if the database schema is
+  // out of sync, so the indexer cannot start against a stale schema (#255).
+  assertSchemaValid();
+
   pollerRunning = true;
   logger.info("Starting event indexer poller", {
     intervalMs: getCurrentPollIntervalMs(),
