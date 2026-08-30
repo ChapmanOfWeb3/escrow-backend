@@ -18,11 +18,13 @@ jest.unstable_mockModule("../src/middleware/job-contract-rate-limit.js", () => (
   jobContractRateLimit: (_req: any, _res: any, next: any) => next(),
   partialReleaseRateLimit: (_req: any, _res: any, next: any) => next(),
   jobWhitelistRateLimit: (_req: any, _res: any, next: any) => next(),
+  whitelistUpdateRateLimit: (_req: any, _res: any, next: any) => next(),
   buildTxRateLimit: (_req: any, _res: any, next: any) => next(),
   timeRemainingRateLimit: (_req: any, _res: any, next: any) => next(),
   createJobDraftRateLimit: (_req: any, _res: any, next: any) => next(),
   claimAutoReleaseRateLimit: (_req: any, _res: any, next: any) => next(),
   resetSubmitRateLimitBuckets: () => {},
+  resetWhitelistUpdateRateLimitBuckets: () => {},
 }));
 
 jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
