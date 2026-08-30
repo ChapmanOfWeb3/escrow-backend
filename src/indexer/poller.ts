@@ -1,8 +1,10 @@
 import { Server } from "@stellar/stellar-sdk/rpc";
+import type { Api } from "@stellar/stellar-sdk/rpc";
 import { scValToNative } from "@stellar/stellar-sdk";
 import {
   getLastIndexedLedger,
   insertEventBatch,
+  insertHistoricalEventBatch,
   getActiveContractIds,
   registerContract,
   adjustPollerInterval,
@@ -71,16 +73,92 @@ export function enqueueEventInsert(
   return run;
 }
 
+function buildEventFilter(contractIds: string[]): Api.EventFilter[] {
+  return [
+    {
+      type: "contract",
+      contractIds,
+      topics: [[...EVENT_TYPES]],
+    },
+  ];
+}
+
+function toEventRow(event: Api.EventResponse, fallbackContractId: string): EventRow {
+  return {
+    contractId: event.contractId?.contractId() ?? fallbackContractId,
+    eventType: scValToNative(event.topic[0]) as string,
+    ledgerSequence: event.ledger,
+    timestamp: event.ledgerClosedAt
+      ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
+      : Math.floor(Date.now() / 1000),
+    dataJson: JSON.stringify(event.value),
+  };
+}
+
+// --- High-frequency diagnostic logging (poll speed + payload sizes) ---
+// event_type_filter's decoded event payloads (dataJson) can contain job
+// participant Stellar addresses (client/freelancer/arbiter) and amounts -
+// see db.ts's getJobsByWallet(), which extracts exactly those fields from
+// this same column. Debug logging here records payload *sizes* only, never
+// the raw dataJson content, so this can't leak that data through logs.
+//
+// logger.debug() is already off by default in production (logger.ts:
+// LOG_LEVEL defaults to "info" when NODE_ENV=production, "debug"
+// otherwise) - that's the primary gate. On top of that, no log-sampling/
+// rate-limiting convention existed anywhere in this codebase for a
+// per-poll-cycle log line, so this adds a simple time-based throttle
+// (independent of POLL_INTERVAL_MS) as a ceiling against a misconfigured,
+// very short poll interval turning this into unconditional hot-path
+// logging.
+const POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS = parseInt(
+  process.env.POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS || "5000",
+  10
+);
+let lastDiagnosticLogAt = 0;
+
+/** Exposed for tests - resets the diagnostic-log throttle so each test starts fresh. */
+export function resetPollDiagnosticsThrottle(): void {
+  lastDiagnosticLogAt = 0;
+}
+
+function logPollDiagnostics(elapsedMs: number, batch: EventRow[]): void {
+  const now = Date.now();
+  if (now - lastDiagnosticLogAt < POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS) return;
+  lastDiagnosticLogAt = now;
+
+  const payloadSizes = batch.map((ev) => Buffer.byteLength(ev.dataJson, "utf8"));
+  const totalPayloadBytes = payloadSizes.reduce((sum, n) => sum + n, 0);
+  const avgPayloadBytes = payloadSizes.length
+    ? Math.round(totalPayloadBytes / payloadSizes.length)
+    : 0;
+
+  logger.debug(
+    `Poll diagnostics: elapsedMs=${elapsedMs.toFixed(1)} eventCount=${batch.length} ` +
+      `totalPayloadBytes=${totalPayloadBytes} avgPayloadBytes=${avgPayloadBytes}`,
+    { elapsedMs, eventCount: batch.length, totalPayloadBytes, avgPayloadBytes }
+  );
+}
+
 /**
  * Poll events for all active contract IDs stored in monitored_contracts (#85).
  * All events fetched in a single poll are written atomically together with the
  * ledger pointer update (#84) – so a mid-poll crash cannot advance the pointer
  * without committing the accompanying events.
  *
- * Returns whether the ledger actually advanced, so startPoller() can throttle
- * its polling frequency up or down based on ledger processing load (#274).
+ * Returns whether the network showed activity (a new ledger closed since the
+ * last poll). The caller uses this to drive the dynamic polling interval
+ * (see nextPollIntervalMs()) – NOTE this only affects how *often* we poll,
+ * never *what* gets written. Duplicate prevention itself is guaranteed by the
+ * UNIQUE(contract_id, ledger_sequence, event_type) constraint + INSERT OR
+ * IGNORE in db.ts, and every poll always resumes from the last committed
+ * ledger pointer (lastLedger + 1) regardless of how much time has passed
+ * since the previous poll. So a longer interval can only delay *when* an
+ * event is detected – it cannot cause an event to be missed, double-counted,
+ * or processed out of order.
  */
 export async function pollEvents(): Promise<boolean> {
+  const pollStartedAt = performance.now();
+
   // --- Resolve active contract IDs from the DB (#85) ---
   let contractIds: string[] = getActiveContractIds();
 
@@ -134,7 +212,7 @@ export async function pollEvents(): Promise<boolean> {
     const eventsStart = performance.now();
     const events = await fetchEventsWithRetry(server, {
       startLedger,
-      contractIds,
+      filters: buildEventFilter(contractIds),
       limit: 100,
     });
     const eventsElapsed = performance.now() - eventsStart;
@@ -150,15 +228,9 @@ export async function pollEvents(): Promise<boolean> {
     });
 
     // Build the batch to be written atomically (#84)
-    const batch: EventRow[] = events.events.map((event) => ({
-      contractId: event.contractId?.contractId() ?? contractIds[0],
-      eventType: scValToNative(event.topic[0]) as string,
-      ledgerSequence: event.ledger,
-      timestamp: event.ledgerClosedAt
-        ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
-        : Math.floor(Date.now() / 1000),
-      dataJson: JSON.stringify(event.value),
-    }));
+    const batch: EventRow[] = events.events.map((event) =>
+      toEventRow(event, contractIds[0])
+    );
 
     // Persist the batch and advance the ledger pointer atomically (#84).
     // Concurrent indexer_runner executions share a memory queue lock so their
@@ -178,6 +250,8 @@ export async function pollEvents(): Promise<boolean> {
       elapsedMs: Math.round(totalElapsed),
       pollIntervalMs: throttleState.currentIntervalMs,
     });
+
+    logPollDiagnostics(performance.now() - pollStartedAt, batch);
 
     deliverWebhooks(startLedger, currentLedger).catch((err) =>
       logger.error("Error delivering webhooks", {
@@ -244,4 +318,5 @@ export function stopPoller() {
     clearTimeout(pollerTimeout);
     pollerTimeout = null;
   }
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
 }

@@ -742,6 +742,34 @@ export function getActiveContractIds(): string[] {
 // ---------------------------------------------------------------------------
 
 /**
+ * Checks whether an event with the given (contract_id, ledger_sequence,
+ * event_type) already exists - the exact composite key the
+ * UNIQUE(contract_id, ledger_sequence, event_type) constraint on `events`
+ * enforces (see MIGRATIONS v1). insertEvent()/insertEventBatch() rely on
+ * INSERT OR IGNORE for the actual write path (unchanged), so this constraint
+ * check normally happens implicitly inside SQLite and isn't independently
+ * observable. This lookup is exposed as its own query so the duplicate-check
+ * path can be measured and EXPLAIN QUERY PLAN'd directly - it reuses the
+ * existing sqlite_autoindex_events_1 index that comes from the UNIQUE
+ * constraint; no new index is introduced.
+ */
+export function isDuplicateEvent(
+  contractId: string,
+  ledgerSequence: number,
+  eventType: string
+): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT 1 FROM events
+       WHERE contract_id = ? AND ledger_sequence = ? AND event_type = ?
+       LIMIT 1`
+    )
+    .get(contractId, ledgerSequence, eventType);
+  return row !== undefined;
+}
+
+/**
  * Insert a single event row.  For atomic batch inserts use insertEventBatch().
  * Wrapped in a transaction so concurrent writes never leave partial state.
  */
@@ -860,6 +888,47 @@ export function insertEventBatch(events: EventRow[], newLedger: number): void {
   });
 
   batchTransaction();
+}
+
+/**
+ * Insert a batch of events WITHOUT touching the live indexer_state ledger
+ * pointer. Used for custom historical event imports (event_type_filter's
+ * dynamic start/end ledger support) so a backfill over an arbitrary past
+ * range can never advance or rewind last_ledger_sequence - only the live
+ * poller (insertEventBatch, driven strictly by lastLedger+1..currentLedger)
+ * is allowed to move that pointer. Rows still go through INSERT OR IGNORE
+ * against the same UNIQUE(contract_id, ledger_sequence, event_type)
+ * constraint, so re-running a historical import is idempotent exactly like
+ * the live poller.
+ *
+ * Returns the number of rows actually inserted (excludes rows ignored as
+ * duplicates).
+ */
+export function insertHistoricalEventBatch(events: EventRow[]): number {
+  const db = getDb();
+
+  const insertStmt = db.prepare(`
+    INSERT OR IGNORE INTO events
+    (contract_id, event_type, ledger_sequence, timestamp, data_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const batchTransaction = db.transaction(() => {
+    let inserted = 0;
+    for (const ev of events) {
+      const result = insertStmt.run(
+        ev.contractId,
+        ev.eventType,
+        ev.ledgerSequence,
+        ev.timestamp,
+        ev.dataJson
+      );
+      if (result.changes > 0) inserted++;
+    }
+    return inserted;
+  });
+
+  return batchTransaction();
 }
 
 // ---------------------------------------------------------------------------
