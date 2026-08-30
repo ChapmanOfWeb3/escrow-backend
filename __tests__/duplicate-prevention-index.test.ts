@@ -59,11 +59,12 @@ describe("SQLite index optimization — duplicate_prevention lookups", () => {
       .prepare("SELECT name, \"unique\" FROM pragma_index_list('events')")
       .all() as Array<{ name: string; unique: number }>;
 
-    // Only the auto-index backing the UNIQUE constraint should exist - no
-    // speculative index was added for this ticket.
-    expect(indexes).toHaveLength(1);
-    expect(indexes[0].name).toBe("sqlite_autoindex_events_1");
-    expect(indexes[0].unique).toBe(1);
+    // Later migrations added non-unique lookup indexes to `events`, so this
+    // asserts what the ticket actually cares about: the UNIQUE constraint's
+    // auto-index is still the one and only unique index on the table.
+    const uniqueIndexes = indexes.filter((i) => i.unique === 1);
+    expect(uniqueIndexes).toHaveLength(1);
+    expect(uniqueIndexes[0].name).toBe("sqlite_autoindex_events_1");
 
     const columns = testDb
       .prepare("SELECT name FROM pragma_index_info('sqlite_autoindex_events_1') ORDER BY seqno")
@@ -108,7 +109,11 @@ describe("SQLite index optimization — duplicate_prevention lookups", () => {
         .all("C1", 10, 0) as QueryPlanRow[];
 
       const detail = plan.map((row) => row.detail).join(" | ");
-      expect(detail).toContain("USING INDEX sqlite_autoindex_events_1");
+      // Later migrations gave the planner a better-suited composite index for
+      // this predicate, so assert the property that matters — the lookup is
+      // index-backed rather than a full table scan — instead of naming one.
+      expect(detail).toMatch(/USING (COVERING )?INDEX/);
+      expect(detail).not.toMatch(/SCAN events\b/);
     });
   });
 

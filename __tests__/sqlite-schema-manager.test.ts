@@ -18,7 +18,6 @@ import {
 } from "../src/indexer/db.js";
 import { jest } from "@jest/globals";
 import logger from "../src/utils/logger.js";
-import { SCHEMA_MANAGER_INDEXES } from "../src/indexer/db.js";
 
 describe("SQLite Schema Manager – in-memory integration tests", () => {
   let testDb: Database.Database;

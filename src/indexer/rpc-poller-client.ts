@@ -580,6 +580,15 @@ export class RpcPollerClient {
     });
   }
 
+  /**
+   * The underlying RPC server, for helpers that take a bare server and apply
+   * their own retry policy (e.g. `fetchEventsWithRetry`). Going through
+   * `getEvents()` instead would stack this client's retries on top of theirs.
+   */
+  get rpcServer(): RpcServerLike {
+    return this.server;
+  }
+
   async getLatestLedger(): Promise<{ sequence: number }> {
     return withRetry(
       () => this.server.getLatestLedger(),

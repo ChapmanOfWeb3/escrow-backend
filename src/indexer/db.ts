@@ -75,12 +75,6 @@ export const INDEXER_RUNNER_INDEXES = {
 } as const;
 
 /** Index names created by the schema-manager migration (#259). */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
 // ---------------------------------------------------------------------------
@@ -198,15 +192,23 @@ const MIGRATIONS: Migration[] = [
         ON webhook_subscriptions (webhook_url);
     `,
   },
+  {
+    version: 8,
+    description: "add event_type_filter lookup indexes (#276)",
+    // The topic filter groups and filters by event_type. Migration 3 indexed
+    // (contract_id, event_type), which cannot serve a bare event_type
+    // predicate because event_type is not the leading column.
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_event_type
+        ON events (contract_id, event_type);
+    `,
+  },
 ];
 
 /** Index names created by the SQLite schema manager lookup-index migration (#259). */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 /**
  * Migration versions this build ships, ascending. Callers compare these
  * against `schema_migrations` to detect a database that is behind the code.
@@ -216,12 +218,6 @@ export function getShippedMigrationVersions(): number[] {
 }
 
 /** Index names created by the version-5 migration (#259), for test assertions. */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
 // Retries transient SQLite / connection / timeout failures during migrations.
@@ -377,13 +373,18 @@ export async function withSchemaRetry<T>(
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
  */
-export function runMigrations(): void {
+export function runMigrations(
+  retryConfig: Partial<SchemaRetryConfig> = {},
+): void {
   const monitor = getSqliteSchemaManagerFailureMonitor();
   monitor.checkStall();
   const startedAt = performance.now();
-  const database = getDb();
   let failureRecorded = false;
 
+  try {
+  const database = getDb();
+
+  const runAll = database.transaction(() => {
   // Bootstrap: create the migrations tracking table if it doesn't exist yet
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -431,15 +432,42 @@ export function runMigrations(): void {
     });
 
     try {
-      applyMigration();
+      // Transient SQLite failures (locked/busy database) are retried with
+      // backoff; the savepoint means a failed attempt leaves nothing behind.
+      withSchemaRetrySync(
+        applyMigration,
+        retryConfig,
+        `migration_${migration.version}`,
+      );
       logger.info("Migration applied", { version: migration.version });
     } catch (err) {
       logger.error("Migration failed – rolled back", {
         version: migration.version,
         error: err instanceof Error ? err.message : String(err),
       });
+      monitor.recordFailure("migration", {
+        error: err instanceof Error ? err.message : String(err),
+        version: migration.version,
+        description: migration.description,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      failureRecorded = true;
       throw err;
     }
+  }
+  });
+
+    runAll();
+    monitor.recordSuccess();
+  } catch (err) {
+    // A bootstrap failure never reached the per-migration handler above.
+    if (!failureRecorded) {
+      monitor.recordFailure("bootstrap", {
+        error: err instanceof Error ? err.message : String(err),
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+    }
+    throw err;
   }
 }
 
@@ -997,33 +1025,10 @@ export function insertEventBatch(events: EventRow[], newLedger: number): void {
  *
  * Returns the number of rows actually inserted (excludes rows ignored as
  * duplicates).
+ *
+ * Superseded by the range-validating overload defined later in this file,
+ * which every caller uses.
  */
-export function insertHistoricalEventBatch(events: EventRow[]): number {
-  const db = getDb();
-
-  const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const batchTransaction = db.transaction(() => {
-    let inserted = 0;
-    for (const ev of events) {
-      const result = insertStmt.run(
-        ev.contractId,
-        ev.eventType,
-        ev.ledgerSequence,
-        ev.timestamp,
-        ev.dataJson
-      );
-      if (result.changes > 0) inserted++;
-    }
-    return inserted;
-  });
-
-  return batchTransaction();
-}
 
 // ---------------------------------------------------------------------------
 // In-memory event queue locks for concurrent inserts (#260)
@@ -1162,33 +1167,10 @@ export async function insertEventBatchLocked(
  *
  * Returns the number of rows actually inserted (excludes rows ignored as
  * duplicates).
+ *
+ * Superseded by the range-validating overload defined later in this file,
+ * which every caller uses.
  */
-export function insertHistoricalEventBatch(events: EventRow[]): number {
-  const db = getDb();
-
-  const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const batchTransaction = db.transaction(() => {
-    let inserted = 0;
-    for (const ev of events) {
-      const result = insertStmt.run(
-        ev.contractId,
-        ev.eventType,
-        ev.ledgerSequence,
-        ev.timestamp,
-        ev.dataJson
-      );
-      if (result.changes > 0) inserted++;
-    }
-    return inserted;
-  });
-
-  return batchTransaction();
-}
 
 // ---------------------------------------------------------------------------
 // Event queries

@@ -7,16 +7,6 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# TEMPORARY (backlog merge): the type check, tests and build are set to
-# continue-on-error so a red result cannot block merging the open contributor
-# PRs. The steps still run and their output is still in the logs — only the
-# gate is lifted.
-#
-# The workflow is deliberately NOT deleted: if a branch protection rule requires
-# the "build" check, removing the workflow means the check never reports at all
-# and merges stay blocked permanently. Keeping it green is what actually unblocks.
-#
-# TO RESTORE: delete the four `continue-on-error: true` lines below.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,22 +23,10 @@ jobs:
         run: npm ci
 
       - name: Type check
-        continue-on-error: true
         run: npx tsc --noEmit
 
       - name: Test
-        continue-on-error: true
         run: npm test
 
       - name: Build
-        continue-on-error: true
         run: npm run build
-
-      # Reports the real status without failing the job, so the gate stays open
-      # while the actual state of the branch is still visible at a glance.
-      - name: Report status
-        continue-on-error: true
-        run: |
-          echo "::notice::CI gating is temporarily disabled for the backlog merge."
-          npx tsc --noEmit 2>&1 | grep -c "error TS" \
-            | xargs -I{} echo "::notice::tsc reports {} error(s)"

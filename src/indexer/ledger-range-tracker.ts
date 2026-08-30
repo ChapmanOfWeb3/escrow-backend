@@ -1,6 +1,114 @@
 import { getDb, getLastIndexedLedger, insertEvent, type EventRow } from "./db.js";
 import logger from "../utils/logger.js";
 
+// ---------------------------------------------------------------------------
+// Schema verification (#259)
+// ---------------------------------------------------------------------------
+// The tracker reads and writes `events` and `indexer_state` directly. Starting
+// it against a half-migrated database silently mis-tracks ledger progress, so
+// callers verify the schema before the tracker is allowed to run.
+
+/** Tables and columns the tracker's statements depend on. */
+const LEDGER_RANGE_REQUIRED_SCHEMA: Record<string, string[]> = {
+  events: ["contract_id", "event_type", "ledger_sequence", "data_json"],
+  indexer_state: ["key", "value"],
+};
+
+export interface LedgerRangeSchemaReport {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  errors: string[];
+}
+
+/**
+ * Check every table and column the tracker needs, reporting all problems at
+ * once rather than failing on the first.
+ */
+export function verifyLedgerRangeTrackerSchema(): LedgerRangeSchemaReport {
+  const database = getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const errors: string[] = [];
+
+  for (const [table, requiredColumns] of Object.entries(
+    LEDGER_RANGE_REQUIRED_SCHEMA,
+  )) {
+    const exists = database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+      .get(table);
+
+    if (!exists) {
+      missingTables.push(table);
+      errors.push(`missing table: ${table}`);
+      continue;
+    }
+
+    const columns = (
+      database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+        name: string;
+      }>
+    ).map((c) => c.name);
+
+    const absent = requiredColumns.filter((c) => !columns.includes(c));
+    if (absent.length > 0) {
+      missingColumns[table] = absent;
+      errors.push(`missing columns in ${table}: ${absent.join(", ")}`);
+    }
+  }
+
+  // A hole in the applied migration versions means some migrations ran and
+  // others did not — the tracker's tables may exist but be the wrong shape.
+  if (!missingTables.includes("schema_migrations")) {
+    try {
+      const applied = (
+        database
+          .prepare("SELECT version FROM schema_migrations ORDER BY version")
+          .all() as Array<{ version: number }>
+      ).map((r) => r.version);
+
+      if (applied.length > 0) {
+        const gaps: number[] = [];
+        for (let v = applied[0]; v < applied[applied.length - 1]; v++) {
+          if (!applied.includes(v)) gaps.push(v);
+        }
+        if (gaps.length > 0) {
+          errors.push(
+            `migration version gap – missing applied migrations: ${gaps.join(", ")}`,
+          );
+        }
+      }
+    } catch {
+      // schema_migrations exists but is unreadable; the table checks above
+      // already describe the damage.
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    missingTables,
+    missingColumns,
+    errors,
+  };
+}
+
+/** Throw unless the tracker's schema dependencies are all satisfied. */
+export function assertLedgerRangeTrackerSchemaValid(): void {
+  const report = verifyLedgerRangeTrackerSchema();
+  if (report.valid) return;
+
+  logger.error("LedgerRangeTracker schema verification failed", {
+    missingTables: report.missingTables,
+    missingColumns: report.missingColumns,
+    errors: report.errors,
+  });
+
+  throw new Error(
+    `LedgerRangeTracker schema verification failed – the tracker cannot start: ` +
+      report.errors.join("; "),
+  );
+}
+
 /**
  * LedgerRangeTracker manages ledger range operations with full transaction support.
  * Ensures that operations on ledger sequence tracking are atomic and consistent

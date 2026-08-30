@@ -1,5 +1,10 @@
 import Database from "better-sqlite3";
-import { setDb, runMigrations, closeDb } from "../src/indexer/db.js";
+import {
+  setDb,
+  runMigrations,
+  closeDb,
+  getShippedMigrationVersions,
+} from "../src/indexer/db.js";
 import {
   WriterPoolSchemaError,
   assertWriterPoolSchemaReady,
@@ -63,7 +68,10 @@ describe("database_writer_pool – migration verification hooks (#331)", () => {
       const report = verifyWriterPoolSchema();
 
       expect(report.valid).toBe(false);
-      expect(report.missingVersions).toEqual([5, 6, 7]);
+      // Derived from the shipped list rather than hardcoded, so adding a
+      // migration does not require editing this expectation.
+      const expectedMissing = getShippedMigrationVersions().filter((v) => v >= 5);
+      expect(report.missingVersions).toEqual(expectedMissing);
       expect(report.issues.join(" ")).toContain("out of sync");
     });
 

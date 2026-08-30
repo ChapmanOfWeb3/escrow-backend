@@ -1,5 +1,10 @@
 import type Database from "better-sqlite3";
-import { getDb, insertEvent, type EventRow } from "./db.js";
+import {
+  getDb,
+  getShippedMigrationVersions,
+  insertEvent,
+  type EventRow,
+} from "./db.js";
 import logger from "../utils/logger.js";
 import {
   withRetry,
@@ -162,6 +167,9 @@ export interface IndexerMetricsDiagnostics {
   rowCount?: number;
   totalEvents?: number;
   lastIndexedLedger?: number;
+  /** Inclusive ledger window, set by the historical-sync collection path. */
+  startLedger?: number;
+  endLedger?: number;
   error?: string;
 }
 
@@ -696,6 +704,176 @@ export function getIndexerMetricsMonitor(): IndexerMetricsFailureMonitor {
 
 export function getIndexerMetricsQueue(): IndexerMetricsEventQueue {
   return defaultQueue;
+}
+
+// ---------------------------------------------------------------------------
+// RPC health check with backoff retry (#334)
+// ---------------------------------------------------------------------------
+
+export interface RpcHealthMetrics {
+  latestLedgerSequence: number;
+  collectedAt: string;
+}
+
+/**
+ * Probe RPC liveness by reading the latest ledger, retrying transient
+ * failures with the shared backoff policy.
+ *
+ * Retries are delegated to `withRetry`, so a non-retryable error (a malformed
+ * request, say) surfaces on the first attempt instead of burning the budget.
+ * Either way a failure is recorded on the shared monitor as `rpc_timeout`, so
+ * repeated RPC trouble trips the same consecutive-failure alert as a failing
+ * collection.
+ */
+export async function collectRpcHealthMetrics(
+  server: RpcServerLike,
+  config: Partial<RpcRetryConfig> = {},
+): Promise<RpcHealthMetrics> {
+  const startedAt = performance.now();
+
+  try {
+    const ledger = await withRetry(
+      () => server.getLatestLedger(),
+      config,
+      "rpc_health_check",
+    );
+
+    defaultMonitor.recordSuccess();
+    logIndexerMetricsDiagnostics({
+      collector: COLLECTOR_NAME,
+      operation: "rpc_health_check",
+      status: "success",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      lastIndexedLedger: ledger.sequence,
+    });
+
+    return {
+      latestLedgerSequence: ledger.sequence,
+      collectedAt: new Date().toISOString(),
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+
+    defaultMonitor.recordFailure("rpc_timeout", {
+      error,
+      operation: "rpc_health_check",
+    });
+
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Migration verification hooks (#340)
+// ---------------------------------------------------------------------------
+// The collector reads `events`, `indexer_state` and `schema_migrations`
+// directly. Running it against a half-migrated database yields silently wrong
+// metrics rather than an error, so callers can verify the schema up front.
+
+/** Tables and columns the collector's queries depend on. */
+const METRICS_REQUIRED_SCHEMA: Record<string, string[]> = {
+  events: ["event_type", "ledger_sequence", "created_at"],
+  indexer_state: ["key", "value"],
+  schema_migrations: ["version"],
+};
+
+export interface IndexerMetricsSchemaReport {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  missingMigrations: number[];
+  errors: string[];
+}
+
+/**
+ * Check that every table, column and migration the collector relies on is
+ * present. Reports all problems at once rather than failing on the first.
+ */
+export function validateIndexerMetricsSchema(
+  targetDb?: Database.Database,
+): IndexerMetricsSchemaReport {
+  const database = targetDb || getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const missingMigrations: number[] = [];
+  const errors: string[] = [];
+
+  for (const [table, requiredColumns] of Object.entries(METRICS_REQUIRED_SCHEMA)) {
+    const exists = database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+      .get(table);
+
+    if (!exists) {
+      missingTables.push(table);
+      errors.push(`Missing table: ${table}`);
+      continue;
+    }
+
+    const columns = (
+      database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+        name: string;
+      }>
+    ).map((c) => c.name);
+
+    const absent = requiredColumns.filter((c) => !columns.includes(c));
+    if (absent.length > 0) {
+      missingColumns[table] = absent;
+      errors.push(`Missing columns in ${table}: ${absent.join(", ")}`);
+    }
+  }
+
+  // Only meaningful when schema_migrations itself survived.
+  if (!missingTables.includes("schema_migrations")) {
+    const applied = new Set(
+      (
+        database.prepare("SELECT version FROM schema_migrations").all() as Array<{
+          version: number;
+        }>
+      ).map((r) => r.version),
+    );
+
+    for (const version of getShippedMigrationVersions()) {
+      if (!applied.has(version)) missingMigrations.push(version);
+    }
+
+    if (missingMigrations.length > 0) {
+      errors.push(`Missing applied migrations: ${missingMigrations.join(", ")}`);
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    missingTables,
+    missingColumns,
+    missingMigrations,
+    errors,
+  };
+}
+
+/** Throw unless the collector's schema dependencies are all satisfied. */
+export function assertIndexerMetricsSchemaValid(
+  targetDb?: Database.Database,
+): void {
+  const report = validateIndexerMetricsSchema(targetDb);
+  if (report.valid) return;
+
+  logger.error("indexer_metrics_collector schema verification failed", {
+    collector: COLLECTOR_NAME,
+    missingTables: report.missingTables,
+    missingColumns: report.missingColumns,
+    missingMigrations: report.missingMigrations,
+  });
+
+  throw new Error(
+    `indexer_metrics_collector: database schema is out of sync – ${report.errors.join("; ")}`,
+  );
+}
+
+/** Drop queue, alert monitor and in-flight collection state. For tests. */
+export function resetIndexerMetricsCollectorState(): void {
+  defaultMonitor = new IndexerMetricsFailureMonitor();
+  defaultQueue = new IndexerMetricsEventQueue();
+  inFlightCollection = null;
 }
 
 // ---------------------------------------------------------------------------
