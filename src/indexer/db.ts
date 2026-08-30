@@ -154,6 +154,14 @@ const MIGRATIONS: Migration[] = [
         ON events (contract_id, event_type, ledger_sequence);
     `,
   },
+  {
+    version: 6,
+    description: "add indexer_metrics_collector aggregation index (#335)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+    `,
+  },
 ];
 
 /** Index names created by the SQLite schema manager lookup-index migration (#259). */
@@ -162,6 +170,14 @@ export const SCHEMA_MANAGER_INDEXES = {
   eventsCreatedAt: "idx_events_created_at",
   eventsContractTypeLedger: "idx_events_contract_type_ledger",
 } as const;
+
+/**
+ * Migration versions this build ships, ascending. Callers compare these
+ * against `schema_migrations` to detect a database that is behind the code.
+ */
+export function getShippedMigrationVersions(): number[] {
+  return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
+}
 
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
