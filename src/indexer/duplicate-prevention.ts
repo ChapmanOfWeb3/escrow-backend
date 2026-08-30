@@ -425,22 +425,23 @@ export function deleteEventsInRange(
   endLedger: number,
 ): number {
   const db = getDb();
-  const result = db
-    .prepare(
-      `DELETE FROM events
-       WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
-    )
-    .run(startLedger, endLedger);
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare(
+        `DELETE FROM events
+         WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+      )
+      .run(startLedger, endLedger);
 
-  const hasSyncRanges = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sync_ranges'")
-    .get();
-  if (hasSyncRanges) {
-    db.prepare(
-      `DELETE FROM sync_ranges
-       WHERE start_ledger >= ? AND end_ledger <= ?`,
-    ).run(startLedger, endLedger);
-  }
+    const hasSyncRanges = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sync_ranges'")
+      .get();
+    if (hasSyncRanges) {
+      db.prepare(
+        `DELETE FROM sync_ranges
+         WHERE start_ledger >= ? AND end_ledger <= ?`,
+      ).run(startLedger, endLedger);
+    }
 
     return result.changes;
   });

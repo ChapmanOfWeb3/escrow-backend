@@ -309,37 +309,6 @@ export function runVacuumCleanup(
     monitor.recordFailure("prune", {
       error: err instanceof Error ? err.message : String(err),
     });
-    throw err;
-  }
-
-  // Step 2: non-transactional VACUUM, only reached once pruning committed.
-  try {
-    runVacuum(db);
-  } catch (err) {
-    monitor.recordFailure("vacuum", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
-  }
-
-  monitor.recordSuccess();
-
-    // Step 2: non-transactional VACUUM, only reached once pruning committed.
-    runVacuum(db);
-
-    logger.info("Completed sqlite vacuum cleanup", { prunedEvents });
-
-    logVacuumPollDiagnostics({
-      component: VACUUM_COMPONENT_NAME,
-      operation: "vacuum_cleanup",
-      status: "success",
-      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
-      retentionDays,
-      prunedEvents,
-    });
-
-    return { prunedEvents, vacuumed: true };
-  } catch (err) {
     logVacuumPollDiagnostics({
       component: VACUUM_COMPONENT_NAME,
       operation: "vacuum_cleanup",
@@ -350,6 +319,39 @@ export function runVacuumCleanup(
     });
     throw err;
   }
+
+  // Step 2: non-transactional VACUUM, only reached once pruning committed.
+  try {
+    runVacuum(db);
+  } catch (err) {
+    monitor.recordFailure("vacuum", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation: "vacuum_cleanup",
+      status: "failure",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      retentionDays,
+      error: vacuumErrorMessage(err),
+    });
+    throw err;
+  }
+
+  monitor.recordSuccess();
+
+  logger.info("Completed sqlite vacuum cleanup", { prunedEvents });
+
+  logVacuumPollDiagnostics({
+    component: VACUUM_COMPONENT_NAME,
+    operation: "vacuum_cleanup",
+    status: "success",
+    elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+    retentionDays,
+    prunedEvents,
+  });
+
+  return { prunedEvents, vacuumed: true };
 }
 
 /**

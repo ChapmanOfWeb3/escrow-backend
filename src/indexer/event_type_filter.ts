@@ -1,9 +1,4 @@
 import type { Server } from "@stellar/stellar-sdk/rpc";
-import logger from "../utils/logger.js";
-
-/**
- * The set of Soroban contract event types the indexer cares about.
- * Only events whose first topic matches one of these strings will be fetched.
 import { insertEvent, type EventRow } from "./db.js";
 import logger from "../utils/logger.js";
 
