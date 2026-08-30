@@ -4,6 +4,9 @@ import { fileURLToPath } from "url";
 import fs from "fs";
 import NodeCache from "node-cache";
 import logger from "../utils/logger.js";
+import {
+  getSqliteSchemaManagerFailureMonitor,
+} from "./sqlite_schema_manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -328,7 +331,11 @@ export async function withSchemaRetry<T>(
  * pending migrations in version order, each wrapped in its own transaction.
  */
 export function runMigrations(): void {
+  const monitor = getSqliteSchemaManagerFailureMonitor();
+  monitor.checkStall();
+  const startedAt = performance.now();
   const database = getDb();
+  let failureRecorded = false;
 
   // Bootstrap: create the migrations tracking table if it doesn't exist yet
   database.exec(`
