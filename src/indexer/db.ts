@@ -191,6 +191,13 @@ export function getShippedMigrationVersions(): number[] {
   return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
 }
 
+/** Index names created by the version-5 migration (#259), for test assertions. */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
+
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
 // Retries transient SQLite / connection / timeout failures during migrations.
@@ -1280,4 +1287,180 @@ export function getIndexerStatusData(): IndexerStatusData {
     lastEventAt: lastEventRow.last_at,
     eventsByType,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic historical sync ranges for custom event imports (#263)
+// ---------------------------------------------------------------------------
+// Lets callers (backfill scripts, admin tooling, tests) hand sqlite_schema_manager
+// an arbitrary, explicit start/end ledger range for a one-off historical import,
+// with the range validated up front and the live `last_ledger_sequence` pointer
+// left untouched unless the caller explicitly opts in to advancing it.
+
+export class HistoricalRangeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HistoricalRangeError";
+  }
+}
+
+export interface HistoricalLedgerRange {
+  startLedger: number;
+  endLedger: number;
+}
+
+function isValidLedgerValue(value: unknown): value is number {
+  return (
+    typeof value === "number" && Number.isInteger(value) && value >= 1
+  );
+}
+
+/**
+ * Validate an inclusive [startLedger, endLedger] range for a custom
+ * historical import. Throws HistoricalRangeError for non-integers, values
+ * below 1, or start > end.
+ */
+export function validateHistoricalRange(
+  startLedger: unknown,
+  endLedger: unknown,
+): HistoricalLedgerRange {
+  if (!isValidLedgerValue(startLedger)) {
+    throw new HistoricalRangeError(
+      `start ledger must be a positive integer, received ${String(startLedger)}`,
+    );
+  }
+  if (!isValidLedgerValue(endLedger)) {
+    throw new HistoricalRangeError(
+      `end ledger must be a positive integer, received ${String(endLedger)}`,
+    );
+  }
+  if (startLedger > endLedger) {
+    throw new HistoricalRangeError(
+      `start ledger must not exceed end ledger (start=${startLedger}, end=${endLedger})`,
+    );
+  }
+  return { startLedger, endLedger };
+}
+
+export interface InsertHistoricalEventBatchOptions {
+  /** Advance indexer_state.last_ledger_sequence to endLedger once the import commits. */
+  advanceLivePointer?: boolean;
+}
+
+export interface InsertHistoricalEventBatchResult {
+  inserted: number;
+  range: HistoricalLedgerRange;
+}
+
+/**
+ * Atomically insert a batch of events for a custom historical range.
+ *
+ * Unlike insertEventBatch (used by the live poller), this never advances the
+ * live ledger pointer unless advanceLivePointer is explicitly requested, and
+ * it rejects any event whose ledger_sequence falls outside the declared
+ * range so a mistyped range can't silently import the wrong window.
+ */
+export function insertHistoricalEventBatch(
+  events: EventRow[],
+  range: { startLedger: unknown; endLedger: unknown },
+  options: InsertHistoricalEventBatchOptions = {},
+): InsertHistoricalEventBatchResult {
+  const validRange = validateHistoricalRange(range.startLedger, range.endLedger);
+
+  for (const ev of events) {
+    if (
+      ev.ledgerSequence < validRange.startLedger ||
+      ev.ledgerSequence > validRange.endLedger
+    ) {
+      throw new HistoricalRangeError(
+        `event ledger_sequence ${ev.ledgerSequence} is outside the declared range ` +
+          `[${validRange.startLedger}, ${validRange.endLedger}]`,
+      );
+    }
+  }
+
+  const db = getDb();
+  const insertStmt = db.prepare(`
+    INSERT OR IGNORE INTO events
+    (contract_id, event_type, ledger_sequence, timestamp, data_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const importTransaction = db.transaction(() => {
+    let inserted = 0;
+    for (const ev of events) {
+      const result = insertStmt.run(
+        ev.contractId,
+        ev.eventType,
+        ev.ledgerSequence,
+        ev.timestamp,
+        ev.dataJson,
+      );
+      if (result.changes > 0) inserted += 1;
+    }
+
+    if (options.advanceLivePointer) {
+      const current = getLastIndexedLedger();
+      if (validRange.endLedger > current) {
+        db.prepare(
+          "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'",
+        ).run(validRange.endLedger.toString());
+      }
+    }
+
+    return inserted;
+  });
+
+  const inserted = importTransaction();
+  logger.info("sqlite_schema_manager historical range imported", {
+    startLedger: validRange.startLedger,
+    endLedger: validRange.endLedger,
+    inserted,
+    advanceLivePointer: options.advanceLivePointer ?? false,
+  });
+
+  return { inserted, range: validRange };
+}
+
+export interface HistoricalEventCounts {
+  totalEvents: number;
+  eventsByType: Record<string, number>;
+}
+
+/**
+ * Assert-friendly summary of how many events are indexed for a given ledger
+ * range, broken down by event type. Used to validate that a custom
+ * historical import indexed the expected block event counts.
+ */
+export function getHistoricalEventCounts(
+  startLedger: unknown,
+  endLedger: unknown,
+): HistoricalEventCounts {
+  const validRange = validateHistoricalRange(startLedger, endLedger);
+  const db = getDb();
+
+  const totalRow = db
+    .prepare(
+      `SELECT COUNT(*) as count FROM events
+       WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+    )
+    .get(validRange.startLedger, validRange.endLedger) as { count: number };
+
+  const typeRows = db
+    .prepare(
+      `SELECT event_type, COUNT(*) as count FROM events
+       WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+       GROUP BY event_type`,
+    )
+    .all(validRange.startLedger, validRange.endLedger) as Array<{
+    event_type: string;
+    count: number;
+  }>;
+
+  const eventsByType: Record<string, number> = {};
+  for (const row of typeRows) {
+    eventsByType[row.event_type] = row.count;
+  }
+
+  return { totalEvents: totalRow.count, eventsByType };
 }
