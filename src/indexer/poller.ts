@@ -54,6 +54,44 @@ export function resetFailureState(): void {
   lastSuccessfulPollAt = null;
 }
 
+// ---------------------------------------------------------------------------
+// Memory queue lock for concurrent event inserts (#251)
+// ---------------------------------------------------------------------------
+// A single promise chain acts as an in-memory queue so overlapping
+// indexer_runner executions serialize their writes to the events table and the
+// ledger pointer. Without this, concurrent notifications could interleave the
+// atomic batch + pointer update and produce conflicting/duplicate entries.
+let eventInsertTail: Promise<void> = Promise.resolve();
+
+/**
+ * Reset the in-memory event-insert queue lock (used by tests).
+ */
+export function resetEventInsertQueueForTests(): void {
+  eventInsertTail = Promise.resolve();
+}
+
+/**
+ * Enqueue an event batch write behind a memory queue lock.
+ *
+ * Concurrent callers are chained onto a single promise tail and executed one at
+ * a time, preserving the atomicity of `insertEventBatch` and preventing
+ * duplicate or conflicting inserts from overlapping iterations.
+ */
+export function enqueueEventInsert(
+  events: EventRow[],
+  newLedger: number,
+): Promise<void> {
+  const run = eventInsertTail.then(() => {
+    insertEventBatch(events, newLedger);
+  });
+  // Keep the queue alive even if an insert rejects so later enqueues proceed.
+  eventInsertTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 const EVENT_TYPES = [
   "initialized",
   "funded",
@@ -254,8 +292,10 @@ export async function pollEvents(): Promise<boolean> {
       dataJson: JSON.stringify(event.value),
     }));
 
-    // Persist the batch and advance the ledger pointer atomically (#84)
-    insertEventBatch(batch, currentLedger);
+    // Persist the batch and advance the ledger pointer atomically (#84).
+    // Concurrent indexer_runner executions share a memory queue lock so their
+    // event inserts are serialized and cannot conflict or duplicate entries (#251).
+    await enqueueEventInsert(batch, currentLedger);
 
     const totalElapsed = Math.round(performance.now() - pollStart);
     consecutiveFailures = 0;
@@ -330,6 +370,11 @@ async function pollLoop() {
 
 export function startPoller() {
   if (pollerRunning) return;
+
+  // Migration verification hook: fail-fast on startup if the database schema is
+  // out of sync, so the indexer cannot start against a stale schema (#255).
+  assertSchemaValid();
+
   pollerRunning = true;
   logger.info("Starting event indexer poller", {
     intervalMs: getCurrentPollIntervalMs(),
