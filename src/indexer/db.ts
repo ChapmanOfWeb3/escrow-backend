@@ -192,6 +192,20 @@ const MIGRATIONS: Migration[] = [
         ON webhook_subscriptions (webhook_url);
     `,
   },
+  {
+    version: 8,
+    description: "add event_type_filter lookup indexes (#276)",
+    // The topic filter groups and filters by event_type. Migration 3 indexed
+    // (contract_id, event_type), which cannot serve a bare event_type
+    // predicate because event_type is not the leading column.
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_event_type
+        ON events (contract_id, event_type);
+    `,
+  },
 ];
 
 /** Index names created by the SQLite schema manager lookup-index migration (#259). */
