@@ -410,6 +410,7 @@ export function countEventsInRange(
 
 /**
  * Delete event data for a specific ledger range (useful for re-sync).
+ * Wrapped in a transaction so both events and sync_ranges deletes are atomic.
  */
 export function deleteEventsInRange(
   startLedger: number,
@@ -433,5 +434,7 @@ export function deleteEventsInRange(
     ).run(startLedger, endLedger);
   }
 
-  return result.changes;
+    return result.changes;
+  });
+  return tx();
 }
