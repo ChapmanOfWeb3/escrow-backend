@@ -1026,69 +1026,71 @@ export function collectIndexerMetrics(
 }
 
 // ---------------------------------------------------------------------------
-// RPC health check with exponential backoff retry (#334)
+// SQLite index structures for collector lookups (#335)
 // ---------------------------------------------------------------------------
 
-export interface IndexerRpcHealthMetrics {
-  latestLedgerSequence: number;
-  collectedAt: string;
+export const INDEXER_METRICS_INDEXES = {
+  eventsByType: "idx_events_event_type",
+  lastEventAt: "idx_events_created_at",
+  activeContracts: "idx_monitored_contracts_active",
+} as const;
+
+export const INDEXER_METRICS_QUERIES = {
+  lastLedger:
+    "SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'",
+  totalEvents: "SELECT COUNT(*) as count FROM events",
+  lastEventAt: "SELECT MAX(created_at) as last_at FROM events",
+  eventsByType:
+    "SELECT event_type, COUNT(*) as count FROM events GROUP BY event_type",
+  activeContracts:
+    "SELECT COUNT(*) as count FROM monitored_contracts WHERE active = 1",
+  subscriptions: "SELECT COUNT(*) as count FROM webhook_subscriptions",
+} as const;
+
+export function verifyIndexerMetricsIndexes(
+  targetDb?: Database.Database,
+): { valid: boolean; present: string[]; missing: string[] } {
+  const database = targetDb || getDb();
+  const names = new Set(
+    (
+      database
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name),
+  );
+  const expected = Object.values(INDEXER_METRICS_INDEXES);
+  const present = expected.filter((name) => names.has(name));
+  const missing = expected.filter((name) => !names.has(name));
+  return { valid: missing.length === 0, present, missing };
 }
 
-/**
- * Check RPC connectivity by fetching the latest ledger, retrying transient
- * connection timeouts with the same exponential backoff `withRetry` uses in
- * rpc_poller_client rather than a bespoke retry loop. Retry frequency grows
- * with each attempt (doubling by default) up to `maxRetries`.
- *
- * A failure that survives every retry is recorded on the shared failure
- * monitor as `rpc_timeout` – surfacing through the existing threshold
- * alerting (#338) – before being rethrown for the caller to handle.
- */
-export async function collectRpcHealthMetrics(
-  server: RpcServerLike,
-  config: Partial<RpcRetryConfig> = {},
-): Promise<IndexerRpcHealthMetrics> {
-  const monitor = defaultMonitor;
-  const startedAt = performance.now();
+export function explainIndexerMetricsQueryPlan(
+  sql: string,
+  targetDb?: Database.Database,
+): Array<Record<string, unknown>> {
+  const database = targetDb || getDb();
+  return database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<
+    Record<string, unknown>
+  >;
+}
 
-  try {
-    const { sequence } = await withRetry(
-      () => server.getLatestLedger(),
-      config,
-      `${COLLECTOR_NAME} rpc_health_check`,
-    );
+export function metricsQueryPlanUsesIndex(
+  plan: Array<Record<string, unknown>>,
+  indexName: string,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && value.includes(indexName),
+    ),
+  );
+}
 
-    const metrics: IndexerRpcHealthMetrics = {
-      latestLedgerSequence: sequence,
-      collectedAt: new Date().toISOString(),
-    };
-
-    monitor.recordSuccess();
-    logIndexerMetricsDiagnostics({
-      collector: COLLECTOR_NAME,
-      operation: "rpc_health_check",
-      status: "success",
-      elapsedMs: roundElapsed(performance.now() - startedAt),
-      payloadSizeBytes: metricsPayloadSizeBytes(metrics),
-      lastIndexedLedger: sequence,
-    });
-
-    return metrics;
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-
-    logIndexerMetricsDiagnostics({
-      collector: COLLECTOR_NAME,
-      operation: "rpc_health_check",
-      status: "failure",
-      elapsedMs: roundElapsed(performance.now() - startedAt),
-      error,
-    });
-    monitor.recordFailure("rpc_timeout", {
-      error,
-      operation: "rpc_health_check",
-    });
-
-    throw err;
-  }
+export function metricsQueryPlanUsesTempBTree(
+  plan: Array<Record<string, unknown>>,
+): boolean {
+  return plan.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && /USE TEMP B-TREE/i.test(value),
+    ),
+  );
 }

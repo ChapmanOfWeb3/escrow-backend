@@ -190,6 +190,14 @@ const MIGRATIONS: Migration[] = [
         ON events (ledger_sequence, created_at);
     `,
   },
+  {
+    version: 7,
+    description: "add database_writer_pool write-path lookup indexes (#326)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_webhook_url
+        ON webhook_subscriptions (webhook_url);
+    `,
+  },
 ];
 
 /** Index names created by the SQLite schema manager lookup-index migration (#259). */
