@@ -181,13 +181,169 @@ function toEventRow(event: any, fallbackContractId: string): EventRow {
   };
 }
 
-/** Debug line carrying poll duration and payload size for one cycle (#270). */
+// ---------------------------------------------------------------------------
+// Poll diagnostics (#270)
+// ---------------------------------------------------------------------------
+
+const POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS = parseInt(
+  process.env.POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS || "0",
+  10,
+);
+let lastPollDiagnosticAt = 0;
+
+/** Clear the diagnostics throttle so the next poll logs unconditionally. */
+export function resetPollDiagnosticsThrottle(): void {
+  lastPollDiagnosticAt = 0;
+}
+
+/**
+ * Debug line carrying poll duration and payload size for one cycle.
+ *
+ * Throttled to at most one line per POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS so a
+ * fast poll loop cannot flood the log; the interval defaults to 0 (every poll).
+ */
 function logPollDiagnostics(elapsedMs: number, batch: EventRow[]): void {
-  logger.debug("Indexer poll diagnostics", {
-    elapsedMs: Math.round(elapsedMs),
-    payloadSizeBytes: JSON.stringify(batch).length,
-    eventCount: batch.length,
+  const now = Date.now();
+  if (
+    POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS > 0 &&
+    lastPollDiagnosticAt > 0 &&
+    now - lastPollDiagnosticAt < POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
+  lastPollDiagnosticAt = now;
+
+  logger.debug(
+    `Indexer poll diagnostics elapsedMs=${Math.round(elapsedMs)} ` +
+      `payloadSizeBytes=${JSON.stringify(batch).length}`,
+    {
+      elapsedMs: Math.round(elapsedMs),
+      payloadSizeBytes: JSON.stringify(batch).length,
+      eventCount: batch.length,
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Historical range import (#254)
+// ---------------------------------------------------------------------------
+
+/** Upper bound on how many ledgers a single backfill may cover. */
+export const MAX_LEDGERS_PER_IMPORT = parseInt(
+  process.env.MAX_LEDGERS_PER_IMPORT || "10000",
+  10,
+);
+
+const HISTORICAL_PAGE_SIZE = 100;
+
+export interface HistoricalRangeValidation {
+  valid: boolean;
+  error?: string;
+}
+
+export interface HistoricalImportResult {
+  eventsFound: number;
+  eventsImported: number;
+}
+
+/**
+ * Check a requested backfill window against the chain head and the per-import
+ * ceiling. Pure, so callers can validate before opening any RPC connection.
+ */
+export function validateHistoricalRange(
+  startLedger: number,
+  endLedger: number,
+  chainHeadLedger: number,
+): HistoricalRangeValidation {
+  if (!Number.isInteger(startLedger) || startLedger <= 0) {
+    return { valid: false, error: "startLedger must be a positive integer" };
+  }
+  if (!Number.isInteger(endLedger) || endLedger <= 0) {
+    return { valid: false, error: "endLedger must be a positive integer" };
+  }
+  if (startLedger > endLedger) {
+    return { valid: false, error: "startLedger must be <= endLedger" };
+  }
+  if (endLedger > chainHeadLedger) {
+    return {
+      valid: false,
+      error:
+        `endLedger ${endLedger} does not exist yet – ` +
+        `the chain head is ${chainHeadLedger}`,
+    };
+  }
+
+  const span = endLedger - startLedger + 1;
+  if (span > MAX_LEDGERS_PER_IMPORT) {
+    return {
+      valid: false,
+      error:
+        `range covers ${span} ledgers, exceeding the ` +
+        `${MAX_LEDGERS_PER_IMPORT}-ledger maximum per import`,
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Import a historical ledger window without disturbing the live poller.
+ *
+ * Rows go through `insertHistoricalEventBatch`, which keeps the live ledger
+ * pointer where it is and relies on the same UNIQUE constraint as the poller —
+ * so re-running an import is idempotent. Pages are followed by cursor until a
+ * short page signals the range is fully collected.
+ */
+export async function fetchHistoricalEvents(
+  startLedger: number,
+  endLedger: number,
+): Promise<HistoricalImportResult> {
+  const chainHead = (await rpcClient.getLatestLedger()).sequence;
+  const validation = validateHistoricalRange(startLedger, endLedger, chainHead);
+  if (!validation.valid) {
+    throw new Error(`Invalid historical range: ${validation.error}`);
+  }
+
+  let contractIds: string[] = getActiveContractIds();
+  if (contractIds.length === 0 && process.env.CONTRACT_ID) {
+    contractIds = [process.env.CONTRACT_ID];
+  }
+
+  let eventsFound = 0;
+  let eventsImported = 0;
+  let cursor: string | undefined;
+
+  for (;;) {
+    // Cursor mode supersedes the ledger window once paging has started; sending
+    // both is rejected by the RPC.
+    const params = cursor
+      ? { cursor, limit: HISTORICAL_PAGE_SIZE }
+      : { startLedger, endLedger, contractIds, limit: HISTORICAL_PAGE_SIZE };
+
+    const page = await rpcClient.getEvents(params);
+    const pageEvents: any[] = page?.events ?? [];
+    if (pageEvents.length === 0) break;
+
+    eventsFound += pageEvents.length;
+
+    const batch: EventRow[] = pageEvents.map((event) =>
+      toEventRow(event, contractIds[0] ?? ""),
+    );
+    const result = insertHistoricalEventBatch(batch, { startLedger, endLedger });
+    eventsImported += result.inserted;
+
+    cursor = page?.cursor;
+    if (pageEvents.length < HISTORICAL_PAGE_SIZE || !cursor) break;
+  }
+
+  logger.info("Historical import complete", {
+    startLedger,
+    endLedger,
+    eventsFound,
+    eventsImported,
   });
+
+  return { eventsFound, eventsImported };
 }
 
 // ---------------------------------------------------------------------------
