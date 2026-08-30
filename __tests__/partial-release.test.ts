@@ -30,6 +30,64 @@ function buildApp() {
 const ENDPOINT = `/api/jobs/${VALID_CONTRACT}/milestones/0/partial-release`;
 const VALID_BODY = { amount: "100", sourceAddress: VALID_ADDRESS };
 
+describe("POST /api/jobs/:contractId/milestones/:index/partial-release – CORS and security headers", () => {
+  it("rejects requests from unauthorized origins", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("Origin", "http://malicious.com")
+      .send(VALID_BODY)
+      .expect(403);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Origin not allowed by CORS policy",
+    });
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("allows trusted origins and sets CORS response headers", async () => {
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_ADDRESS,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("Origin", "http://localhost:3000")
+      .send(VALID_BODY)
+      .expect(200);
+
+    expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(res.headers["access-control-allow-methods"]).toContain("POST");
+    expect(res.headers["access-control-allow-methods"]).toContain("OPTIONS");
+    expect(res.body.success).toBe(true);
+  });
+
+  it("sets required security headers on the response", async () => {
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_ADDRESS,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("Origin", "http://localhost:3000")
+      .send(VALID_BODY)
+      .expect(200);
+
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["x-frame-options"]).toBe("DENY");
+    expect(res.headers["referrer-policy"]).toBe("no-referrer");
+    expect(res.headers["x-xss-protection"]).toBe("0");
+    expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
+    expect(res.headers["permissions-policy"]).toContain("camera=()");
+  });
+});
+
 describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
   beforeEach(() => {
     mockGetAccount.mockReset();

@@ -74,13 +74,6 @@ export const INDEXER_RUNNER_INDEXES = {
   eventsCreatedAt: "idx_events_created_at",
 } as const;
 
-/** Index names created by the schema-manager migration (#259). */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
 // ---------------------------------------------------------------------------
@@ -200,13 +193,6 @@ const MIGRATIONS: Migration[] = [
   },
 ];
 
-/** Index names created by the SQLite schema manager lookup-index migration (#259). */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
-
 /**
  * Migration versions this build ships, ascending. Callers compare these
  * against `schema_migrations` to detect a database that is behind the code.
@@ -214,13 +200,6 @@ export const SCHEMA_MANAGER_INDEXES = {
 export function getShippedMigrationVersions(): number[] {
   return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
 }
-
-/** Index names created by the version-5 migration (#259), for test assertions. */
-export const SCHEMA_MANAGER_INDEXES = {
-  monitoredContractsActive: "idx_monitored_contracts_active",
-  eventsCreatedAt: "idx_events_created_at",
-  eventsContractTypeLedger: "idx_events_contract_type_ledger",
-} as const;
 
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
@@ -984,47 +963,6 @@ export function insertEventBatch(events: EventRow[], newLedger: number): void {
   );
 }
 
-/**
- * Insert a batch of events WITHOUT touching the live indexer_state ledger
- * pointer. Used for custom historical event imports (event_type_filter's
- * dynamic start/end ledger support) so a backfill over an arbitrary past
- * range can never advance or rewind last_ledger_sequence - only the live
- * poller (insertEventBatch, driven strictly by lastLedger+1..currentLedger)
- * is allowed to move that pointer. Rows still go through INSERT OR IGNORE
- * against the same UNIQUE(contract_id, ledger_sequence, event_type)
- * constraint, so re-running a historical import is idempotent exactly like
- * the live poller.
- *
- * Returns the number of rows actually inserted (excludes rows ignored as
- * duplicates).
- */
-export function insertHistoricalEventBatch(events: EventRow[]): number {
-  const db = getDb();
-
-  const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const batchTransaction = db.transaction(() => {
-    let inserted = 0;
-    for (const ev of events) {
-      const result = insertStmt.run(
-        ev.contractId,
-        ev.eventType,
-        ev.ledgerSequence,
-        ev.timestamp,
-        ev.dataJson
-      );
-      if (result.changes > 0) inserted++;
-    }
-    return inserted;
-  });
-
-  return batchTransaction();
-}
-
 // ---------------------------------------------------------------------------
 // In-memory event queue locks for concurrent inserts (#260)
 // ---------------------------------------------------------------------------
@@ -1147,47 +1085,6 @@ export async function insertEventBatchLocked(
   await acquireEventLocksInOrder(keys, () => {
     insertEventBatch(events, newLedger);
   });
-}
-
-/**
- * Insert a batch of events WITHOUT touching the live indexer_state ledger
- * pointer. Used for custom historical event imports (event_type_filter's
- * dynamic start/end ledger support) so a backfill over an arbitrary past
- * range can never advance or rewind last_ledger_sequence - only the live
- * poller (insertEventBatch, driven strictly by lastLedger+1..currentLedger)
- * is allowed to move that pointer. Rows still go through INSERT OR IGNORE
- * against the same UNIQUE(contract_id, ledger_sequence, event_type)
- * constraint, so re-running a historical import is idempotent exactly like
- * the live poller.
- *
- * Returns the number of rows actually inserted (excludes rows ignored as
- * duplicates).
- */
-export function insertHistoricalEventBatch(events: EventRow[]): number {
-  const db = getDb();
-
-  const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const batchTransaction = db.transaction(() => {
-    let inserted = 0;
-    for (const ev of events) {
-      const result = insertStmt.run(
-        ev.contractId,
-        ev.eventType,
-        ev.ledgerSequence,
-        ev.timestamp,
-        ev.dataJson
-      );
-      if (result.changes > 0) inserted++;
-    }
-    return inserted;
-  });
-
-  return batchTransaction();
 }
 
 // ---------------------------------------------------------------------------
