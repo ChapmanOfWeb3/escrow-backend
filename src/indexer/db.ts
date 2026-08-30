@@ -172,6 +172,13 @@ export function getShippedMigrationVersions(): number[] {
   return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
 }
 
+/** Index names created by the version-5 migration (#259), for test assertions. */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
+
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
 // Retries transient SQLite / connection / timeout failures during migrations.
