@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import Database from "better-sqlite3";
 import { runMigrations, setDb } from "../src/indexer/db.js";
 import {
@@ -7,6 +8,13 @@ import {
   runVacuumCleanup,
   ERROR_CODES,
   DEFAULT_RETENTION_DAYS,
+  isVacuumRetryableError,
+  computeVacuumBackoffMs,
+  withVacuumRetrySync,
+  withVacuumRetry,
+  runVacuumWithRetry,
+  runVacuumCleanupWithRetry,
+  DEFAULT_VACUUM_RETRY_CONFIG,
 } from "../src/indexer/sqlite_vacuum_cleaner.js";
 
 describe("sqlite_vacuum_cleaner (#193)", () => {
@@ -790,5 +798,332 @@ describe("sqlite_vacuum_cleaner — Issue 4: Schema migration checks", () => {
     }
     expect(message).toMatch(/missing table: events/);
     expect(message).toMatch(/missing table: schema_migrations/);
+  });
+});
+
+// ============================================================================
+// Issue 343 — Exponential backoff retry strategies on sqlite_vacuum_cleaner
+// ============================================================================
+
+describe("sqlite_vacuum_cleaner — #343: Exponential backoff retry", () => {
+  // Use zero-delay config so tests don't wait on real timeouts.
+  const fastConfig = {
+    maxRetries: 3,
+    initialBackoffMs: 0,
+    backoffMultiplier: 2,
+    maxBackoffMs: 0,
+  };
+
+  // --- isVacuumRetryableError ---
+
+  describe("isVacuumRetryableError", () => {
+    it("returns true for timeout errors", () => {
+      expect(isVacuumRetryableError(new Error("RPC connection timeout"))).toBe(
+        true,
+      );
+      expect(isVacuumRetryableError(new Error("request ETIMEDOUT"))).toBe(true);
+    });
+
+    it("returns true for connection reset / refused / dropped", () => {
+      expect(
+        isVacuumRetryableError(new Error("ECONNRESET: connection reset")),
+      ).toBe(true);
+      expect(
+        isVacuumRetryableError(new Error("connection refused")),
+      ).toBe(true);
+      expect(isVacuumRetryableError(new Error("socket hang up"))).toBe(true);
+    });
+
+    it("returns true for SQLite lock / busy errors", () => {
+      expect(isVacuumRetryableError(new Error("SQLITE_BUSY"))).toBe(true);
+      expect(isVacuumRetryableError(new Error("database is locked"))).toBe(
+        true,
+      );
+      expect(isVacuumRetryableError(new Error("database is busy"))).toBe(true);
+      expect(isVacuumRetryableError(new Error("SQLITE_LOCKED"))).toBe(true);
+    });
+
+    it("returns true for generic RPC connection errors", () => {
+      expect(
+        isVacuumRetryableError(new Error("RPC connection failed")),
+      ).toBe(true);
+    });
+
+    it("returns false for non-error values", () => {
+      expect(isVacuumRetryableError("string error")).toBe(false);
+      expect(isVacuumRetryableError(42)).toBe(false);
+      expect(isVacuumRetryableError(null)).toBe(false);
+      expect(isVacuumRetryableError(undefined)).toBe(false);
+    });
+
+    it("returns false for non-retryable errors", () => {
+      expect(
+        isVacuumRetryableError(new Error("syntax error near SELECT")),
+      ).toBe(false);
+      expect(
+        isVacuumRetryableError(new Error("no such table: foo")),
+      ).toBe(false);
+    });
+  });
+
+  // --- computeVacuumBackoffMs ---
+
+  describe("computeVacuumBackoffMs", () => {
+    it("returns initialBackoffMs for attempt 0", () => {
+      const result = computeVacuumBackoffMs(0, {
+        initialBackoffMs: 500,
+        backoffMultiplier: 2,
+        maxBackoffMs: 30_000,
+      });
+      expect(result).toBe(500);
+    });
+
+    it("doubles the delay on each subsequent attempt", () => {
+      expect(
+        computeVacuumBackoffMs(0, DEFAULT_VACUUM_RETRY_CONFIG),
+      ).toBe(1_000);
+      expect(
+        computeVacuumBackoffMs(1, DEFAULT_VACUUM_RETRY_CONFIG),
+      ).toBe(2_000);
+      expect(
+        computeVacuumBackoffMs(2, DEFAULT_VACUUM_RETRY_CONFIG),
+      ).toBe(4_000);
+      expect(
+        computeVacuumBackoffMs(3, DEFAULT_VACUUM_RETRY_CONFIG),
+      ).toBe(8_000);
+      expect(
+        computeVacuumBackoffMs(4, DEFAULT_VACUUM_RETRY_CONFIG),
+      ).toBe(16_000);
+    });
+
+    it("caps at maxBackoffMs", () => {
+      const result = computeVacuumBackoffMs(20, DEFAULT_VACUUM_RETRY_CONFIG);
+      expect(result).toBe(30_000);
+    });
+
+    it("respects custom multiplier and ceiling", () => {
+      const cfg = {
+        initialBackoffMs: 100,
+        backoffMultiplier: 3,
+        maxBackoffMs: 500,
+      };
+      expect(computeVacuumBackoffMs(0, cfg)).toBe(100);
+      expect(computeVacuumBackoffMs(1, cfg)).toBe(300);
+      expect(computeVacuumBackoffMs(2, cfg)).toBe(500);
+      expect(computeVacuumBackoffMs(3, cfg)).toBe(500);
+    });
+  });
+
+  // --- withVacuumRetrySync ---
+
+  describe("withVacuumRetrySync", () => {
+    it("returns the result immediately on first success", () => {
+      const fn = jest.fn(() => "ok");
+      const result = withVacuumRetrySync(fn, fastConfig);
+      expect(result).toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries on a retryable error and succeeds", () => {
+      let calls = 0;
+      const fn = jest.fn(() => {
+        calls++;
+        if (calls < 3) throw new Error("RPC connection timeout");
+        return "recovered";
+      });
+
+      const result = withVacuumRetrySync(fn, fastConfig);
+      expect(result).toBe("recovered");
+      expect(fn).toHaveBeenCalledTimes(3);
+    });
+
+    it("propagates non-retryable errors immediately without retrying", () => {
+      const fn = jest.fn(() => {
+        throw new Error("no such table: events");
+      });
+
+      expect(() => withVacuumRetrySync(fn, fastConfig)).toThrow(
+        /no such table/,
+      );
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it("throws after exhausting all retries on a persistent retryable error", () => {
+      const fn = jest.fn(() => {
+        throw new Error("database is locked");
+      });
+
+      expect(() => withVacuumRetrySync(fn, fastConfig)).toThrow(
+        /database is locked/,
+      );
+      expect(fn).toHaveBeenCalledTimes(4);
+    });
+  });
+
+  // --- withVacuumRetry (async) ---
+
+  describe("withVacuumRetry (async)", () => {
+    it("returns the result immediately on first success", async () => {
+      const fn = jest.fn(async () => "ok");
+      const result = await withVacuumRetry(fn, fastConfig);
+      expect(result).toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries on a retryable error and succeeds", async () => {
+      let calls = 0;
+      const fn = jest.fn(async () => {
+        calls++;
+        if (calls < 2) throw new Error("ETIMEDOUT");
+        return "recovered";
+      });
+
+      const result = await withVacuumRetry(fn, fastConfig);
+      expect(result).toBe("recovered");
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it("propagates non-retryable errors immediately", async () => {
+      const fn = jest.fn(async () => {
+        throw new Error("SQLITE_READONLY: attempt to write a readonly database");
+      });
+
+      await expect(withVacuumRetry(fn, fastConfig)).rejects.toThrow(
+        /SQLITE_READONLY/,
+      );
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it("throws after exhausting all retries", async () => {
+      const fn = jest.fn(async () => {
+        throw new Error("connect timeout");
+      });
+
+      await expect(withVacuumRetry(fn, fastConfig)).rejects.toThrow(
+        /connect timeout/,
+      );
+      expect(fn).toHaveBeenCalledTimes(4);
+    });
+  });
+
+  // --- runVacuumWithRetry ---
+
+  describe("runVacuumWithRetry", () => {
+    it("runs vacuum successfully on the first attempt", () => {
+      const db = new Database(":memory:");
+      try {
+        expect(() => runVacuumWithRetry(db, fastConfig)).not.toThrow();
+      } finally {
+        db.close();
+      }
+    });
+
+    it("retries vacuum on a retryable error and succeeds", () => {
+      const db = new Database(":memory:");
+      try {
+        let calls = 0;
+        db.exec("CREATE TABLE events (id INTEGER)");
+        // Spy on db.exec: fail twice then succeed
+        const spy = jest
+          .spyOn(db, "exec")
+          .mockImplementationOnce(() => {
+            calls++;
+            throw new Error("SQLITE_BUSY");
+          })
+          .mockImplementationOnce(() => {
+            calls++;
+            throw new Error("database is locked");
+          })
+          .mockImplementation(() => {
+            calls++;
+          });
+
+        expect(() => runVacuumWithRetry(db, fastConfig)).not.toThrow();
+        expect(spy).toHaveBeenCalledTimes(3);
+        spy.mockRestore();
+        expect(calls).toBe(3);
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  // --- runVacuumCleanupWithRetry ---
+
+  describe("runVacuumCleanupWithRetry", () => {
+    let testDb: Database.Database;
+
+    beforeEach(() => {
+      testDb = new Database(":memory:");
+      setDb(testDb);
+      runMigrations();
+    });
+
+    afterEach(() => {
+      testDb.close();
+    });
+
+    it("completes a full cleanup cycle successfully", () => {
+      const result = runVacuumCleanupWithRetry(
+        testDb,
+        { retentionDays: 90 },
+        fastConfig,
+      );
+      expect(result.prunedEvents).toBe(0);
+      expect(result.vacuumed).toBe(true);
+    });
+
+    it("prunes old events and vacuums end-to-end with retry", () => {
+      testDb.prepare(
+        `INSERT INTO events
+         (contract_id, event_type, ledger_sequence, timestamp, data_json, created_at)
+         VALUES ('OLD', 'test', 1, 1000, '{}', datetime('now', '-100 days'))`,
+      ).run();
+
+      const result = runVacuumCleanupWithRetry(
+        testDb,
+        { retentionDays: 90 },
+        fastConfig,
+      );
+      expect(result.prunedEvents).toBe(1);
+      expect(result.vacuumed).toBe(true);
+
+      const remaining = testDb
+        .prepare("SELECT COUNT(*) as cnt FROM events")
+        .get() as { cnt: number };
+      expect(remaining.cnt).toBe(0);
+    });
+
+    it("does not retry pruning — propagates pruning errors immediately", () => {
+      // Insert a sentinel that triggers a trigger error during prune
+      testDb.prepare(
+        `INSERT INTO events
+         (contract_id, event_type, ledger_sequence, timestamp, data_json, created_at)
+         VALUES ('__SENTINEL_FAIL__', 'test', 1, 1000, '{}', datetime('now', '-100 days'))`,
+      ).run();
+
+      testDb.exec(`
+        CREATE TRIGGER trg_fail_on_delete_sentinel_retry
+        BEFORE DELETE ON events
+        WHEN OLD.contract_id = '__SENTINEL_FAIL__'
+        BEGIN
+          SELECT RAISE(FAIL, 'intentional test failure');
+        END;
+      `);
+
+      try {
+        expect(() =>
+          runVacuumCleanupWithRetry(
+            testDb,
+            { retentionDays: 90 },
+            fastConfig,
+          ),
+        ).toThrow(/intentional test failure/);
+      } finally {
+        testDb.exec(
+          "DROP TRIGGER IF EXISTS trg_fail_on_delete_sentinel_retry",
+        );
+      }
+    });
   });
 });

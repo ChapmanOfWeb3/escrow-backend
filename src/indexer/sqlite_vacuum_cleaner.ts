@@ -18,6 +18,11 @@ import logger from "../utils/logger.js";
 //     verifies the required tables/columns exist before the cleaner starts,
 //     failing fast when the database state is out of sync.
 //
+//   - Exponential backoff retry (#343): withVacuumRetrySync() and
+//     withVacuumRetry() retry RPC connection timeouts with exponentially
+//     increasing delays up to a configurable ceiling, so transient connection
+//     dropouts don't abort the vacuum cycle.
+//
 // This module prunes stale rows from the `events` table and reclaims the
 // disk space they occupied.
 //
@@ -442,4 +447,208 @@ export function assertVacuumSchemaValid(db: Database.Database): void {
       `Vacuum cleaner cannot start — database schema is out of sync: ${reasons.join("; ")}`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Exponential backoff retry (#343)
+// ---------------------------------------------------------------------------
+
+/** Retry configuration for vacuum operations subject to connection dropouts. */
+export interface VacuumRetryConfig {
+  /** Maximum number of retry attempts after the initial failure (default: 5). */
+  maxRetries: number;
+  /** Initial delay in ms after the first failure (default: 1000). */
+  initialBackoffMs: number;
+  /** Multiplier applied to the backoff on each consecutive failure (default: 2). */
+  backoffMultiplier: number;
+  /** Ceiling delay in ms (default: 30000). */
+  maxBackoffMs: number;
+}
+
+/** Default retry configuration for vacuum connection dropouts. */
+export const DEFAULT_VACUUM_RETRY_CONFIG: VacuumRetryConfig = {
+  maxRetries: 5,
+  initialBackoffMs: 1000,
+  backoffMultiplier: 2,
+  maxBackoffMs: 30_000,
+};
+
+/** Error-string fragments that indicate a transient, retryable failure. */
+export const VACUUM_RETRYABLE_PATTERNS = [
+  "timeout",
+  "SQLITE_BUSY",
+  "SQLITE_LOCKED",
+  "database is locked",
+  "database is busy",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "connect timeout",
+  "connection reset",
+  "connection refused",
+  "connection dropped",
+  "RPC connection",
+] as const;
+
+/**
+ * Returns true when `err` looks like a transient RPC connection timeout or
+ * SQLite lock that is worth retrying.
+ */
+export function isVacuumRetryableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return (VACUUM_RETRYABLE_PATTERNS as readonly string[]).some((p) =>
+    msg.includes(p.toLowerCase()),
+  );
+}
+
+/**
+ * Compute the backoff delay (ms) for a given attempt index.
+ * attempt 0 → initialBackoffMs, attempt 1 → initialBackoffMs * multiplier, etc.,
+ * capped at maxBackoffMs.
+ */
+export function computeVacuumBackoffMs(
+  attempt: number,
+  config: Pick<VacuumRetryConfig, "initialBackoffMs" | "backoffMultiplier" | "maxBackoffMs">,
+): number {
+  return Math.min(
+    config.initialBackoffMs * Math.pow(config.backoffMultiplier, attempt),
+    config.maxBackoffMs,
+  );
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a synchronous vacuum operation with exponential backoff retry.
+ * Uses `sleepSync` (Atomics.wait) so the delay is truly blocking — appropriate
+ * for the synchronous better-sqlite3 calls used throughout this module.
+ *
+ * Only errors flagged by `isVacuumRetryableError` are retried; all other errors
+ * propagate immediately. After `maxRetries` consecutive retries have been
+ * exhausted the last error is rethrown.
+ */
+export function withVacuumRetrySync<T>(
+  fn: () => T,
+  config: Partial<VacuumRetryConfig> = {},
+  context: string = "sqlite_vacuum_cleaner",
+): T {
+  const cfg = { ...DEFAULT_VACUUM_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isVacuumRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeVacuumBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      sleepSync(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
+/**
+ * Async variant of vacuum retry for callers that prefer Promise-based backoff.
+ * Otherwise identical semantics to `withVacuumRetrySync`.
+ */
+export async function withVacuumRetry<T>(
+  fn: () => Promise<T> | T,
+  config: Partial<VacuumRetryConfig> = {},
+  context: string = "sqlite_vacuum_cleaner",
+): Promise<T> {
+  const cfg = { ...DEFAULT_VACUUM_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isVacuumRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeVacuumBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      await sleep(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
+/**
+ * Run `runVacuum` wrapped in exponential backoff retry so transient RPC
+ * connection timeouts and SQLite lock dropouts don't abort the cycle.
+ *
+ * Pruning is intentionally NOT retried here — it runs inside a transaction
+ * that either commits or rolls back atomically. Only the separate VACUUM step
+ * (which is non-transactional and most susceptible to "database is locked"
+ * errors from concurrent writers) gets the retry treatment.
+ */
+export function runVacuumWithRetry(
+  db: Database.Database,
+  retryConfig: Partial<VacuumRetryConfig> = {},
+): void {
+  withVacuumRetrySync(
+    () => runVacuum(db),
+    retryConfig,
+    "sqlite_vacuum_cleaner.run_vacuum",
+  );
+}
+
+/**
+ * Run a full vacuum-cleanup cycle with retry on the VACUUM step.
+ *
+ * Pruning runs once (no retry — a failed prune rolls back atomically and
+ * should not be blindly retried). The VACUUM step is retried with
+ * exponential backoff for transient connection dropouts.
+ */
+export function runVacuumCleanupWithRetry(
+  db: Database.Database,
+  options: VacuumCleanupOptions = {},
+  retryConfig: Partial<VacuumRetryConfig> = {},
+): VacuumCleanupResult {
+  const retentionDays = options.retentionDays ?? DEFAULT_RETENTION_DAYS;
+
+  logger.info("Starting sqlite vacuum cleanup (with retry)", {
+    retentionDays,
+  });
+
+  const prunedEvents = pruneOldEvents(db, retentionDays);
+
+  runVacuumWithRetry(db, retryConfig);
+
+  logger.info("Completed sqlite vacuum cleanup (with retry)", { prunedEvents });
+
+  return { prunedEvents, vacuumed: true };
 }
