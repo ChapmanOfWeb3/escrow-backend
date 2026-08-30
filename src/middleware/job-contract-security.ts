@@ -284,30 +284,17 @@ export function claimAutoReleaseCors(
 /** Security headers applied to claim-auto-release responses. */
 export const claimAutoReleaseSecurityHeaders = jobContractSecurityHeaders;
 
-<<<<<<< HEAD
 /** Strict CORS gate for POST /api/jobs/:contractId/whitelist/update. */
 export function updateWhitelistCors(
-=======
-/** Strict CORS gate for POST /api/jobs/build-tx. */
-export function buildTxCors(
->>>>>>> pr/385
   req: Request,
   res: Response,
   next: NextFunction
 ): void {
-<<<<<<< HEAD
   const origin = req.header("Origin");
   const allowedOrigins = getAllowedOrigins();
 
   if (!origin) {
     if (req.method === "OPTIONS") {
-=======
-  const origin = req.header('Origin');
-  const allowedOrigins = getAllowedOrigins();
-
-  if (!origin) {
-    if (req.method === 'OPTIONS') {
->>>>>>> pr/385
       res.status(204).end();
       return;
     }
@@ -316,7 +303,6 @@ export function buildTxCors(
   }
 
   if (allowedOrigins.includes(origin)) {
-<<<<<<< HEAD
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -325,16 +311,6 @@ export function buildTxCors(
       "Content-Type, Authorization, X-API-Key"
     );
     if (req.method === "OPTIONS") {
-=======
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-API-Key'
-    );
-    if (req.method === 'OPTIONS') {
->>>>>>> pr/385
       res.status(204).end();
       return;
     }
@@ -344,19 +320,52 @@ export function buildTxCors(
 
   res.status(403).json({
     success: false,
-<<<<<<< HEAD
     error: "Origin not allowed by CORS policy",
   });
 }
 
 /** Security headers applied to whitelist update responses. */
 export const updateWhitelistSecurityHeaders = jobContractSecurityHeaders;
-=======
-    error: 'Origin not allowed by CORS policy',
+
+/** Strict CORS gate for POST /api/jobs/build-tx. */
+export function buildTxCors(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const origin = req.header("Origin");
+  const allowedOrigins = getAllowedOrigins();
+
+  if (!origin) {
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+    return;
+  }
+
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-API-Key"
+    );
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+    return;
+  }
+
+  res.status(403).json({
+    success: false,
+    error: "Origin not allowed by CORS policy",
   });
 }
 
 /** Security headers applied to POST /api/jobs/build-tx responses. */
 export const buildTxSecurityHeaders = jobContractSecurityHeaders;
-
->>>>>>> pr/385

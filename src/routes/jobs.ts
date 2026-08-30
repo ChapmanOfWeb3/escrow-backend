@@ -35,13 +35,10 @@ import {
   byWalletSecurityHeaders,
   claimAutoReleaseCors,
   claimAutoReleaseSecurityHeaders,
-<<<<<<< HEAD
   updateWhitelistCors,
   updateWhitelistSecurityHeaders,
-=======
   buildTxCors,
   buildTxSecurityHeaders,
->>>>>>> pr/385
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
