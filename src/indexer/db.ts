@@ -183,6 +183,13 @@ const MIGRATIONS: Migration[] = [
   },
 ];
 
+/** Index names created by the SQLite schema manager lookup-index migration (#259). */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
+
 /**
  * Migration versions this build ships, ascending. Callers compare these
  * against `schema_migrations` to detect a database that is behind the code.

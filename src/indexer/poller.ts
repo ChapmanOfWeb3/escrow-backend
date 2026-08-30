@@ -19,7 +19,28 @@ import logger from "../utils/logger.js";
 
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
-const server = new Server(RPC_URL);
+
+// ---------------------------------------------------------------------------
+// RPC exponential backoff retry (#249)
+// ---------------------------------------------------------------------------
+// All RPC calls in the indexer poll loop go through RpcPollerClient, which
+// retries transient failures (timeouts, connection resets, rate limits, 5xx)
+// with a doubling backoff up to maxRetries, then resets on success.
+const rpcClient = new RpcPollerClient(RPC_URL, {
+  maxRetries: parseInt(process.env.INDEXER_RPC_MAX_RETRIES || "5", 10),
+  initialBackoffMs: parseInt(
+    process.env.INDEXER_RPC_INITIAL_BACKOFF_MS || "1000",
+    10,
+  ),
+  backoffMultiplier: parseInt(
+    process.env.INDEXER_RPC_BACKOFF_MULTIPLIER || "2",
+    10,
+  ),
+  maxBackoffMs: parseInt(
+    process.env.INDEXER_RPC_MAX_BACKOFF_MS || "30000",
+    10,
+  ),
+});
 
 const failureMonitor = getIndexerRunnerFailureMonitor();
 
