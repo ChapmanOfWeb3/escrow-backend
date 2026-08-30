@@ -1,6 +1,11 @@
 import type Database from "better-sqlite3";
 import { getDb, insertEvent, type EventRow } from "./db.js";
 import logger from "../utils/logger.js";
+import {
+  withRetry,
+  type RpcRetryConfig,
+  type RpcServerLike,
+} from "./rpc-poller-client.js";
 
 /**
  * indexer_metrics_collector – poller performance telemetry tracker.
@@ -17,6 +22,9 @@ import logger from "../utils/logger.js";
  * - Threshold alerting: consecutive collection failures and stalled
  *   collections raise warning alerts once the configured counts are reached
  *   (#338).
+ * - RPC health checks: `collectRpcHealthMetrics` retries transient RPC
+ *   connection timeouts with the same exponential backoff used by
+ *   rpc_poller_client, instead of a bespoke retry loop (#334).
  */
 
 export interface IndexerMetrics {
@@ -264,7 +272,11 @@ export const DEFAULT_METRICS_FAILURE_THRESHOLD = 3;
 /** Elapsed ms without a successful collection before a stall alert is raised. */
 export const DEFAULT_METRICS_STALL_THRESHOLD_MS = 120_000;
 
-export type IndexerMetricsFailureType = "collection" | "query" | "stall";
+export type IndexerMetricsFailureType =
+  | "collection"
+  | "query"
+  | "stall"
+  | "rpc_timeout";
 
 function readPositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -862,6 +874,74 @@ export function collectIndexerMetrics(
     monitor.recordFailure("collection", {
       error,
       operation: "collect_metrics",
+    });
+
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RPC health check with exponential backoff retry (#334)
+// ---------------------------------------------------------------------------
+
+export interface IndexerRpcHealthMetrics {
+  latestLedgerSequence: number;
+  collectedAt: string;
+}
+
+/**
+ * Check RPC connectivity by fetching the latest ledger, retrying transient
+ * connection timeouts with the same exponential backoff `withRetry` uses in
+ * rpc_poller_client rather than a bespoke retry loop. Retry frequency grows
+ * with each attempt (doubling by default) up to `maxRetries`.
+ *
+ * A failure that survives every retry is recorded on the shared failure
+ * monitor as `rpc_timeout` – surfacing through the existing threshold
+ * alerting (#338) – before being rethrown for the caller to handle.
+ */
+export async function collectRpcHealthMetrics(
+  server: RpcServerLike,
+  config: Partial<RpcRetryConfig> = {},
+): Promise<IndexerRpcHealthMetrics> {
+  const monitor = defaultMonitor;
+  const startedAt = performance.now();
+
+  try {
+    const { sequence } = await withRetry(
+      () => server.getLatestLedger(),
+      config,
+      `${COLLECTOR_NAME} rpc_health_check`,
+    );
+
+    const metrics: IndexerRpcHealthMetrics = {
+      latestLedgerSequence: sequence,
+      collectedAt: new Date().toISOString(),
+    };
+
+    monitor.recordSuccess();
+    logIndexerMetricsDiagnostics({
+      collector: COLLECTOR_NAME,
+      operation: "rpc_health_check",
+      status: "success",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      payloadSizeBytes: metricsPayloadSizeBytes(metrics),
+      lastIndexedLedger: sequence,
+    });
+
+    return metrics;
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+
+    logIndexerMetricsDiagnostics({
+      collector: COLLECTOR_NAME,
+      operation: "rpc_health_check",
+      status: "failure",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      error,
+    });
+    monitor.recordFailure("rpc_timeout", {
+      error,
+      operation: "rpc_health_check",
     });
 
     throw err;
