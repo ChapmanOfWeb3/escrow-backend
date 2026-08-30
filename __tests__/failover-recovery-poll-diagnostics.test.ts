@@ -23,7 +23,9 @@ describe("FailoverRecovery – poll diagnostics logging", () => {
   });
 
   it("logs a debug diagnostic string containing elapsed time and payload size", () => {
-    const debugSpy = jest.spyOn(logger, "debug").mockImplementation(() => logger);
+    const debugSpy = jest
+      .spyOn(logger, "debug")
+      .mockImplementation((() => logger) as never);
 
     const startedAt = Date.now() - 42;
     logPollDiagnostics("https://rpc.example.com", startedAt, 2048);
