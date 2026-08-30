@@ -1165,7 +1165,8 @@ export function addSubscription(
   eventTypes: string[]
 ): WebhookSubscription {
   const db = getDb();
-  const tx = db.transaction(() => {
+
+  const addTx = db.transaction(() => {
     const stmt = db.prepare(`
       INSERT OR IGNORE INTO webhook_subscriptions
       (contract_id, webhook_url, event_types)
@@ -1176,7 +1177,17 @@ export function addSubscription(
       .prepare("SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
       .get(contractId, webhookUrl) as WebhookSubscription;
   });
-  return tx();
+
+  try {
+    return addTx();
+  } catch (err) {
+    logger.error("addSubscription failed – transaction rolled back", {
+      contractId,
+      webhookUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }
 
 /**
@@ -1185,13 +1196,24 @@ export function addSubscription(
  */
 export function removeSubscription(contractId: string, webhookUrl: string): boolean {
   const db = getDb();
-  const tx = db.transaction(() => {
+
+  const removeTx = db.transaction(() => {
     const result = db
       .prepare("DELETE FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
       .run(contractId, webhookUrl);
     return result.changes > 0;
   });
-  return tx();
+
+  try {
+    return removeTx();
+  } catch (err) {
+    logger.error("removeSubscription failed – transaction rolled back", {
+      contractId,
+      webhookUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }
 
 export function getSubscriptions(): WebhookSubscription[] {
