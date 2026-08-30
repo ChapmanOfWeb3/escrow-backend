@@ -18,32 +18,18 @@ const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const server = new Server(RPC_URL);
 
-// ---------------------------------------------------------------------------
-// Alerting thresholds (#271)
-// ---------------------------------------------------------------------------
-const CONSECUTIVE_FAILURE_THRESHOLD = parseInt(
-  process.env.POLLER_FAILURE_THRESHOLD || "3",
-  10,
-);
-
-function getStallThresholdMs(): number {
-  return parseInt(process.env.POLLER_STALL_THRESHOLD_MS || "120000", 10);
-}
-
-let consecutiveFailures = 0;
-let lastSuccessfulPollAt: number | null = null;
+const failureMonitor = getIndexerRunnerFailureMonitor();
 
 export function getConsecutiveFailures(): number {
-  return consecutiveFailures;
+  return failureMonitor.getConsecutiveFailures();
 }
 
 export function getLastSuccessfulPollAt(): number | null {
-  return lastSuccessfulPollAt;
+  return failureMonitor.getLastSuccessfulAt();
 }
 
 export function resetFailureState(): void {
-  consecutiveFailures = 0;
-  lastSuccessfulPollAt = null;
+  resetIndexerRunnerFailureState();
 }
 
 // ---------------------------------------------------------------------------
@@ -122,17 +108,16 @@ export async function pollEvents(): Promise<boolean> {
     return false;
   }
 
-  // --- Diagnostics: stall detection before polling (#270, #271) ---
-  if (lastSuccessfulPollAt) {
-    const stallThresholdMs = getStallThresholdMs();
-    const elapsed = Date.now() - lastSuccessfulPollAt;
-    if (elapsed > stallThresholdMs) {
-      logger.warn("Poller stall detected – no successful poll for threshold period", {
-        elapsedMs: elapsed,
-        stallThresholdMs,
-        consecutiveFailures,
-      });
-    }
+  // --- Alerting: stall detection before polling (#253, #271) ---
+  failureMonitor.checkStall();
+  if (failureMonitor.getLastSuccessfulAt()) {
+    const elapsed = Date.now() - (failureMonitor.getLastSuccessfulAt() as number);
+    const stallThresholdMs = parseInt(
+      process.env.INDEXER_RUNNER_STALL_THRESHOLD_MS ||
+        process.env.POLLER_STALL_THRESHOLD_MS ||
+        String(failureMonitor.stallThresholdMs),
+      10,
+    );
     logger.debug("Poller stall diagnostics", {
       elapsedMsSinceLastSuccess: elapsed,
       stallThresholdMs,
@@ -229,12 +214,15 @@ export async function pollEvents(): Promise<boolean> {
       elapsedMs: Math.round(totalElapsed),
     });
 
-    // --- Alerting: warn when consecutive failures hit threshold (#271) ---
-    if (consecutiveFailures >= CONSECUTIVE_FAILURE_THRESHOLD) {
+    // Keep legacy poller alert message for existing #271 tests
+    if (
+      failureMonitor.getConsecutiveFailures() >=
+      failureMonitor.getFailureThreshold()
+    ) {
       logger.error("Poller alert: consecutive failure threshold exceeded", {
-        consecutiveFailures,
-        threshold: CONSECUTIVE_FAILURE_THRESHOLD,
-        lastSuccessAt: lastSuccessfulPollAt,
+        consecutiveFailures: failureMonitor.getConsecutiveFailures(),
+        threshold: failureMonitor.getFailureThreshold(),
+        lastSuccessAt: failureMonitor.getLastSuccessfulAt(),
       });
     }
 
