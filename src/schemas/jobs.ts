@@ -293,6 +293,30 @@ export const createJobDraftLegacyBodySchema = z.object({
     .min(1, "milestones must contain at least one entry"),
 });
 
+/**
+ * POST /:contractId/whitelist/update body.
+ * Validates the token address and the action (add/remove).
+ */
+export const whitelistUpdateBodySchema = z.object({
+  token: z
+    .string({
+      required_error: "token is required",
+      invalid_type_error: "token must be a string",
+    })
+    .min(1, "token cannot be empty")
+    .refine(isValidStellarContractId, {
+      message: "token must be a valid Stellar contract address (C...)",
+    }),
+  action: z
+    .enum(["add", "remove"], {
+      required_error: "action is required",
+      invalid_type_error: "action must be one of: add, remove",
+    }),
+  adminAddress: stellarAccountField("adminAddress"),
+}).strict();
+
+export type WhitelistUpdateBody = z.infer<typeof whitelistUpdateBodySchema>;
+
 export type CreateJobDraftLegacyBody = z.infer<typeof createJobDraftLegacyBodySchema>;
 
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;

@@ -51,9 +51,11 @@ import {
   byWalletQuerySchema,
   createJobDraftBodySchema,
   createJobDraftLegacyBodySchema,
+  whitelistUpdateBodySchema,
   type ByWalletQuery,
   type CreateJobDraftBody,
   type CreateJobDraftLegacyBody,
+  type WhitelistUpdateBody,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
