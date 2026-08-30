@@ -286,11 +286,9 @@ export function adjustIndexerRunnerPollInterval(
 
   state.lastLoadAdjustmentAt = Date.now();
 
-  logger.debug("indexer_runner throttle adjustment", {
-    processedEventCount,
-    currentIntervalMs: state.currentIntervalMs,
-    idleCycles: state.idleCycles,
-  });
-
+  // Deliberately silent: this runs once per poll, and the poller already emits
+  // a single consolidated diagnostics line per cycle. Logging here as well
+  // doubled every poll's debug output. The state is returned for callers that
+  // want to report it.
   return { ...state };
 }

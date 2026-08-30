@@ -32,10 +32,15 @@ const RPC_URL =
 // All RPC calls in the indexer poll loop go through RpcPollerClient, which
 // retries transient failures (timeouts, connection resets, rate limits, 5xx)
 // with a doubling backoff up to maxRetries, then resets on success.
+// Under test the backoff is collapsed to ~1ms: a rejected RPC mock would
+// otherwise spend ~31s walking the production backoff curve before the poll
+// reports failure, blowing past Jest's default timeout.
+const IS_TEST_ENV = process.env.NODE_ENV === "test";
+
 const rpcClient = new RpcPollerClient(RPC_URL, {
   maxRetries: parseInt(process.env.INDEXER_RPC_MAX_RETRIES || "5", 10),
   initialBackoffMs: parseInt(
-    process.env.INDEXER_RPC_INITIAL_BACKOFF_MS || "1000",
+    process.env.INDEXER_RPC_INITIAL_BACKOFF_MS || (IS_TEST_ENV ? "1" : "1000"),
     10,
   ),
   backoffMultiplier: parseInt(
@@ -43,7 +48,7 @@ const rpcClient = new RpcPollerClient(RPC_URL, {
     10,
   ),
   maxBackoffMs: parseInt(
-    process.env.INDEXER_RPC_MAX_BACKOFF_MS || "30000",
+    process.env.INDEXER_RPC_MAX_BACKOFF_MS || (IS_TEST_ENV ? "5" : "30000"),
     10,
   ),
 });

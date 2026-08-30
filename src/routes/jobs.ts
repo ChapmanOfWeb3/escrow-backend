@@ -1236,7 +1236,12 @@ router.post(
           } catch (err: any) {
             const errMsg = String(err?.message || err);
             const { status, message } = classifySimError(errMsg);
-            logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+            logger.error("Failed to prepare transaction for partial release", {
+              traceId,
+              contractId,
+              index,
+              error: errMsg,
+            });
             throw { status, message };
           }
 
