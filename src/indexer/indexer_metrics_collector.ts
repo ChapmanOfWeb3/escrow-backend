@@ -470,3 +470,228 @@ export function collectIndexerMetrics(
     throw err;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic historical sync ranges
+// ---------------------------------------------------------------------------
+
+/** Per-ledger ("block") event count, ascending by ledger sequence. */
+export interface IndexerHistoricalLedgerEventCount {
+  ledgerSequence: number;
+  eventCount: number;
+}
+
+export interface HistoricalMetricsRangeOptions {
+  /** Inclusive lower bound of the ledger range to import. */
+  startLedger: number;
+  /** Inclusive upper bound of the ledger range to import. */
+  endLedger: number;
+}
+
+export interface HistoricalMetricsResult {
+  range: { startLedger: number; endLedger: number };
+  /** Total events indexed within the requested range. */
+  totalEvents: number;
+  /** Event counts grouped by type, within the range. */
+  eventsByType: Record<string, number>;
+  /** Last indexed ledger in the overall database (not range-limited). */
+  lastIndexedLedger: number;
+  collectedAt: string;
+  /** Per-ledger ("block") event counts, ascending by ledger sequence. */
+  ledgerEventCounts: IndexerHistoricalLedgerEventCount[];
+  /** Number of distinct ledgers in the range that have at least one event. */
+  processedLedgerCount: number;
+}
+
+export interface HistoricalRangeValidation {
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * Validate an inclusive ledger range for historical metrics collection.
+ * Both values must be positive integers and startLedger must be ≤ endLedger.
+ */
+export function validateHistoricalRange(
+  startLedger: number,
+  endLedger: number,
+): HistoricalRangeValidation {
+  if (
+    typeof startLedger !== "number" ||
+    !Number.isInteger(startLedger) ||
+    startLedger < 1
+  ) {
+    return {
+      ok: false,
+      error: `startLedger must be a positive integer, got: ${startLedger}`,
+    };
+  }
+  if (
+    typeof endLedger !== "number" ||
+    !Number.isInteger(endLedger) ||
+    endLedger < 1
+  ) {
+    return {
+      ok: false,
+      error: `endLedger must be a positive integer, got: ${endLedger}`,
+    };
+  }
+  if (startLedger > endLedger) {
+    return {
+      ok: false,
+      error: `startLedger (${startLedger}) must be ≤ endLedger (${endLedger})`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Collect metrics for a custom historical ledger range, accepting dynamic
+ * start/end ledger values for custom historical event imports.
+ *
+ * The function validates the range, then queries the `events` table inside a
+ * transaction for a consistent snapshot. It returns per-ledger ("block") event
+ * counts so callers can assert the correct number of events were indexed for
+ * each block in the imported range.
+ *
+ * Unlike `collectIndexerMetrics` this never writes to the database and does not
+ * advance the live `last_ledger_sequence` pointer — it is purely a read-side
+ * verification of an already-completed historical import.
+ */
+export function collectHistoricalMetrics(
+  options: HistoricalMetricsRangeOptions,
+  targetDb?: Database.Database,
+): HistoricalMetricsResult {
+  const { startLedger, endLedger } = options;
+
+  const validation = validateHistoricalRange(startLedger, endLedger);
+  if (!validation.ok) {
+    throw new Error(validation.error);
+  }
+
+  const database = targetDb || getDb();
+  const monitor = defaultMonitor;
+  const startedAt = performance.now();
+
+  logIndexerMetricsDiagnostics({
+    collector: COLLECTOR_NAME,
+    operation: "collect_historical_metrics",
+    status: "started",
+    elapsedMs: 0,
+    startLedger,
+    endLedger,
+  });
+
+  const getMetricsTx = database.transaction(() => {
+    const lastLedgerRow = withStageDiagnostics(
+      "query_historical_last_ledger",
+      () =>
+        database
+          .prepare(
+            "SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'",
+          )
+          .get() as { value: string } | undefined,
+    );
+    const lastIndexedLedger = lastLedgerRow
+      ? parseInt(lastLedgerRow.value, 10)
+      : 0;
+
+    const totalRow = withStageDiagnostics(
+      "query_historical_total_events",
+      () =>
+        database
+          .prepare(
+            `SELECT COUNT(*) as count FROM events
+             WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+          )
+          .get(startLedger, endLedger) as { count: number },
+    );
+
+    const typeRows = withStageDiagnostics(
+      "query_historical_events_by_type",
+      () =>
+        database
+          .prepare(
+            `SELECT event_type, COUNT(*) as count FROM events
+             WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+             GROUP BY event_type`,
+          )
+          .all(startLedger, endLedger) as Array<{ event_type: string; count: number }>,
+    );
+
+    const eventsByType: Record<string, number> = {};
+    for (const row of typeRows) {
+      eventsByType[row.event_type] = row.count;
+    }
+
+    const ledgerRows = withStageDiagnostics(
+      "query_historical_ledger_event_counts",
+      () =>
+        database
+          .prepare(
+            `SELECT ledger_sequence, COUNT(*) as count FROM events
+             WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+             GROUP BY ledger_sequence
+             ORDER BY ledger_sequence ASC`,
+          )
+          .all(startLedger, endLedger) as Array<{
+            ledger_sequence: number;
+            count: number;
+          }>,
+    );
+
+    const ledgerEventCounts: IndexerHistoricalLedgerEventCount[] = ledgerRows.map(
+      (row) => ({
+        ledgerSequence: row.ledger_sequence,
+        eventCount: row.count,
+      }),
+    );
+
+    return {
+      range: { startLedger, endLedger },
+      totalEvents: totalRow ? totalRow.count : 0,
+      eventsByType,
+      lastIndexedLedger,
+      collectedAt: new Date().toISOString(),
+      ledgerEventCounts,
+      processedLedgerCount: ledgerEventCounts.length,
+    };
+  });
+
+  try {
+    const metrics = getMetricsTx();
+
+    monitor.recordSuccess();
+    logIndexerMetricsDiagnostics({
+      collector: COLLECTOR_NAME,
+      operation: "collect_historical_metrics",
+      status: "success",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      payloadSizeBytes: metricsPayloadSizeBytes(metrics),
+      startLedger,
+      endLedger,
+      totalEvents: metrics.totalEvents,
+      lastIndexedLedger: metrics.lastIndexedLedger,
+    });
+
+    return metrics;
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+
+    logIndexerMetricsDiagnostics({
+      collector: COLLECTOR_NAME,
+      operation: "collect_historical_metrics",
+      status: "failure",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      startLedger,
+      endLedger,
+      error,
+    });
+    monitor.recordFailure("collection", {
+      error,
+      operation: "collect_historical_metrics",
+    });
+
+    throw err;
+  }
+}
