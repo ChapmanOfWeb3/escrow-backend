@@ -1078,6 +1078,14 @@ describe("sqlite_vacuum_cleaner — failure alerting (#347)", () => {
   describe("runVacuumCleanup integration", () => {
     let testDb: Database.Database;
 
+    // Near-zero backoff so the retry path is exercised without real delays.
+    const fastConfig = {
+      maxRetries: 3,
+      initialBackoffMs: 1,
+      backoffMultiplier: 2,
+      maxBackoffMs: 5,
+    };
+
     beforeEach(() => {
       testDb = new Database(":memory:");
       setDb(testDb);

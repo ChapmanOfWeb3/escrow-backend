@@ -74,6 +74,7 @@ export const INDEXER_RUNNER_INDEXES = {
   eventsCreatedAt: "idx_events_created_at",
 } as const;
 
+/** Index names created by the schema-manager migration (#259). */
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
 // ---------------------------------------------------------------------------
@@ -191,8 +192,23 @@ const MIGRATIONS: Migration[] = [
         ON webhook_subscriptions (webhook_url);
     `,
   },
+  {
+    version: 8,
+    description: "add event_type_filter lookup indexes (#276)",
+    // The topic filter groups and filters by event_type. Migration 3 indexed
+    // (contract_id, event_type), which cannot serve a bare event_type
+    // predicate because event_type is not the leading column.
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_event_type
+        ON events (contract_id, event_type);
+    `,
+  },
 ];
 
+/** Index names created by the SQLite schema manager lookup-index migration (#259). */
 /**
  * Migration versions this build ships, ascending. Callers compare these
  * against `schema_migrations` to detect a database that is behind the code.
@@ -201,6 +217,7 @@ export function getShippedMigrationVersions(): number[] {
   return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
 }
 
+/** Index names created by the version-5 migration (#259), for test assertions. */
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
 // Retries transient SQLite / connection / timeout failures during migrations.
@@ -356,13 +373,18 @@ export async function withSchemaRetry<T>(
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
  */
-export function runMigrations(): void {
+export function runMigrations(
+  retryConfig: Partial<SchemaRetryConfig> = {},
+): void {
   const monitor = getSqliteSchemaManagerFailureMonitor();
   monitor.checkStall();
   const startedAt = performance.now();
-  const database = getDb();
   let failureRecorded = false;
 
+  try {
+  const database = getDb();
+
+  const runAll = database.transaction(() => {
   // Bootstrap: create the migrations tracking table if it doesn't exist yet
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -410,15 +432,42 @@ export function runMigrations(): void {
     });
 
     try {
-      applyMigration();
+      // Transient SQLite failures (locked/busy database) are retried with
+      // backoff; the savepoint means a failed attempt leaves nothing behind.
+      withSchemaRetrySync(
+        applyMigration,
+        retryConfig,
+        `migration_${migration.version}`,
+      );
       logger.info("Migration applied", { version: migration.version });
     } catch (err) {
       logger.error("Migration failed – rolled back", {
         version: migration.version,
         error: err instanceof Error ? err.message : String(err),
       });
+      monitor.recordFailure("migration", {
+        error: err instanceof Error ? err.message : String(err),
+        version: migration.version,
+        description: migration.description,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      failureRecorded = true;
       throw err;
     }
+  }
+  });
+
+    runAll();
+    monitor.recordSuccess();
+  } catch (err) {
+    // A bootstrap failure never reached the per-migration handler above.
+    if (!failureRecorded) {
+      monitor.recordFailure("bootstrap", {
+        error: err instanceof Error ? err.message : String(err),
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+    }
+    throw err;
   }
 }
 
@@ -963,6 +1012,24 @@ export function insertEventBatch(events: EventRow[], newLedger: number): void {
   );
 }
 
+/**
+ * Insert a batch of events WITHOUT touching the live indexer_state ledger
+ * pointer. Used for custom historical event imports (event_type_filter's
+ * dynamic start/end ledger support) so a backfill over an arbitrary past
+ * range can never advance or rewind last_ledger_sequence - only the live
+ * poller (insertEventBatch, driven strictly by lastLedger+1..currentLedger)
+ * is allowed to move that pointer. Rows still go through INSERT OR IGNORE
+ * against the same UNIQUE(contract_id, ledger_sequence, event_type)
+ * constraint, so re-running a historical import is idempotent exactly like
+ * the live poller.
+ *
+ * Returns the number of rows actually inserted (excludes rows ignored as
+ * duplicates).
+ *
+ * Superseded by the range-validating overload defined later in this file,
+ * which every caller uses.
+ */
+
 // ---------------------------------------------------------------------------
 // In-memory event queue locks for concurrent inserts (#260)
 // ---------------------------------------------------------------------------
@@ -1086,6 +1153,24 @@ export async function insertEventBatchLocked(
     insertEventBatch(events, newLedger);
   });
 }
+
+/**
+ * Insert a batch of events WITHOUT touching the live indexer_state ledger
+ * pointer. Used for custom historical event imports (event_type_filter's
+ * dynamic start/end ledger support) so a backfill over an arbitrary past
+ * range can never advance or rewind last_ledger_sequence - only the live
+ * poller (insertEventBatch, driven strictly by lastLedger+1..currentLedger)
+ * is allowed to move that pointer. Rows still go through INSERT OR IGNORE
+ * against the same UNIQUE(contract_id, ledger_sequence, event_type)
+ * constraint, so re-running a historical import is idempotent exactly like
+ * the live poller.
+ *
+ * Returns the number of rows actually inserted (excludes rows ignored as
+ * duplicates).
+ *
+ * Superseded by the range-validating overload defined later in this file,
+ * which every caller uses.
+ */
 
 // ---------------------------------------------------------------------------
 // Event queries

@@ -1,6 +1,5 @@
 import { jest } from "@jest/globals";
 import Database from "better-sqlite3";
-import { jest } from "@jest/globals";
 import { setDb, runMigrations } from "../src/indexer/db.js";
 import {
   initializeNodeHealthTables,

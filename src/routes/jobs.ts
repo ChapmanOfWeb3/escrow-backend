@@ -165,6 +165,21 @@ export function resetPartialReleaseCache(): void {
   inFlightPartialReleaseRequests.clear();
 }
 
+/**
+ * Cache key for a partial-release build. The amount and source address are
+ * part of the key because each combination produces a different unsigned
+ * transaction — keying on the contract and milestone alone would serve one
+ * caller another caller's XDR.
+ */
+function partialReleaseCacheKey(
+  contractId: string,
+  index: string | number,
+  amount: unknown,
+  sourceAddress: string,
+): string {
+  return `${contractId}:${index}:${String(amount)}:${sourceAddress}`;
+}
+
 // ---------------------------------------------------------------------------
 // Simulation error helpers  (#83)
 // ---------------------------------------------------------------------------
@@ -1183,6 +1198,27 @@ router.post(
         return;
       }
 
+      const cacheKey = partialReleaseCacheKey(
+        contractId as string,
+        index as string,
+        amount,
+        sourceAddress,
+      );
+
+      logger.debug("Checking partial-release cache", { traceId, contractId, index, cacheKey });
+      const cachedXdr = partialReleaseCache.get<string>(cacheKey);
+      if (cachedXdr !== undefined) {
+        logger.info("Partial-release XDR served from cache", {
+          traceId,
+          contractId,
+          index,
+          source: "cache",
+          xdrLength: cachedXdr.length,
+        });
+        res.json({ success: true, xdr: cachedXdr });
+        return;
+      }
+
       let requestPromise = inFlightPartialReleaseRequests.get(cacheKey);
       const servedFromInFlight = Boolean(requestPromise);
 
@@ -1210,7 +1246,12 @@ router.post(
           } catch (err: any) {
             const errMsg = String(err?.message || err);
             const { status, message } = classifySimError(errMsg);
-            logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
+            logger.error("Failed to prepare transaction for partial release", {
+              traceId,
+              contractId,
+              index,
+              error: errMsg,
+            });
             throw { status, message };
           }
 

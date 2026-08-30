@@ -60,13 +60,9 @@ describe("Indexer Database", () => {
     });
 
     it("does not re-apply already-applied migrations (idempotent)", () => {
-      const before = testDb
-        .prepare("SELECT version FROM schema_migrations ORDER BY version")
-        .all() as Array<{ version: number }>;
-
       // Running again should not throw and should not duplicate rows
       const before = testDb
-        .prepare("SELECT version FROM schema_migrations")
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .all() as Array<{ version: number }>;
 
       runMigrations();
