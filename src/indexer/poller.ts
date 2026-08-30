@@ -312,11 +312,17 @@ export async function fetchHistoricalEvents(
 
     eventsFound += pageEvents.length;
 
-    const batch: EventRow[] = pageEvents.map((event) =>
-      toEventRow(event, contractIds[0] ?? ""),
-    );
-    const result = insertHistoricalEventBatch(batch, { startLedger, endLedger });
-    eventsImported += result.inserted;
+    const batch: EventRow[] = pageEvents
+      .map((event) => toEventRow(event, contractIds[0] ?? ""))
+      .filter(
+        (row) =>
+          row.ledgerSequence >= startLedger && row.ledgerSequence <= endLedger,
+      );
+
+    if (batch.length > 0) {
+      const result = insertHistoricalEventBatch(batch, { startLedger, endLedger });
+      eventsImported += result.inserted;
+    }
 
     cursor = page?.cursor;
     if (pageEvents.length < HISTORICAL_PAGE_SIZE || !cursor) break;
@@ -434,6 +440,27 @@ export async function pollEvents(): Promise<boolean> {
     // Validate the schema before matching events against EVENT_TYPES – a stale
     // schema must not silently pass through the topic filter (#282).
     verifySchemaUpToDate();
+
+    // --- Dynamic historical sync ranges (#254) ---
+    // With LEDGER_RANGE_START/END set the poller imports that inclusive window
+    // instead of following the chain head, and leaves the live ledger pointer
+    // untouched so a backfill cannot disturb live indexing.
+    const rangeStartRaw = process.env.LEDGER_RANGE_START;
+    const rangeEndRaw = process.env.LEDGER_RANGE_END;
+    if (rangeStartRaw || rangeEndRaw) {
+      const rangeStart = parseInt(rangeStartRaw ?? rangeEndRaw ?? "0", 10);
+      const rangeEnd = parseInt(rangeEndRaw ?? rangeStartRaw ?? "0", 10);
+
+      const imported = await fetchHistoricalEvents(rangeStart, rangeEnd);
+      failureMonitor.recordSuccess();
+
+      logger.info("Historical range import cycle complete", {
+        startLedger: rangeStart,
+        endLedger: rangeEnd,
+        ...imported,
+      });
+      return true;
+    }
 
     const lastLedger = getLastIndexedLedger();
     const currentLedger = (await rpcClient.getLatestLedger()).sequence;
