@@ -818,7 +818,7 @@ export function validateIndexerMetricsSchema(
     const absent = requiredColumns.filter((c) => !columns.includes(c));
     if (absent.length > 0) {
       missingColumns[table] = absent;
-      errors.push(`Missing columns on ${table}: ${absent.join(", ")}`);
+      errors.push(`Missing columns in ${table}: ${absent.join(", ")}`);
     }
   }
 

@@ -78,6 +78,7 @@ export function getLastSuccessfulPollAt(): number | null {
 
 export function resetFailureState(): void {
   failureMonitor.reset();
+  resetPollDiagnosticsThrottle();
 }
 
 // ---------------------------------------------------------------------------
@@ -127,25 +128,45 @@ function toEventRow(event: any, fallbackContractId: string): EventRow {
 // ---------------------------------------------------------------------------
 
 const POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS = parseInt(
-  process.env.POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS || "0",
+  process.env.POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS || "60000",
   10,
 );
 let lastPollDiagnosticAt = 0;
+let stallWindowReported = false;
+
+interface StallWindow {
+  elapsedMsSinceLastSuccess: number;
+  stallThresholdMs: number;
+}
 
 /** Clear the diagnostics throttle so the next poll logs unconditionally. */
 export function resetPollDiagnosticsThrottle(): void {
   lastPollDiagnosticAt = 0;
+  stallWindowReported = false;
 }
 
 /**
- * Debug line carrying poll duration and payload size for one cycle.
+ * One debug line per poll carrying duration and payload size.
+ *
+ * Only byte counts are logged, never the payload itself — event data carries
+ * participant wallet addresses and amounts that have no business in a log.
  *
  * Throttled to at most one line per POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS so a
- * fast poll loop cannot flood the log; the interval defaults to 0 (every poll).
+ * fast poll loop cannot flood the log.
  */
-function logPollDiagnostics(elapsedMs: number, batch: EventRow[]): void {
+function logPollDiagnostics(
+  elapsedMs: number,
+  batch: EventRow[],
+  stall: StallWindow | null = null,
+): void {
   const now = Date.now();
+
+  // The first line carrying a stall window is new information, so it is never
+  // throttled away; repeats of it are.
+  const stallWindowIsNews = stall !== null && !stallWindowReported;
+
   if (
+    !stallWindowIsNews &&
     POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS > 0 &&
     lastPollDiagnosticAt > 0 &&
     now - lastPollDiagnosticAt < POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS
@@ -153,14 +174,31 @@ function logPollDiagnostics(elapsedMs: number, batch: EventRow[]): void {
     return;
   }
   lastPollDiagnosticAt = now;
+  if (stall !== null) stallWindowReported = true;
+
+  const totalPayloadBytes = batch.reduce(
+    (sum, row) => sum + Buffer.byteLength(row.dataJson, "utf8"),
+    0,
+  );
+  const avgPayloadBytes =
+    batch.length > 0 ? Math.round(totalPayloadBytes / batch.length) : 0;
+  const rounded = Math.round(elapsedMs);
+
+  const stallSegment = stall
+    ? ` | Poller stall diagnostics elapsedMsSinceLastSuccess=${stall.elapsedMsSinceLastSuccess}` +
+      ` stallThresholdMs=${stall.stallThresholdMs}`
+    : "";
 
   logger.debug(
-    `Indexer poll diagnostics elapsedMs=${Math.round(elapsedMs)} ` +
-      `payloadSizeBytes=${JSON.stringify(batch).length}`,
+    `RPC getEvents diagnostics elapsedMs=${rounded} payloadSizeBytes=${totalPayloadBytes}` +
+      stallSegment,
     {
-      elapsedMs: Math.round(elapsedMs),
-      payloadSizeBytes: JSON.stringify(batch).length,
+      elapsedMs: rounded,
+      payloadSizeBytes: totalPayloadBytes,
+      totalPayloadBytes,
+      avgPayloadBytes,
       eventCount: batch.length,
+      ...(stall ?? {}),
     },
   );
 }
@@ -361,19 +399,26 @@ export async function pollEvents(): Promise<boolean> {
   }
 
   // --- Alerting: stall detection before polling (#253, #271) ---
-  failureMonitor.checkStall();
-  if (failureMonitor.getLastSuccessfulAt()) {
-    const elapsed = Date.now() - (failureMonitor.getLastSuccessfulAt() as number);
+  const lastSuccessAt = failureMonitor.getLastSuccessfulAt();
+  let stallWindow: StallWindow | null = null;
+
+  if (lastSuccessAt) {
+    const elapsedMsSinceLastSuccess = Date.now() - lastSuccessAt;
     const stallThresholdMs = parseInt(
       process.env.INDEXER_RUNNER_STALL_THRESHOLD_MS ||
         process.env.POLLER_STALL_THRESHOLD_MS ||
         String(failureMonitor.stallThresholdMs),
       10,
     );
-    logger.debug("Poller stall diagnostics", {
-      elapsedMsSinceLastSuccess: elapsed,
-      stallThresholdMs,
-    });
+    stallWindow = { elapsedMsSinceLastSuccess, stallThresholdMs };
+
+    if (elapsedMsSinceLastSuccess > stallThresholdMs) {
+      logger.warn("Poller stall detected – no successful poll for threshold period", {
+        elapsedMs: elapsedMsSinceLastSuccess,
+        stallThresholdMs,
+        consecutiveFailures: failureMonitor.getConsecutiveFailures(),
+      });
+    }
   }
 
   const pollStart = performance.now();
@@ -403,16 +448,6 @@ export async function pollEvents(): Promise<boolean> {
     });
     const eventsElapsed = performance.now() - eventsStart;
 
-    // --- Diagnostics: payload size and timing (#270) ---
-    const payloadSizeBytes = JSON.stringify(events.events).length;
-    logger.debug("RPC getEvents diagnostics", {
-      elapsedMs: Math.round(eventsElapsed),
-      payloadSizeBytes,
-      eventCount: events.events.length,
-      startLedger,
-      currentLedger,
-    });
-
     // Build the batch to be written atomically (#84)
     const batch: EventRow[] = events.events.map((event) =>
       toEventRow(event, contractIds[0])
@@ -436,7 +471,7 @@ export async function pollEvents(): Promise<boolean> {
       pollIntervalMs: throttleState.currentIntervalMs,
     });
 
-    logPollDiagnostics(performance.now() - pollStartedAt, batch);
+    logPollDiagnostics(performance.now() - pollStartedAt, batch, stallWindow);
 
     deliverWebhooks(startLedger, currentLedger).catch((err) =>
       logger.error("Error delivering webhooks", {

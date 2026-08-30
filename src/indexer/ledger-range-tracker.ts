@@ -53,7 +53,34 @@ export function verifyLedgerRangeTrackerSchema(): LedgerRangeSchemaReport {
     const absent = requiredColumns.filter((c) => !columns.includes(c));
     if (absent.length > 0) {
       missingColumns[table] = absent;
-      errors.push(`missing columns on ${table}: ${absent.join(", ")}`);
+      errors.push(`missing columns in ${table}: ${absent.join(", ")}`);
+    }
+  }
+
+  // A hole in the applied migration versions means some migrations ran and
+  // others did not — the tracker's tables may exist but be the wrong shape.
+  if (!missingTables.includes("schema_migrations")) {
+    try {
+      const applied = (
+        database
+          .prepare("SELECT version FROM schema_migrations ORDER BY version")
+          .all() as Array<{ version: number }>
+      ).map((r) => r.version);
+
+      if (applied.length > 0) {
+        const gaps: number[] = [];
+        for (let v = applied[0]; v < applied[applied.length - 1]; v++) {
+          if (!applied.includes(v)) gaps.push(v);
+        }
+        if (gaps.length > 0) {
+          errors.push(
+            `migration version gap – missing applied migrations: ${gaps.join(", ")}`,
+          );
+        }
+      }
+    } catch {
+      // schema_migrations exists but is unreadable; the table checks above
+      // already describe the damage.
     }
   }
 
@@ -70,13 +97,15 @@ export function assertLedgerRangeTrackerSchemaValid(): void {
   const report = verifyLedgerRangeTrackerSchema();
   if (report.valid) return;
 
-  logger.error("ledger_range_tracker schema verification failed", {
+  logger.error("LedgerRangeTracker schema verification failed", {
     missingTables: report.missingTables,
     missingColumns: report.missingColumns,
+    errors: report.errors,
   });
 
   throw new Error(
-    `ledger_range_tracker: database schema is out of sync – ${report.errors.join("; ")}`,
+    `LedgerRangeTracker schema verification failed – the tracker cannot start: ` +
+      report.errors.join("; "),
   );
 }
 
