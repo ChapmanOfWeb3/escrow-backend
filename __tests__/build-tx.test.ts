@@ -447,6 +447,7 @@ describe("POST /api/jobs/build-tx — in-memory caching (duplicate network hits)
   });
 });
 
+<<<<<<< HEAD
 // ---------------------------------------------------------------------------
 // Winston logger traces (#109)
 // ---------------------------------------------------------------------------
@@ -646,3 +647,39 @@ describe("POST /api/jobs/build-tx — Winston traces (#109)", () => {
     expect(meta.contractId).toBe(VALID_BODY.contractId);
   });
 });
+=======
+describe('POST /api/jobs/build-tx � CORS and security headers', () => {
+  it('rejects requests from unauthorized origins', async () => {
+    const res = await request(app)
+      .post('/api/jobs/build-tx')
+      .set('Origin', 'http://malicious.com')
+      .send({})
+      .expect(403);
+    expect(res.body).toEqual({
+      success: false,
+      error: 'Origin not allowed by CORS policy',
+    });
+  });
+
+  it('allows trusted origins and sets CORS response headers', async () => {
+    const res = await request(app)
+      .post('/api/jobs/build-tx')
+      .set('Origin', 'http://localhost:3000')
+      .send({}) // send empty body to trigger 400 validation error, but cors should pass first
+      .expect(400); 
+    expect(res.headers['access-control-allow-origin']).toBe('http://localhost:3000');
+    expect(res.headers['access-control-allow-methods']).toContain('POST');
+  });
+
+  it('sets security headers', async () => {
+    const res = await request(app)
+      .post('/api/jobs/build-tx')
+      .set('Origin', 'http://localhost:3000')
+      .send({})
+      .expect(400);
+    expect(res.headers['x-frame-options']).toBe('DENY');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+  });
+});
+
+>>>>>>> pr/385
