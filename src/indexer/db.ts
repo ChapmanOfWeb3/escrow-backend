@@ -4,6 +4,9 @@ import { fileURLToPath } from "url";
 import fs from "fs";
 import NodeCache from "node-cache";
 import logger from "../utils/logger.js";
+import {
+  getSqliteSchemaManagerFailureMonitor,
+} from "./sqlite_schema_manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -61,6 +64,22 @@ export function resetJobsByWalletCache(): void {
   jobsByWalletCache.flushAll();
   inFlightJobsByWalletRequests.clear();
 }
+
+/**
+ * Index names used by the indexer_runner execution loop – validated via
+ * EXPLAIN QUERY PLAN (#250).
+ */
+export const INDEXER_RUNNER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+} as const;
+
+/** Index names created by the schema-manager migration (#259). */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
 
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
@@ -156,13 +175,37 @@ const MIGRATIONS: Migration[] = [
   },
   {
     version: 6,
-    description: "add indexer_metrics_collector aggregation index (#335)",
+    description: "add sqlite_vacuum_cleaner lookup indexes (#344)",
     up: `
-      CREATE INDEX IF NOT EXISTS idx_events_event_type
-        ON events (event_type);
+      CREATE INDEX IF NOT EXISTS idx_events_created_at
+        ON events (created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_sequence
+        ON events (ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_created_at_ledger
+        ON events (created_at, ledger_sequence);
+
+      CREATE INDEX IF NOT EXISTS idx_events_ledger_created_at
+        ON events (ledger_sequence, created_at);
+    `,
+  },
+  {
+    version: 7,
+    description: "add database_writer_pool write-path lookup indexes (#326)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_webhook_url
+        ON webhook_subscriptions (webhook_url);
     `,
   },
 ];
+
+/** Index names created by the SQLite schema manager lookup-index migration (#259). */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
 
 /**
  * Migration versions this build ships, ascending. Callers compare these
@@ -171,6 +214,13 @@ const MIGRATIONS: Migration[] = [
 export function getShippedMigrationVersions(): number[] {
   return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
 }
+
+/** Index names created by the version-5 migration (#259), for test assertions. */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
 
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
@@ -328,7 +378,11 @@ export async function withSchemaRetry<T>(
  * pending migrations in version order, each wrapped in its own transaction.
  */
 export function runMigrations(): void {
+  const monitor = getSqliteSchemaManagerFailureMonitor();
+  monitor.checkStall();
+  const startedAt = performance.now();
   const database = getDb();
+  let failureRecorded = false;
 
   // Bootstrap: create the migrations tracking table if it doesn't exist yet
   database.exec(`
@@ -439,6 +493,23 @@ export function verifySchemaUpToDate(): void {
 // ---------------------------------------------------------------------------
 // Schema verification hooks (#264)
 // ---------------------------------------------------------------------------
+
+/**
+ * Index names created by the schema manager migrations. Exported so modules
+ * and tests can assert the exact lookup indexes the schema manager relies on
+ * without hardcoding names (#259).
+ */
+export const SCHEMA_MANAGER_INDEXES = [
+  "idx_events_contract_id",
+  "idx_events_ledger_sequence",
+  "idx_events_contract_ledger",
+  "idx_events_contract_type",
+  "idx_webhook_subscriptions_contract",
+  "idx_events_ledger_event_type",
+  "idx_monitored_contracts_active",
+  "idx_events_created_at",
+  "idx_events_contract_type_ledger",
+] as const;
 
 export interface SchemaVerificationResult {
   valid: boolean;
@@ -857,15 +928,32 @@ export interface EventRow {
 }
 
 /**
+ * Emit a sqlite_schema_manager poll diagnostics debug log. Always includes
+ * elapsedMs so log-based validation can assert timing fields are present (#261).
+ */
+export function logSchemaManagerPollDiagnostics(
+  operation: string,
+  startedAtMs: number,
+  payloadSizeBytes: number,
+): void {
+  const elapsedMs = Date.now() - startedAtMs;
+  logger.debug(
+    `sqlite_schema_manager poll diagnostics operation=${operation} elapsedMs=${elapsedMs} payloadSizeBytes=${payloadSizeBytes}`,
+    { operation, elapsedMs, payloadSizeBytes },
+  );
+}
+
+/**
  * Atomically insert a batch of events AND advance the ledger pointer.
  * If any insertion fails the entire batch and the ledger update are rolled back,
  * so the indexer pointer never advances past un-committed data (#84).
  */
 export function insertEventBatch(events: EventRow[], newLedger: number): void {
   const db = getDb();
+  const startedAt = Date.now();
 
   const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO events 
+    INSERT OR IGNORE INTO events
     (contract_id, event_type, ledger_sequence, timestamp, data_json)
     VALUES (?, ?, ?, ?, ?)
   `);
@@ -888,6 +976,177 @@ export function insertEventBatch(events: EventRow[], newLedger: number): void {
   });
 
   batchTransaction();
+
+  logSchemaManagerPollDiagnostics(
+    "insertEventBatch",
+    startedAt,
+    Buffer.byteLength(JSON.stringify(events), "utf8"),
+  );
+}
+
+/**
+ * Insert a batch of events WITHOUT touching the live indexer_state ledger
+ * pointer. Used for custom historical event imports (event_type_filter's
+ * dynamic start/end ledger support) so a backfill over an arbitrary past
+ * range can never advance or rewind last_ledger_sequence - only the live
+ * poller (insertEventBatch, driven strictly by lastLedger+1..currentLedger)
+ * is allowed to move that pointer. Rows still go through INSERT OR IGNORE
+ * against the same UNIQUE(contract_id, ledger_sequence, event_type)
+ * constraint, so re-running a historical import is idempotent exactly like
+ * the live poller.
+ *
+ * Returns the number of rows actually inserted (excludes rows ignored as
+ * duplicates).
+ */
+export function insertHistoricalEventBatch(events: EventRow[]): number {
+  const db = getDb();
+
+  const insertStmt = db.prepare(`
+    INSERT OR IGNORE INTO events
+    (contract_id, event_type, ledger_sequence, timestamp, data_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const batchTransaction = db.transaction(() => {
+    let inserted = 0;
+    for (const ev of events) {
+      const result = insertStmt.run(
+        ev.contractId,
+        ev.eventType,
+        ev.ledgerSequence,
+        ev.timestamp,
+        ev.dataJson
+      );
+      if (result.changes > 0) inserted++;
+    }
+    return inserted;
+  });
+
+  return batchTransaction();
+}
+
+// ---------------------------------------------------------------------------
+// In-memory event queue locks for concurrent inserts (#260)
+// ---------------------------------------------------------------------------
+// Concurrent RPC notifications routinely carry the same event more than once
+// (retried pages, overlapping poll windows, several producers in one
+// process). insertEvent / insertEventBatch already rely on INSERT OR IGNORE +
+// the UNIQUE constraint to keep the events table itself duplicate-free, but
+// two async callers racing on the same event identity still both perform the
+// (redundant) insert work concurrently. These locked wrappers serialize per
+// event identity – keyed on contract_id|ledger_sequence|event_type – so
+// exactly one caller does the work for a given event; unrelated events still
+// persist concurrently.
+
+const eventInsertLockTails = new Map<string, Promise<void>>();
+
+/** Optional hook used by tests to observe/gate lock acquisition (#260). */
+let eventInsertLockHookForTests: ((key: string) => Promise<void>) | null = null;
+
+function eventInsertLockKey(
+  contractId: string,
+  ledgerSequence: number,
+  eventType: string
+): string {
+  return `${contractId}:${ledgerSequence}:${eventType}`;
+}
+
+/** Test helper – drop all in-memory insert locks between cases. */
+export function resetEventInsertLocksForTests(): void {
+  eventInsertLockTails.clear();
+  eventInsertLockHookForTests = null;
+}
+
+/** Test helper – observe or gate lock acquisition in concurrency tests. */
+export function setEventInsertLockHookForTests(
+  hook: ((key: string) => Promise<void>) | null
+): void {
+  eventInsertLockHookForTests = hook;
+}
+
+/** Event identities currently locked/queued – exposed for concurrency assertions. */
+export function getEventInsertLockCount(): number {
+  return eventInsertLockTails.size;
+}
+
+async function withEventInsertLock<T>(
+  key: string,
+  fn: () => T | Promise<T>
+): Promise<T> {
+  const previous = eventInsertLockTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => gate, () => gate);
+  eventInsertLockTails.set(key, tail);
+
+  try {
+    await previous.catch(() => undefined);
+    if (eventInsertLockHookForTests) {
+      await eventInsertLockHookForTests(key);
+    }
+    return await fn();
+  } finally {
+    release();
+    if (eventInsertLockTails.get(key) === tail) {
+      eventInsertLockTails.delete(key);
+    }
+  }
+}
+
+async function acquireEventLocksInOrder(
+  keys: string[],
+  fn: () => void
+): Promise<void> {
+  if (keys.length === 0) {
+    fn();
+    return;
+  }
+  const [head, ...tail] = keys;
+  await withEventInsertLock(head, () => acquireEventLocksInOrder(tail, fn));
+}
+
+/**
+ * Lock-protected variant of insertEvent for concurrent async notification
+ * producers (#260). Serializes calls that share the same (contract_id,
+ * ledger_sequence, event_type) identity, so overlapping notifications for the
+ * same event cannot race each other into duplicate work.
+ */
+export async function insertEventLocked(
+  contractId: string,
+  eventType: string,
+  ledgerSequence: number,
+  timestamp: number,
+  dataJson: string
+): Promise<boolean> {
+  const key = eventInsertLockKey(contractId, ledgerSequence, eventType);
+  return withEventInsertLock(key, () =>
+    insertEvent(contractId, eventType, ledgerSequence, timestamp, dataJson)
+  );
+}
+
+/**
+ * Lock-protected variant of insertEventBatch (#260). Acquires the lock for
+ * every distinct event identity in the batch, in sorted order, before running
+ * the batch transaction – so a concurrent insertEventLocked /
+ * insertEventBatchLocked call sharing an identity waits its turn.
+ */
+export async function insertEventBatchLocked(
+  events: EventRow[],
+  newLedger: number
+): Promise<void> {
+  const keys = [
+    ...new Set(
+      events.map((ev) =>
+        eventInsertLockKey(ev.contractId, ev.ledgerSequence, ev.eventType)
+      )
+    ),
+  ].sort();
+
+  await acquireEventLocksInOrder(keys, () => {
+    insertEventBatch(events, newLedger);
+  });
 }
 
 /**
@@ -1165,7 +1424,8 @@ export function addSubscription(
   eventTypes: string[]
 ): WebhookSubscription {
   const db = getDb();
-  const tx = db.transaction(() => {
+
+  const addTx = db.transaction(() => {
     const stmt = db.prepare(`
       INSERT OR IGNORE INTO webhook_subscriptions
       (contract_id, webhook_url, event_types)
@@ -1176,7 +1436,17 @@ export function addSubscription(
       .prepare("SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
       .get(contractId, webhookUrl) as WebhookSubscription;
   });
-  return tx();
+
+  try {
+    return addTx();
+  } catch (err) {
+    logger.error("addSubscription failed – transaction rolled back", {
+      contractId,
+      webhookUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }
 
 /**
@@ -1185,13 +1455,24 @@ export function addSubscription(
  */
 export function removeSubscription(contractId: string, webhookUrl: string): boolean {
   const db = getDb();
-  const tx = db.transaction(() => {
+
+  const removeTx = db.transaction(() => {
     const result = db
       .prepare("DELETE FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
       .run(contractId, webhookUrl);
     return result.changes > 0;
   });
-  return tx();
+
+  try {
+    return removeTx();
+  } catch (err) {
+    logger.error("removeSubscription failed – transaction rolled back", {
+      contractId,
+      webhookUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }
 
 export function getSubscriptions(): WebhookSubscription[] {
@@ -1235,4 +1516,180 @@ export function getIndexerStatusData(): IndexerStatusData {
     lastEventAt: lastEventRow.last_at,
     eventsByType,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic historical sync ranges for custom event imports (#263)
+// ---------------------------------------------------------------------------
+// Lets callers (backfill scripts, admin tooling, tests) hand sqlite_schema_manager
+// an arbitrary, explicit start/end ledger range for a one-off historical import,
+// with the range validated up front and the live `last_ledger_sequence` pointer
+// left untouched unless the caller explicitly opts in to advancing it.
+
+export class HistoricalRangeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HistoricalRangeError";
+  }
+}
+
+export interface HistoricalLedgerRange {
+  startLedger: number;
+  endLedger: number;
+}
+
+function isValidLedgerValue(value: unknown): value is number {
+  return (
+    typeof value === "number" && Number.isInteger(value) && value >= 1
+  );
+}
+
+/**
+ * Validate an inclusive [startLedger, endLedger] range for a custom
+ * historical import. Throws HistoricalRangeError for non-integers, values
+ * below 1, or start > end.
+ */
+export function validateHistoricalRange(
+  startLedger: unknown,
+  endLedger: unknown,
+): HistoricalLedgerRange {
+  if (!isValidLedgerValue(startLedger)) {
+    throw new HistoricalRangeError(
+      `start ledger must be a positive integer, received ${String(startLedger)}`,
+    );
+  }
+  if (!isValidLedgerValue(endLedger)) {
+    throw new HistoricalRangeError(
+      `end ledger must be a positive integer, received ${String(endLedger)}`,
+    );
+  }
+  if (startLedger > endLedger) {
+    throw new HistoricalRangeError(
+      `start ledger must not exceed end ledger (start=${startLedger}, end=${endLedger})`,
+    );
+  }
+  return { startLedger, endLedger };
+}
+
+export interface InsertHistoricalEventBatchOptions {
+  /** Advance indexer_state.last_ledger_sequence to endLedger once the import commits. */
+  advanceLivePointer?: boolean;
+}
+
+export interface InsertHistoricalEventBatchResult {
+  inserted: number;
+  range: HistoricalLedgerRange;
+}
+
+/**
+ * Atomically insert a batch of events for a custom historical range.
+ *
+ * Unlike insertEventBatch (used by the live poller), this never advances the
+ * live ledger pointer unless advanceLivePointer is explicitly requested, and
+ * it rejects any event whose ledger_sequence falls outside the declared
+ * range so a mistyped range can't silently import the wrong window.
+ */
+export function insertHistoricalEventBatch(
+  events: EventRow[],
+  range: { startLedger: unknown; endLedger: unknown },
+  options: InsertHistoricalEventBatchOptions = {},
+): InsertHistoricalEventBatchResult {
+  const validRange = validateHistoricalRange(range.startLedger, range.endLedger);
+
+  for (const ev of events) {
+    if (
+      ev.ledgerSequence < validRange.startLedger ||
+      ev.ledgerSequence > validRange.endLedger
+    ) {
+      throw new HistoricalRangeError(
+        `event ledger_sequence ${ev.ledgerSequence} is outside the declared range ` +
+          `[${validRange.startLedger}, ${validRange.endLedger}]`,
+      );
+    }
+  }
+
+  const db = getDb();
+  const insertStmt = db.prepare(`
+    INSERT OR IGNORE INTO events
+    (contract_id, event_type, ledger_sequence, timestamp, data_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const importTransaction = db.transaction(() => {
+    let inserted = 0;
+    for (const ev of events) {
+      const result = insertStmt.run(
+        ev.contractId,
+        ev.eventType,
+        ev.ledgerSequence,
+        ev.timestamp,
+        ev.dataJson,
+      );
+      if (result.changes > 0) inserted += 1;
+    }
+
+    if (options.advanceLivePointer) {
+      const current = getLastIndexedLedger();
+      if (validRange.endLedger > current) {
+        db.prepare(
+          "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'",
+        ).run(validRange.endLedger.toString());
+      }
+    }
+
+    return inserted;
+  });
+
+  const inserted = importTransaction();
+  logger.info("sqlite_schema_manager historical range imported", {
+    startLedger: validRange.startLedger,
+    endLedger: validRange.endLedger,
+    inserted,
+    advanceLivePointer: options.advanceLivePointer ?? false,
+  });
+
+  return { inserted, range: validRange };
+}
+
+export interface HistoricalEventCounts {
+  totalEvents: number;
+  eventsByType: Record<string, number>;
+}
+
+/**
+ * Assert-friendly summary of how many events are indexed for a given ledger
+ * range, broken down by event type. Used to validate that a custom
+ * historical import indexed the expected block event counts.
+ */
+export function getHistoricalEventCounts(
+  startLedger: unknown,
+  endLedger: unknown,
+): HistoricalEventCounts {
+  const validRange = validateHistoricalRange(startLedger, endLedger);
+  const db = getDb();
+
+  const totalRow = db
+    .prepare(
+      `SELECT COUNT(*) as count FROM events
+       WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+    )
+    .get(validRange.startLedger, validRange.endLedger) as { count: number };
+
+  const typeRows = db
+    .prepare(
+      `SELECT event_type, COUNT(*) as count FROM events
+       WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+       GROUP BY event_type`,
+    )
+    .all(validRange.startLedger, validRange.endLedger) as Array<{
+    event_type: string;
+    count: number;
+  }>;
+
+  const eventsByType: Record<string, number> = {};
+  for (const row of typeRows) {
+    eventsByType[row.event_type] = row.count;
+  }
+
+  return { totalEvents: totalRow.count, eventsByType };
 }

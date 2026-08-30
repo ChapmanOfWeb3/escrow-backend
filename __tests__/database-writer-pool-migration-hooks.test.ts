@@ -43,7 +43,7 @@ describe("database_writer_pool – migration verification hooks (#331)", () => {
       expect(report.issues).toEqual([]);
       expect(report.missingVersions).toEqual([]);
       expect(report.appliedVersions).toEqual(
-        expect.arrayContaining([1, 2, 3, 4, 5, 6]),
+        expect.arrayContaining([1, 2, 3, 4, 5, 6, 7]),
       );
     });
 
@@ -63,7 +63,7 @@ describe("database_writer_pool – migration verification hooks (#331)", () => {
       const report = verifyWriterPoolSchema();
 
       expect(report.valid).toBe(false);
-      expect(report.missingVersions).toEqual([5, 6]);
+      expect(report.missingVersions).toEqual([5, 6, 7]);
       expect(report.issues.join(" ")).toContain("out of sync");
     });
 

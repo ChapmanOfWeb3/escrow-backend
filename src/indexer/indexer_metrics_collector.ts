@@ -698,49 +698,194 @@ export function getIndexerMetricsQueue(): IndexerMetricsEventQueue {
   return defaultQueue;
 }
 
-/** Drop queue, alert monitor and in-flight collection state. Intended for tests. */
-export function resetIndexerMetricsCollectorState(): void {
-  defaultMonitor = new IndexerMetricsFailureMonitor();
-  defaultQueue = new IndexerMetricsEventQueue();
-  inFlightCollection = null;
+// ---------------------------------------------------------------------------
+// Dynamic poller throttling parameters (#341)
+// ---------------------------------------------------------------------------
+//
+// The collector sizes how often it polls for new metrics based on ledger
+// processing load. When the network is idle the `totalEvents` snapshot stops
+// growing, so the collection poll interval backs off toward the maximum; once
+// events start flowing again the interval is pulled back to the minimum so
+// telemetry stays fresh.
+
+export interface IndexerMetricsThrottleParameters {
+  /** Starting poll interval in ms before any load is observed. */
+  baseIntervalMs: number;
+  /** Floor for the collection poll interval in ms. */
+  minIntervalMs: number;
+  /** Ceiling for the collection poll interval in ms after long idle periods. */
+  maxIntervalMs: number;
+  /** Factor applied to the interval on each idle backing-off step. */
+  idleMultiplier: number;
+  /** Consecutive idle collections required before backing off. */
+  idleThresholdCycles: number;
+}
+
+export interface IndexerMetricsThrottleState {
+  /** Current effective collection poll interval in ms. */
+  currentIntervalMs: number;
+  /** Number of events processed during the last observed interval. */
+  lastProcessedEventCount: number;
+  /** Consecutive idle (zero new event) collections so far. */
+  idleCycles: number;
+  /** Timestamp of the most recent throttle adjustment. */
+  lastAdjustmentAt: number;
+}
+
+const METRICS_BASE_POLL_INTERVAL_MS = parseInt(
+  process.env.INDEXER_METRICS_POLL_INTERVAL_MS || "60000",
+  10,
+);
+const METRICS_MIN_POLL_INTERVAL_MS = parseInt(
+  process.env.INDEXER_METRICS_MIN_POLL_INTERVAL_MS || "15000",
+  10,
+);
+const METRICS_MAX_POLL_INTERVAL_MS = parseInt(
+  process.env.INDEXER_METRICS_MAX_POLL_INTERVAL_MS || "600000",
+  10,
+);
+const METRICS_IDLE_MULTIPLIER = parseFloat(
+  process.env.INDEXER_METRICS_IDLE_MULTIPLIER || "2",
+);
+const METRICS_IDLE_THRESHOLD_CYCLES = parseInt(
+  process.env.INDEXER_METRICS_IDLE_THRESHOLD_CYCLES || "3",
+  10,
+);
+
+let metricsThrottleState: IndexerMetricsThrottleState = {
+  currentIntervalMs: METRICS_BASE_POLL_INTERVAL_MS,
+  lastProcessedEventCount: 0,
+  idleCycles: 0,
+  lastAdjustmentAt: Date.now(),
+};
+
+/** Snapshot of the configured collector throttle parameters (read-only). */
+export function getIndexerMetricsThrottleParameters(): IndexerMetricsThrottleParameters {
+  return {
+    baseIntervalMs: METRICS_BASE_POLL_INTERVAL_MS,
+    minIntervalMs: METRICS_MIN_POLL_INTERVAL_MS,
+    maxIntervalMs: METRICS_MAX_POLL_INTERVAL_MS,
+    idleMultiplier: METRICS_IDLE_MULTIPLIER,
+    idleThresholdCycles: METRICS_IDLE_THRESHOLD_CYCLES,
+  };
+}
+
+/** Snapshot of the current collector throttle state (read-only copy). */
+export function getIndexerMetricsThrottleState(): IndexerMetricsThrottleState {
+  return { ...metricsThrottleState };
+}
+
+/** Reset the collector throttle state to defaults (useful for tests). */
+export function resetIndexerMetricsThrottleState(): void {
+  metricsThrottleState = {
+    currentIntervalMs: METRICS_BASE_POLL_INTERVAL_MS,
+    lastProcessedEventCount: 0,
+    idleCycles: 0,
+    lastAdjustmentAt: Date.now(),
+  };
+  lastCollectionSnapshot = null;
+}
+
+/** Poll interval the collector should wait before the next collection. */
+export function getIndexerMetricsPollDelayMs(): number {
+  return metricsThrottleState.currentIntervalMs;
 }
 
 /**
- * Index event notifications through the locked memory queue. Safe to call
- * concurrently: identical notifications collapse to a single insert (#336).
- */
-export async function recordEventNotifications(
-  events: EventRow[],
-): Promise<MetricsSubmitResult> {
-  return defaultQueue.submit(events);
-}
-
-/**
- * Collect metrics with single-flight de-duplication: concurrent callers share
- * one snapshot instead of racing several transactions against the same tables.
+ * Adjust the collection poll interval based on ledger processing load (#341).
  *
- * Any queued notifications are drained first, so the snapshot reflects every
- * event that has been handed to the collector.
+ * A collection that observed zero new events means the network is idle: once
+ * `idleThresholdCycles` consecutive idle collections have been seen, the poll
+ * interval backs off (multiplied by `idleMultiplier`, capped at
+ * `maxIntervalMs`). A collection that observed new events resets the interval
+ * to `minIntervalMs` so telemetry stays responsive under load.
+ *
+ * @param processedEventCount - Number of new events observed since the last
+ *   collection.
+ * @returns Updated throttle state snapshot.
  */
-export async function collectIndexerMetricsAsync(
-  targetDb?: Database.Database,
-): Promise<IndexerMetrics> {
-  if (inFlightCollection) return inFlightCollection;
+export function adjustIndexerMetricsPollingInterval(
+  processedEventCount: number,
+): IndexerMetricsThrottleState {
+  const state = metricsThrottleState;
+  state.lastProcessedEventCount = processedEventCount;
 
-  const collection = (async () => {
-    await defaultQueue.flush();
-    return collectIndexerMetrics(targetDb);
-  })();
-
-  inFlightCollection = collection;
-  try {
-    return await collection;
-  } finally {
-    if (inFlightCollection === collection) {
-      inFlightCollection = null;
+  if (processedEventCount === 0) {
+    // Idle network → the collection poll wait increases once enough
+    // consecutive idle collections have been observed.
+    state.idleCycles += 1;
+    if (state.idleCycles >= METRICS_IDLE_THRESHOLD_CYCLES) {
+      state.currentIntervalMs = Math.min(
+        state.currentIntervalMs * METRICS_IDLE_MULTIPLIER,
+        METRICS_MAX_POLL_INTERVAL_MS,
+      );
     }
+  } else {
+    // Active network → pull the poll interval back to the minimum.
+    state.idleCycles = 0;
+    state.currentIntervalMs = METRICS_MIN_POLL_INTERVAL_MS;
   }
+
+  state.lastAdjustmentAt = Date.now();
+
+  logger.debug("indexer_metrics_collector throttle adjustment", {
+    collector: COLLECTOR_NAME,
+    processedEventCount,
+    currentIntervalMs: state.currentIntervalMs,
+    idleCycles: state.idleCycles,
+  });
+
+  return { ...state };
 }
+
+/**
+ * Number of events processed between two metrics snapshots. When there is no
+ * previous snapshot, falls back to the current `totalEvents` (anything indexed
+ * so far counts as load). When the counts are equal the network is considered
+ * idle (0 new events).
+ */
+export function computeIndexerMetricsProcessedCount(
+  current: Pick<IndexerMetrics, "totalEvents" | "lastIndexedLedger">,
+  previous?: Pick<IndexerMetrics, "totalEvents" | "lastIndexedLedger"> | null,
+): number {
+  if (!previous) {
+    return current.totalEvents > 0 ? current.totalEvents : 0;
+  }
+  return Math.max(0, current.totalEvents - previous.totalEvents);
+}
+
+let lastCollectionSnapshot: Pick<
+  IndexerMetrics,
+  "totalEvents" | "lastIndexedLedger"
+> | null = null;
+
+/**
+ * Record a completed metrics collection and update the collector's dynamic
+ * poll interval based on the ledger processing load it observed (#341).
+ *
+ * The load is the delta in `totalEvents` between this snapshot and the previous
+ * one. If the snapshot is unchanged (idle network) the poll interval backs off;
+ * if new events appeared it is reset to the minimum.
+ *
+ * @param metrics - The most recently collected metrics snapshot.
+ * @returns Updated throttle state snapshot.
+ */
+export function onIndexerMetricsCollected(
+  metrics: IndexerMetrics,
+): IndexerMetricsThrottleState {
+  const processedEventCount = computeIndexerMetricsProcessedCount(
+    metrics,
+    lastCollectionSnapshot,
+  );
+  lastCollectionSnapshot = {
+    totalEvents: metrics.totalEvents,
+    lastIndexedLedger: metrics.lastIndexedLedger,
+  };
+  return adjustIndexerMetricsPollingInterval(processedEventCount);
+}
+
+// ---------------------------------------------------------------------------
+// Collection
 // ---------------------------------------------------------------------------
 
 /**
@@ -881,51 +1026,206 @@ export function collectIndexerMetrics(
 }
 
 // ---------------------------------------------------------------------------
-// RPC health check with exponential backoff retry (#334)
+// Dynamic historical sync ranges
 // ---------------------------------------------------------------------------
 
-export interface IndexerRpcHealthMetrics {
-  latestLedgerSequence: number;
+/** Per-ledger ("block") event count, ascending by ledger sequence. */
+export interface IndexerHistoricalLedgerEventCount {
+  ledgerSequence: number;
+  eventCount: number;
+}
+
+export interface HistoricalMetricsRangeOptions {
+  /** Inclusive lower bound of the ledger range to import. */
+  startLedger: number;
+  /** Inclusive upper bound of the ledger range to import. */
+  endLedger: number;
+}
+
+export interface HistoricalMetricsResult {
+  range: { startLedger: number; endLedger: number };
+  /** Total events indexed within the requested range. */
+  totalEvents: number;
+  /** Event counts grouped by type, within the range. */
+  eventsByType: Record<string, number>;
+  /** Last indexed ledger in the overall database (not range-limited). */
+  lastIndexedLedger: number;
   collectedAt: string;
+  /** Per-ledger ("block") event counts, ascending by ledger sequence. */
+  ledgerEventCounts: IndexerHistoricalLedgerEventCount[];
+  /** Number of distinct ledgers in the range that have at least one event. */
+  processedLedgerCount: number;
+}
+
+export interface HistoricalRangeValidation {
+  ok: boolean;
+  error?: string;
 }
 
 /**
- * Check RPC connectivity by fetching the latest ledger, retrying transient
- * connection timeouts with the same exponential backoff `withRetry` uses in
- * rpc_poller_client rather than a bespoke retry loop. Retry frequency grows
- * with each attempt (doubling by default) up to `maxRetries`.
- *
- * A failure that survives every retry is recorded on the shared failure
- * monitor as `rpc_timeout` – surfacing through the existing threshold
- * alerting (#338) – before being rethrown for the caller to handle.
+ * Validate an inclusive ledger range for historical metrics collection.
+ * Both values must be positive integers and startLedger must be ≤ endLedger.
  */
-export async function collectRpcHealthMetrics(
-  server: RpcServerLike,
-  config: Partial<RpcRetryConfig> = {},
-): Promise<IndexerRpcHealthMetrics> {
+export function validateHistoricalRange(
+  startLedger: number,
+  endLedger: number,
+): HistoricalRangeValidation {
+  if (
+    typeof startLedger !== "number" ||
+    !Number.isInteger(startLedger) ||
+    startLedger < 1
+  ) {
+    return {
+      ok: false,
+      error: `startLedger must be a positive integer, got: ${startLedger}`,
+    };
+  }
+  if (
+    typeof endLedger !== "number" ||
+    !Number.isInteger(endLedger) ||
+    endLedger < 1
+  ) {
+    return {
+      ok: false,
+      error: `endLedger must be a positive integer, got: ${endLedger}`,
+    };
+  }
+  if (startLedger > endLedger) {
+    return {
+      ok: false,
+      error: `startLedger (${startLedger}) must be ≤ endLedger (${endLedger})`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Collect metrics for a custom historical ledger range, accepting dynamic
+ * start/end ledger values for custom historical event imports.
+ *
+ * The function validates the range, then queries the `events` table inside a
+ * transaction for a consistent snapshot. It returns per-ledger ("block") event
+ * counts so callers can assert the correct number of events were indexed for
+ * each block in the imported range.
+ *
+ * Unlike `collectIndexerMetrics` this never writes to the database and does not
+ * advance the live `last_ledger_sequence` pointer — it is purely a read-side
+ * verification of an already-completed historical import.
+ */
+export function collectHistoricalMetrics(
+  options: HistoricalMetricsRangeOptions,
+  targetDb?: Database.Database,
+): HistoricalMetricsResult {
+  const { startLedger, endLedger } = options;
+
+  const validation = validateHistoricalRange(startLedger, endLedger);
+  if (!validation.ok) {
+    throw new Error(validation.error);
+  }
+
+  const database = targetDb || getDb();
   const monitor = defaultMonitor;
   const startedAt = performance.now();
 
-  try {
-    const { sequence } = await withRetry(
-      () => server.getLatestLedger(),
-      config,
-      `${COLLECTOR_NAME} rpc_health_check`,
+  logIndexerMetricsDiagnostics({
+    collector: COLLECTOR_NAME,
+    operation: "collect_historical_metrics",
+    status: "started",
+    elapsedMs: 0,
+    startLedger,
+    endLedger,
+  });
+
+  const getMetricsTx = database.transaction(() => {
+    const lastLedgerRow = withStageDiagnostics(
+      "query_historical_last_ledger",
+      () =>
+        database
+          .prepare(
+            "SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'",
+          )
+          .get() as { value: string } | undefined,
+    );
+    const lastIndexedLedger = lastLedgerRow
+      ? parseInt(lastLedgerRow.value, 10)
+      : 0;
+
+    const totalRow = withStageDiagnostics(
+      "query_historical_total_events",
+      () =>
+        database
+          .prepare(
+            `SELECT COUNT(*) as count FROM events
+             WHERE ledger_sequence >= ? AND ledger_sequence <= ?`,
+          )
+          .get(startLedger, endLedger) as { count: number },
     );
 
-    const metrics: IndexerRpcHealthMetrics = {
-      latestLedgerSequence: sequence,
+    const typeRows = withStageDiagnostics(
+      "query_historical_events_by_type",
+      () =>
+        database
+          .prepare(
+            `SELECT event_type, COUNT(*) as count FROM events
+             WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+             GROUP BY event_type`,
+          )
+          .all(startLedger, endLedger) as Array<{ event_type: string; count: number }>,
+    );
+
+    const eventsByType: Record<string, number> = {};
+    for (const row of typeRows) {
+      eventsByType[row.event_type] = row.count;
+    }
+
+    const ledgerRows = withStageDiagnostics(
+      "query_historical_ledger_event_counts",
+      () =>
+        database
+          .prepare(
+            `SELECT ledger_sequence, COUNT(*) as count FROM events
+             WHERE ledger_sequence >= ? AND ledger_sequence <= ?
+             GROUP BY ledger_sequence
+             ORDER BY ledger_sequence ASC`,
+          )
+          .all(startLedger, endLedger) as Array<{
+            ledger_sequence: number;
+            count: number;
+          }>,
+    );
+
+    const ledgerEventCounts: IndexerHistoricalLedgerEventCount[] = ledgerRows.map(
+      (row) => ({
+        ledgerSequence: row.ledger_sequence,
+        eventCount: row.count,
+      }),
+    );
+
+    return {
+      range: { startLedger, endLedger },
+      totalEvents: totalRow ? totalRow.count : 0,
+      eventsByType,
+      lastIndexedLedger,
       collectedAt: new Date().toISOString(),
+      ledgerEventCounts,
+      processedLedgerCount: ledgerEventCounts.length,
     };
+  });
+
+  try {
+    const metrics = getMetricsTx();
 
     monitor.recordSuccess();
     logIndexerMetricsDiagnostics({
       collector: COLLECTOR_NAME,
-      operation: "rpc_health_check",
+      operation: "collect_historical_metrics",
       status: "success",
       elapsedMs: roundElapsed(performance.now() - startedAt),
       payloadSizeBytes: metricsPayloadSizeBytes(metrics),
-      lastIndexedLedger: sequence,
+      startLedger,
+      endLedger,
+      totalEvents: metrics.totalEvents,
+      lastIndexedLedger: metrics.lastIndexedLedger,
     });
 
     return metrics;
@@ -934,14 +1234,16 @@ export async function collectRpcHealthMetrics(
 
     logIndexerMetricsDiagnostics({
       collector: COLLECTOR_NAME,
-      operation: "rpc_health_check",
+      operation: "collect_historical_metrics",
       status: "failure",
       elapsedMs: roundElapsed(performance.now() - startedAt),
+      startLedger,
+      endLedger,
       error,
     });
-    monitor.recordFailure("rpc_timeout", {
+    monitor.recordFailure("collection", {
       error,
-      operation: "rpc_health_check",
+      operation: "collect_historical_metrics",
     });
 
     throw err;

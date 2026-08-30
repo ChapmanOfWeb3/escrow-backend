@@ -326,3 +326,46 @@ export function updateWhitelistCors(
 
 /** Security headers applied to whitelist update responses. */
 export const updateWhitelistSecurityHeaders = jobContractSecurityHeaders;
+
+/** Strict CORS gate for POST /api/jobs/build-tx. */
+export function buildTxCors(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const origin = req.header("Origin");
+  const allowedOrigins = getAllowedOrigins();
+
+  if (!origin) {
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+    return;
+  }
+
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-API-Key"
+    );
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+    return;
+  }
+
+  res.status(403).json({
+    success: false,
+    error: "Origin not allowed by CORS policy",
+  });
+}
+
+/** Security headers applied to POST /api/jobs/build-tx responses. */
+export const buildTxSecurityHeaders = jobContractSecurityHeaders;
