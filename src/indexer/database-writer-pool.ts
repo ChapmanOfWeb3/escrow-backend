@@ -1,9 +1,19 @@
 import {
   getDb,
+  getLastIndexedLedger,
   getShippedMigrationVersions,
   verifySchemaIntegrity,
   verifySchemaUpToDate,
+  type EventRow,
 } from "./db.js";
+import {
+  chunkLedgerRange,
+  filterEventsToRange,
+  LedgerRangeValidationError,
+  resolveHistoricalLedgerRange,
+  validateLedgerRange,
+  type LedgerRange,
+} from "./ledger-range-tracker.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -18,6 +28,7 @@ import logger from "../utils/logger.js";
  * - Built-in retry logic for transient conflicts
  * - Migration verification hooks that validate the schema before starting (#331)
  * - High-frequency debug diagnostics for write speeds and payload sizes (#328)
+ * - Dynamic historical start/end ledger ranges for custom event imports (#330)
  */
 
 export interface WriteOperation<T> {
@@ -614,6 +625,12 @@ export interface WriterPoolStartOptions {
    * that never call `startWriterPool` keep working exactly as before.
    */
   enforce?: boolean;
+  /** Inclusive historical import start ledger (#330). */
+  startLedger?: number;
+  /** Inclusive historical import end ledger (#330). */
+  endLedger?: number;
+  /** Ledgers per historical import page (default 100). */
+  pageSize?: number;
 }
 
 let poolStarted = false;
@@ -643,6 +660,18 @@ export function startWriterPool(
   try {
     const report = assertWriterPoolSchemaReady();
 
+    if (
+      options.startLedger !== undefined ||
+      options.endLedger !== undefined ||
+      options.pageSize !== undefined
+    ) {
+      configureWriterPoolHistoricalRange({
+        startLedger: options.startLedger,
+        endLedger: options.endLedger,
+        pageSize: options.pageSize,
+      });
+    }
+
     poolStarted = true;
     enforceStart = options.enforce ?? false;
     lastSchemaReport = report;
@@ -658,6 +687,8 @@ export function startWriterPool(
       pool: POOL_NAME,
       appliedVersions: report.appliedVersions,
       enforce: enforceStart,
+      startLedger: historicalRangeConfig.startLedger,
+      endLedger: historicalRangeConfig.endLedger,
     });
 
     return report;
@@ -707,4 +738,276 @@ export function resetWriterPoolStartState(): void {
   enforceStart = false;
   lastSchemaReport = null;
   migrationHooks.clear();
+  resetWriterPoolHistoricalRangeConfig();
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic historical sync ranges (#330)
+// ---------------------------------------------------------------------------
+
+/** Inclusive historical range page size; matches ledger_range_tracker. */
+export const DEFAULT_WRITER_POOL_HISTORICAL_PAGE_SIZE = 100;
+
+export interface WriterPoolHistoricalRangeConfig {
+  /** Inclusive custom start ledger. Falls back to env / defaults. */
+  startLedger?: number;
+  /** Inclusive custom end ledger. Falls back to env / defaults. */
+  endLedger?: number;
+  /** Ledgers per historical import page. */
+  pageSize?: number;
+}
+
+export interface WriterPoolHistoricalRangeOptions
+  extends WriterPoolHistoricalRangeConfig {
+  /** Fallback start when neither an explicit nor an env start is set. */
+  defaultStart?: number;
+  /** Fallback end when neither an explicit nor an env end is set. */
+  defaultEnd?: number;
+  /** Pre-fetched events; filtered to the resolved range before persist. */
+  events?: EventRow[];
+  /** Per-page event source. Called once per chunk with the page's inclusive range. */
+  fetchEvents?: (page: LedgerRange) => Promise<EventRow[]> | EventRow[];
+  /**
+   * When true, advances `last_ledger_sequence` to the range end after a
+   * successful import. Defaults to false so live polling is unchanged.
+   */
+  advanceLivePointer?: boolean;
+}
+
+/** Number of events indexed for a single ledger ("block"). */
+export interface WriterPoolLedgerEventCount {
+  ledgerSequence: number;
+  eventCount: number;
+}
+
+export interface WriterPoolHistoricalImportResult {
+  range: LedgerRange;
+  pages: LedgerRange[];
+  /** Events accepted into the requested range (pre-persist). */
+  eventCount: number;
+  /** Rows actually written by the pool. */
+  insertedCount: number;
+  /** Rows skipped as already present (INSERT OR IGNORE). */
+  duplicateCount: number;
+  /** Distinct ledgers ("blocks") that contributed at least one event. */
+  processedLedgerCount: number;
+  /** Per-ledger event counts, ascending by ledger sequence. */
+  ledgerEventCounts: WriterPoolLedgerEventCount[];
+  elapsedMs: number;
+}
+
+let historicalRangeConfig: WriterPoolHistoricalRangeConfig = {};
+
+function defaultHistoricalStart(): number {
+  const last = getLastIndexedLedger();
+  return last < 1 ? 1 : last + 1;
+}
+
+function validateOptionalLedger(name: string, value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new LedgerRangeValidationError(
+      `${name} must be a positive integer, received ${String(value)}`
+    );
+  }
+  return value;
+}
+
+/**
+ * Aggregate per-ledger ("block") event counts, ascending by ledger sequence.
+ * Tests assert against this to prove a custom range indexed every block.
+ */
+export function countWriterPoolEventsByLedger(
+  events: Array<{ ledgerSequence?: unknown; ledger?: unknown }>
+): WriterPoolLedgerEventCount[] {
+  const counts = new Map<number, number>();
+  for (const event of events) {
+    const raw = event?.ledgerSequence ?? event?.ledger;
+    const ledger = Number(raw);
+    if (!Number.isFinite(ledger)) continue;
+    counts.set(ledger, (counts.get(ledger) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([ledgerSequence, eventCount]) => ({ ledgerSequence, eventCount }));
+}
+
+/**
+ * Store optional historical start/end/pageSize on the pool.
+ * When both start and end are supplied they are validated as a pair.
+ */
+export function configureWriterPoolHistoricalRange(
+  options: WriterPoolHistoricalRangeConfig = {}
+): WriterPoolHistoricalRangeConfig {
+  if (options.startLedger !== undefined && options.endLedger !== undefined) {
+    validateLedgerRange(options.startLedger, options.endLedger);
+  } else {
+    if (options.startLedger !== undefined) {
+      validateOptionalLedger("start ledger", options.startLedger);
+    }
+    if (options.endLedger !== undefined) {
+      validateOptionalLedger("end ledger", options.endLedger);
+    }
+  }
+  if (options.pageSize !== undefined) {
+    validateOptionalLedger("page size", options.pageSize);
+  }
+  historicalRangeConfig = { ...options };
+  return { ...historicalRangeConfig };
+}
+
+export function getWriterPoolHistoricalRangeConfig(): WriterPoolHistoricalRangeConfig {
+  return { ...historicalRangeConfig };
+}
+
+export function resetWriterPoolHistoricalRangeConfig(): void {
+  historicalRangeConfig = {};
+}
+
+/**
+ * Resolve an inclusive historical range from explicit values, then the
+ * pool's configured start/end, then `LEDGER_RANGE_START` / `LEDGER_RANGE_END`,
+ * then live defaults (`last_indexed + 1` → provided default end).
+ *
+ * Throws `LedgerRangeValidationError` on non-integers, values below 1, or
+ * an inverted range (start > end).
+ */
+export function resolveWriterPoolHistoricalRange(
+  options: WriterPoolHistoricalRangeOptions = {}
+): LedgerRange {
+  return resolveHistoricalLedgerRange({
+    startLedger: options.startLedger ?? historicalRangeConfig.startLedger,
+    endLedger: options.endLedger ?? historicalRangeConfig.endLedger,
+    defaultStart: options.defaultStart ?? defaultHistoricalStart(),
+    defaultEnd: options.defaultEnd ?? historicalRangeConfig.endLedger,
+  });
+}
+
+/**
+ * Import events for a custom inclusive historical ledger range through the
+ * writer pool.
+ *
+ * The requested range is validated, split into pages, and used to filter
+ * events before they are persisted. Historical imports never advance the
+ * live ledger pointer unless `advanceLivePointer` is set, so live
+ * synchronization is unaffected.
+ */
+export async function importHistoricalRange(
+  options: WriterPoolHistoricalRangeOptions = {}
+): Promise<WriterPoolHistoricalImportResult> {
+  const startedAt = performance.now();
+  const range = resolveWriterPoolHistoricalRange(options);
+  const pageSize = validateOptionalLedger(
+    "page size",
+    options.pageSize ??
+      historicalRangeConfig.pageSize ??
+      DEFAULT_WRITER_POOL_HISTORICAL_PAGE_SIZE
+  );
+  const pages = chunkLedgerRange(range, pageSize);
+
+  logWriterPoolDiagnostics({
+    pool: POOL_NAME,
+    operation: "import_historical_range",
+    status: "started",
+    elapsedMs: 0,
+    queueDepth: writeQueue.length,
+  });
+
+  try {
+    const collected: EventRow[] = [];
+
+    if (options.fetchEvents) {
+      for (const page of pages) {
+        const pageEvents = await options.fetchEvents(page);
+        collected.push(...filterEventsToRange(pageEvents, page));
+      }
+    } else if (options.events) {
+      collected.push(...filterEventsToRange(options.events, range));
+    }
+
+    const persistResult = await executeWriteTransaction({
+      name: "import_historical_range",
+      execute: (db) => {
+        const insertStmt = db.prepare(`
+          INSERT OR IGNORE INTO events
+          (contract_id, event_type, ledger_sequence, timestamp, data_json)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+
+        let insertedCount = 0;
+        let duplicateCount = 0;
+
+        for (const ev of collected) {
+          const result = insertStmt.run(
+            ev.contractId,
+            ev.eventType,
+            ev.ledgerSequence,
+            ev.timestamp,
+            ev.dataJson
+          );
+          if (result.changes > 0) {
+            insertedCount += 1;
+          } else {
+            duplicateCount += 1;
+          }
+        }
+
+        if (options.advanceLivePointer) {
+          db.prepare(
+            "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'"
+          ).run(range.endLedger.toString());
+        }
+
+        return { insertedCount, duplicateCount };
+      },
+    });
+
+    if (!persistResult.success) {
+      throw persistResult.error ?? new Error("historical import write failed");
+    }
+
+    const elapsedMs = Math.max(0, performance.now() - startedAt);
+    const ledgerEventCounts = countWriterPoolEventsByLedger(collected);
+    const insertedCount = persistResult.data?.insertedCount ?? 0;
+    const duplicateCount = persistResult.data?.duplicateCount ?? 0;
+
+    logWriterPoolDiagnostics({
+      pool: POOL_NAME,
+      operation: "import_historical_range",
+      status: "success",
+      elapsedMs: roundElapsed(elapsedMs),
+      payloadSizeBytes: writerPoolPayloadSizeBytes(collected),
+      queueDepth: writeQueue.length,
+    });
+    logger.info("database_writer_pool historical range imported", {
+      pool: POOL_NAME,
+      startLedger: range.startLedger,
+      endLedger: range.endLedger,
+      eventCount: collected.length,
+      insertedCount,
+      duplicateCount,
+      processedLedgerCount: ledgerEventCounts.length,
+    });
+
+    return {
+      range,
+      pages,
+      eventCount: collected.length,
+      insertedCount,
+      duplicateCount,
+      processedLedgerCount: ledgerEventCounts.length,
+      ledgerEventCounts,
+      elapsedMs,
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logWriterPoolDiagnostics({
+      pool: POOL_NAME,
+      operation: "import_historical_range",
+      status: "failure",
+      elapsedMs: roundElapsed(performance.now() - startedAt),
+      queueDepth: writeQueue.length,
+      error,
+    });
+    throw err;
+  }
 }

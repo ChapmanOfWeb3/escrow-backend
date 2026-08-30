@@ -61,8 +61,13 @@ describe("Indexer Database", () => {
 
     it("does not re-apply already-applied migrations (idempotent)", () => {
       // Running again should not throw and should not duplicate rows
+      const before = testDb
+        .prepare("SELECT version FROM schema_migrations")
+        .all() as Array<{ version: number }>;
+
       runMigrations();
-      const rows = testDb
+
+      const after = testDb
         .prepare("SELECT version FROM schema_migrations")
         .all();
       // We ship 6 migrations (events/indexer_state + monitored_contracts + indexes +

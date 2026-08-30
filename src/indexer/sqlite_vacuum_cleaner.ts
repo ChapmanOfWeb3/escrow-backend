@@ -5,19 +5,6 @@ import logger from "../utils/logger.js";
 // SQLite vacuum cleaner (#193)
 // ---------------------------------------------------------------------------
 //
-// Extended features:
-//   - Dynamic polling frequency (Issue 1): adjustVacuumPollingInterval()
-//     increases wait delays when the database is idle (no rows pruned),
-//     backing off up to MAX_VACUUM_POLL_INTERVAL_MS.
-//
-//   - Dynamic ledger range imports (Issue 3): pruneEventsInLedgerRange()
-//     accepts custom start/end ledger values so callers can import and prune
-//     arbitrary historical windows.
-//
-//   - Schema migration check utilities (Issue 4): validateVacuumSchema()
-//     verifies the required tables/columns exist before the cleaner starts,
-//     failing fast when the database state is out of sync.
-//
 // This module prunes stale rows from the `events` table and reclaims the
 // disk space they occupied.
 //
@@ -55,6 +42,26 @@ export interface VacuumCleanupResult {
   prunedEvents: number;
   /** Whether the VACUUM step ran successfully. */
   vacuumed: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency lock (#345)
+// ---------------------------------------------------------------------------
+//
+// SQLite does NOT allow VACUUM inside an explicit transaction, so two
+// concurrent `runVacuumCleanup` calls could race: one starts pruning while
+// the other tries to VACUUM, or both attempt VACUUM simultaneously and one
+// fails with "cannot VACUUM from within a transaction" or "database is locked".
+//
+// A simple promise-based mutex serialises entry into the critical section.
+// Only one cleanup cycle runs at a time; callers that arrive while a cycle is
+// in progress simply wait for it to finish instead of overlapping.
+
+let vacuumLock: Promise<void> = Promise.resolve();
+let vacuumLockActive = false;
+
+export function isVacuumLocked(): boolean {
+  return vacuumLockActive;
 }
 
 export const ERROR_CODES = {
@@ -148,6 +155,11 @@ export function runVacuum(db: Database.Database): void {
  * If pruning throws, the error propagates immediately and VACUUM is never
  * invoked — we never want to reclaim disk space around data whose cleanup
  * step failed or rolled back ambiguously.
+ *
+ * Concurrency guard (#345): multiple concurrent calls are serialised via
+ * an in-memory promise lock so two cleanup cycles never overlap.  Callers
+ * that arrive while a cycle is in progress wait for it to finish rather
+ * than racing on the database.
  */
 export function runVacuumCleanup(
   db: Database.Database,
@@ -167,6 +179,33 @@ export function runVacuumCleanup(
   logger.info("Completed sqlite vacuum cleanup", { prunedEvents });
 
   return { prunedEvents, vacuumed: true };
+}
+
+/**
+ * Async variant of runVacuumCleanup that honours the concurrency lock.
+ * Internally chains onto the shared `vacuumLock` promise so at most one
+ * cleanup cycle is in flight at any time.
+ */
+export async function runVacuumCleanupConcurrent(
+  db: Database.Database,
+  options: VacuumCleanupOptions = {}
+): Promise<VacuumCleanupResult> {
+  // Chain onto the existing lock so only one cycle runs at a time.
+  const previous = vacuumLock;
+  let release: () => void;
+  vacuumLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  vacuumLockActive = true;
+
+  await previous;
+
+  try {
+    return runVacuumCleanup(db, options);
+  } finally {
+    vacuumLockActive = false;
+    release!();
+  }
 }
 
 // ---------------------------------------------------------------------------

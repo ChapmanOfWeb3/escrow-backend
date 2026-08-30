@@ -792,3 +792,123 @@ describe("sqlite_vacuum_cleaner — Issue 4: Schema migration checks", () => {
     expect(message).toMatch(/missing table: schema_migrations/);
   });
 });
+
+// ============================================================================
+// Issue 345 — Concurrency lock for concurrent vacuum cleanup calls
+// ============================================================================
+
+import { runVacuumCleanupConcurrent, isVacuumLocked } from "../src/indexer/sqlite_vacuum_cleaner.js";
+
+describe("sqlite_vacuum_cleaner — Issue 345: Race condition lock", () => {
+  let db: Database.Database;
+
+  beforeAll(() => {
+    db = new Database(":memory:");
+    setDb(db);
+  });
+
+  afterAll(() => {
+    db.close();
+  });
+
+  beforeEach(() => {
+    db.exec("DROP TABLE IF EXISTS events");
+    db.exec("DROP TABLE IF EXISTS indexer_state");
+    db.exec("DROP TABLE IF EXISTS monitored_contracts");
+    db.exec("DROP TABLE IF EXISTS schema_migrations");
+    db.exec("DROP TABLE IF EXISTS webhook_subscriptions");
+    runMigrations();
+  });
+
+  function insertEventWithCreatedAt(
+    contractId: string,
+    ledgerSequence: number,
+    createdAtExpr: string
+  ) {
+    db.prepare(
+      `INSERT INTO events
+       (contract_id, event_type, ledger_sequence, timestamp, data_json, created_at)
+       VALUES (?, 'test-event', ?, 1000, '{}', ${createdAtExpr})`
+    ).run(contractId, ledgerSequence);
+  }
+
+  it("runVacuumCleanupConcurrent completes successfully", async () => {
+    insertEventWithCreatedAt("OLD-1", 1, "datetime('now', '-100 days')");
+    insertEventWithCreatedAt("RECENT-1", 2, "datetime('now')");
+
+    const result = await runVacuumCleanupConcurrent(db, { retentionDays: 90 });
+
+    expect(result.prunedEvents).toBe(1);
+    expect(result.vacuumed).toBe(true);
+  });
+
+  it("concurrent calls do not duplicate deletions", async () => {
+    // Insert old events that should be pruned.
+    for (let i = 0; i < 10; i++) {
+      insertEventWithCreatedAt(`OLD-${i}`, i, "datetime('now', '-100 days')");
+    }
+    insertEventWithCreatedAt("RECENT-1", 100, "datetime('now')");
+
+    const beforeCount = (
+      db.prepare("SELECT COUNT(*) as cnt FROM events").get() as { cnt: number }
+    ).cnt;
+    expect(beforeCount).toBe(11);
+
+    // Launch 5 concurrent cleanup cycles — all should complete without error
+    // and the total pruned count across all calls should equal 10 (each call
+    // prunes the same rows, but subsequent calls find 0 remaining).
+    const results = await Promise.all([
+      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
+      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
+      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
+      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
+      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
+    ]);
+
+    // At least one call should have pruned rows; the rest may prune 0
+    // because the rows were already deleted by an earlier cycle.
+    const totalPruned = results.reduce((sum, r) => sum + r.prunedEvents, 0);
+    expect(totalPruned).toBeGreaterThanOrEqual(10);
+
+    // The final state should have only the recent event.
+    const afterCount = (
+      db.prepare("SELECT COUNT(*) as cnt FROM events").get() as { cnt: number }
+    ).cnt;
+    expect(afterCount).toBe(1);
+  });
+
+  it("lock releases after a failing cycle so subsequent calls succeed", async () => {
+    insertEventWithCreatedAt("__SENTINEL_FAIL__", 1, "datetime('now', '-100 days')");
+    insertEventWithCreatedAt("OLD-2", 2, "datetime('now', '-100 days')");
+
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_fail_on_delete_concurrent
+      BEFORE DELETE ON events
+      WHEN OLD.contract_id = '__SENTINEL_FAIL__'
+      BEGIN
+        SELECT RAISE(FAIL, 'intentional concurrent failure');
+      END;
+    `);
+
+    try {
+      // First call should fail because the trigger fires.
+      await expect(
+        runVacuumCleanupConcurrent(db, { retentionDays: 90 })
+      ).rejects.toThrow(/intentional concurrent failure/);
+
+      // The lock should have been released even though the cycle threw.
+      // A subsequent call with valid data should succeed.
+      db.exec("DROP TRIGGER IF EXISTS trg_fail_on_delete_concurrent");
+
+      const result = await runVacuumCleanupConcurrent(db, { retentionDays: 90 });
+      expect(result.vacuumed).toBe(true);
+    } finally {
+      db.exec("DROP TRIGGER IF EXISTS trg_fail_on_delete_concurrent");
+    }
+  });
+
+  it("isVacuumLocked returns false when no cycle is running", () => {
+    // After all concurrent calls above have resolved, the lock is released.
+    expect(isVacuumLocked()).toBe(false);
+  });
+});

@@ -12,11 +12,7 @@
     "isolatedModules": true
   },
   "include": ["src/**/*", "__tests__/**/*"],
-  "exclude": [
-    "node_modules",
-    "dist",
-    "__tests__/ledger-range-tracker-improvements.test.ts"
-  ],
+  "exclude": ["node_modules", "dist"],
   "ts-node": {
     "esm": true
   }
