@@ -5,7 +5,10 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
-import { resetJobWhitelistRateLimitBuckets } from "../src/middleware/job-contract-rate-limit.js";
+import {
+  resetJobWhitelistRateLimitBuckets,
+  resetWhitelistUpdateRateLimitBuckets,
+} from "../src/middleware/job-contract-rate-limit.js";
 
 const VALID_CONTRACT = "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
 const VALID_TOKEN    = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
@@ -67,6 +70,10 @@ describe("POST /api/jobs/:contractId/whitelist/update – schema validation", ()
     mockLoggerWarn.mockReset();
     mockLoggerError.mockReset();
     resetJobWhitelistRateLimitBuckets();
+    // This suite issues more requests than the endpoint's per-window budget,
+    // so clear its bucket too – the limiter itself is covered by
+    // whitelist-update.test.ts.
+    resetWhitelistUpdateRateLimitBuckets();
     resetWhitelistCache();
     delete process.env.API_KEY;
 
