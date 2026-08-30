@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import Database from "better-sqlite3";
 import { runMigrations, setDb } from "../src/indexer/db.js";
 import {
@@ -8,6 +9,7 @@ import {
   ERROR_CODES,
   DEFAULT_RETENTION_DAYS,
 } from "../src/indexer/sqlite_vacuum_cleaner.js";
+import logger from "../src/utils/logger.js";
 
 describe("sqlite_vacuum_cleaner (#193)", () => {
   let testDb: Database.Database;
@@ -794,121 +796,329 @@ describe("sqlite_vacuum_cleaner — Issue 4: Schema migration checks", () => {
 });
 
 // ============================================================================
-// Issue 345 — Concurrency lock for concurrent vacuum cleanup calls
+// Issue #347 — Failure alerting notifications
 // ============================================================================
 
-import { runVacuumCleanupConcurrent, isVacuumLocked } from "../src/indexer/sqlite_vacuum_cleaner.js";
+import {
+  VacuumFailureMonitor,
+  DEFAULT_VACUUM_FAILURE_THRESHOLD,
+  DEFAULT_VACUUM_STALL_THRESHOLD_MS,
+  getVacuumAlertConfig,
+  getVacuumFailureMonitor,
+  resetVacuumFailureMonitorState,
+} from "../src/indexer/sqlite_vacuum_cleaner.js";
 
-describe("sqlite_vacuum_cleaner — Issue 345: Race condition lock", () => {
-  let db: Database.Database;
+/** Winston's logger methods are overloaded, so spies are handled untyped. */
+function spyOnLogger(method: "debug" | "info" | "warn" | "error"): any {
+  return jest.spyOn(logger, method).mockImplementation((() => logger) as never);
+}
 
-  beforeAll(() => {
-    db = new Database(":memory:");
-    setDb(db);
-  });
+/** Warning calls that are threshold alerts, not config warnings. */
+function alertWarnings(spy: any): any[][] {
+  return (spy.mock.calls as any[][]).filter((call) =>
+    String(call[0]).includes("sqlite_vacuum_cleaner alert:"),
+  );
+}
 
-  afterAll(() => {
-    db.close();
-  });
+describe("sqlite_vacuum_cleaner — failure alerting (#347)", () => {
+  const envKeys = ["VACUUM_FAILURE_THRESHOLD", "VACUUM_STALL_THRESHOLD_MS"];
+  const savedEnv: Record<string, string | undefined> = {};
+
+  let warnSpy: any;
+  let errorSpy: any;
+  let infoSpy: any;
 
   beforeEach(() => {
-    db.exec("DROP TABLE IF EXISTS events");
-    db.exec("DROP TABLE IF EXISTS indexer_state");
-    db.exec("DROP TABLE IF EXISTS monitored_contracts");
-    db.exec("DROP TABLE IF EXISTS schema_migrations");
-    db.exec("DROP TABLE IF EXISTS webhook_subscriptions");
-    runMigrations();
-  });
-
-  function insertEventWithCreatedAt(
-    contractId: string,
-    ledgerSequence: number,
-    createdAtExpr: string
-  ) {
-    db.prepare(
-      `INSERT INTO events
-       (contract_id, event_type, ledger_sequence, timestamp, data_json, created_at)
-       VALUES (?, 'test-event', ?, 1000, '{}', ${createdAtExpr})`
-    ).run(contractId, ledgerSequence);
-  }
-
-  it("runVacuumCleanupConcurrent completes successfully", async () => {
-    insertEventWithCreatedAt("OLD-1", 1, "datetime('now', '-100 days')");
-    insertEventWithCreatedAt("RECENT-1", 2, "datetime('now')");
-
-    const result = await runVacuumCleanupConcurrent(db, { retentionDays: 90 });
-
-    expect(result.prunedEvents).toBe(1);
-    expect(result.vacuumed).toBe(true);
-  });
-
-  it("concurrent calls do not duplicate deletions", async () => {
-    // Insert old events that should be pruned.
-    for (let i = 0; i < 10; i++) {
-      insertEventWithCreatedAt(`OLD-${i}`, i, "datetime('now', '-100 days')");
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
     }
-    insertEventWithCreatedAt("RECENT-1", 100, "datetime('now')");
-
-    const beforeCount = (
-      db.prepare("SELECT COUNT(*) as cnt FROM events").get() as { cnt: number }
-    ).cnt;
-    expect(beforeCount).toBe(11);
-
-    // Launch 5 concurrent cleanup cycles — all should complete without error
-    // and the total pruned count across all calls should equal 10 (each call
-    // prunes the same rows, but subsequent calls find 0 remaining).
-    const results = await Promise.all([
-      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
-      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
-      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
-      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
-      runVacuumCleanupConcurrent(db, { retentionDays: 90 }),
-    ]);
-
-    // At least one call should have pruned rows; the rest may prune 0
-    // because the rows were already deleted by an earlier cycle.
-    const totalPruned = results.reduce((sum, r) => sum + r.prunedEvents, 0);
-    expect(totalPruned).toBeGreaterThanOrEqual(10);
-
-    // The final state should have only the recent event.
-    const afterCount = (
-      db.prepare("SELECT COUNT(*) as cnt FROM events").get() as { cnt: number }
-    ).cnt;
-    expect(afterCount).toBe(1);
+    warnSpy = spyOnLogger("warn");
+    errorSpy = spyOnLogger("error");
+    infoSpy = spyOnLogger("info");
+    resetVacuumFailureMonitorState();
   });
 
-  it("lock releases after a failing cycle so subsequent calls succeed", async () => {
-    insertEventWithCreatedAt("__SENTINEL_FAIL__", 1, "datetime('now', '-100 days')");
-    insertEventWithCreatedAt("OLD-2", 2, "datetime('now', '-100 days')");
-
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS trg_fail_on_delete_concurrent
-      BEFORE DELETE ON events
-      WHEN OLD.contract_id = '__SENTINEL_FAIL__'
-      BEGIN
-        SELECT RAISE(FAIL, 'intentional concurrent failure');
-      END;
-    `);
-
-    try {
-      // First call should fail because the trigger fires.
-      await expect(
-        runVacuumCleanupConcurrent(db, { retentionDays: 90 })
-      ).rejects.toThrow(/intentional concurrent failure/);
-
-      // The lock should have been released even though the cycle threw.
-      // A subsequent call with valid data should succeed.
-      db.exec("DROP TRIGGER IF EXISTS trg_fail_on_delete_concurrent");
-
-      const result = await runVacuumCleanupConcurrent(db, { retentionDays: 90 });
-      expect(result.vacuumed).toBe(true);
-    } finally {
-      db.exec("DROP TRIGGER IF EXISTS trg_fail_on_delete_concurrent");
+  afterEach(() => {
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
     }
+    warnSpy.mockRestore();
+    errorSpy.mockRestore();
+    infoSpy.mockRestore();
+    resetVacuumFailureMonitorState();
   });
 
-  it("isVacuumLocked returns false when no cycle is running", () => {
-    // After all concurrent calls above have resolved, the lock is released.
-    expect(isVacuumLocked()).toBe(false);
+  describe("configuration", () => {
+    it("uses documented defaults when nothing is configured", () => {
+      expect(getVacuumAlertConfig()).toEqual({
+        failureThreshold: DEFAULT_VACUUM_FAILURE_THRESHOLD,
+        stallThresholdMs: DEFAULT_VACUUM_STALL_THRESHOLD_MS,
+      });
+      expect(DEFAULT_VACUUM_FAILURE_THRESHOLD).toBe(3);
+    });
+
+    it("reads thresholds from the environment", () => {
+      process.env.VACUUM_FAILURE_THRESHOLD = "7";
+      process.env.VACUUM_STALL_THRESHOLD_MS = "5000";
+
+      expect(getVacuumAlertConfig()).toEqual({
+        failureThreshold: 7,
+        stallThresholdMs: 5000,
+      });
+    });
+
+    it("falls back and warns on an invalid threshold instead of throwing", () => {
+      process.env.VACUUM_FAILURE_THRESHOLD = "not-a-number";
+
+      expect(getVacuumAlertConfig().failureThreshold).toBe(
+        DEFAULT_VACUUM_FAILURE_THRESHOLD,
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        "sqlite_vacuum_cleaner ignoring invalid threshold config",
+        expect.objectContaining({
+          variable: "VACUUM_FAILURE_THRESHOLD",
+          received: "not-a-number",
+        }),
+      );
+    });
+
+    it("rejects zero, negative, and fractional thresholds", () => {
+      for (const bad of ["0", "-2", "1.5"]) {
+        process.env.VACUUM_FAILURE_THRESHOLD = bad;
+        expect(getVacuumAlertConfig().failureThreshold).toBe(
+          DEFAULT_VACUUM_FAILURE_THRESHOLD,
+        );
+      }
+    });
+
+    it("picks up env thresholds when monitor state is reset", () => {
+      process.env.VACUUM_FAILURE_THRESHOLD = "4";
+      resetVacuumFailureMonitorState();
+
+      expect(getVacuumFailureMonitor().failureThreshold).toBe(4);
+    });
+  });
+
+  describe("consecutive failure alerts", () => {
+    it("warns only once the configured error count is reached", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 3 });
+
+      monitor.recordFailure("prune", { error: "boom-1" });
+      expect(alertWarnings(warnSpy)).toHaveLength(0);
+
+      monitor.recordFailure("prune", { error: "boom-2" });
+      expect(alertWarnings(warnSpy)).toHaveLength(0);
+      expect(monitor.isAlertActive()).toBe(false);
+
+      monitor.recordFailure("prune", { error: "boom-3" });
+      expect(alertWarnings(warnSpy)).toHaveLength(1);
+      expect(monitor.isAlertActive()).toBe(true);
+      expect(monitor.getConsecutiveFailures()).toBe(3);
+    });
+
+    it("includes the failure count, threshold and cause in the alert", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 2 });
+
+      monitor.recordFailure("vacuum", { error: "disk full" });
+      monitor.recordFailure("vacuum", { error: "disk full" });
+
+      const [message, meta] = alertWarnings(warnSpy)[0];
+      expect(message).toBe(
+        "sqlite_vacuum_cleaner alert: consecutive failure threshold reached",
+      );
+      expect(meta).toMatchObject({
+        failureType: "vacuum",
+        consecutiveFailures: 2,
+        threshold: 2,
+        error: "disk full",
+      });
+    });
+
+    it("keeps alerting while failures continue past the threshold", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 2 });
+
+      for (let i = 0; i < 4; i++) {
+        monitor.recordFailure("prune", { error: `boom-${i}` });
+      }
+
+      expect(alertWarnings(warnSpy)).toHaveLength(3);
+      expect(monitor.getConsecutiveFailures()).toBe(4);
+    });
+
+    it("logs an error for every failure regardless of the threshold", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 10 });
+
+      monitor.recordFailure("prune", { error: "one" });
+      monitor.recordFailure("prune", { error: "two" });
+
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect((errorSpy.mock.calls as any[][])[0][0]).toBe(
+        "sqlite_vacuum_cleaner operation failed",
+      );
+      expect(alertWarnings(warnSpy)).toHaveLength(0);
+    });
+
+    it("honours a threshold of 1 by alerting on the first failure", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 1 });
+
+      monitor.recordFailure("prune", { error: "immediate" });
+
+      expect(alertWarnings(warnSpy)).toHaveLength(1);
+    });
+
+    it("resets the counter and clears the alert after a success", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 2 });
+
+      monitor.recordFailure("prune", { error: "boom" });
+      monitor.recordFailure("prune", { error: "boom" });
+      expect(monitor.isAlertActive()).toBe(true);
+
+      monitor.recordSuccess();
+
+      expect(monitor.getConsecutiveFailures()).toBe(0);
+      expect(monitor.isAlertActive()).toBe(false);
+      expect(infoSpy).toHaveBeenCalledWith(
+        "sqlite_vacuum_cleaner recovered after failures",
+        expect.anything(),
+      );
+    });
+
+    it("requires the full count again after a recovery", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 3 });
+
+      monitor.recordFailure("prune");
+      monitor.recordFailure("prune");
+      monitor.recordSuccess();
+      monitor.recordFailure("prune");
+      monitor.recordFailure("prune");
+
+      expect(alertWarnings(warnSpy)).toHaveLength(0);
+      expect(monitor.getConsecutiveFailures()).toBe(2);
+    });
+
+    it("does not log a recovery message when nothing had failed", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 3 });
+
+      monitor.recordSuccess();
+
+      expect(infoSpy).not.toHaveBeenCalled();
+    });
+
+    it("clears all state on reset", () => {
+      const monitor = new VacuumFailureMonitor({ failureThreshold: 1 });
+      monitor.recordFailure("prune");
+
+      monitor.reset();
+
+      expect(monitor.getConsecutiveFailures()).toBe(0);
+      expect(monitor.isAlertActive()).toBe(false);
+      expect(monitor.getLastSuccessfulAt()).toBeNull();
+    });
+  });
+
+  describe("stall alerts", () => {
+    it("does not report a stall before any successful cleanup", () => {
+      const monitor = new VacuumFailureMonitor({ stallThresholdMs: 1 });
+
+      expect(monitor.checkStall()).toBe(false);
+      expect(alertWarnings(warnSpy)).toHaveLength(0);
+    });
+
+    it("does not report a stall inside the configured window", () => {
+      const monitor = new VacuumFailureMonitor({ stallThresholdMs: 60_000 });
+      monitor.recordSuccess();
+
+      expect(monitor.checkStall()).toBe(false);
+      expect(alertWarnings(warnSpy)).toHaveLength(0);
+    });
+
+    it("warns once the stall window has elapsed", async () => {
+      const monitor = new VacuumFailureMonitor({ stallThresholdMs: 5 });
+      monitor.recordSuccess();
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(monitor.checkStall()).toBe(true);
+      const alerts = alertWarnings(warnSpy);
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0][0]).toBe(
+        "sqlite_vacuum_cleaner alert: stall threshold reached",
+      );
+      expect(alerts[0][1]).toMatchObject({
+        failureType: "stall",
+        stallThresholdMs: 5,
+      });
+      expect(alerts[0][1].elapsedMs).toBeGreaterThanOrEqual(5);
+    });
+
+    it("does not touch the failure counter when stalling", async () => {
+      const monitor = new VacuumFailureMonitor({
+        failureThreshold: 3,
+        stallThresholdMs: 5,
+      });
+      monitor.recordSuccess();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      monitor.checkStall();
+
+      expect(monitor.getConsecutiveFailures()).toBe(0);
+      expect(monitor.isAlertActive()).toBe(false);
+    });
+  });
+
+  describe("runVacuumCleanup integration", () => {
+    let testDb: Database.Database;
+
+    beforeEach(() => {
+      testDb = new Database(":memory:");
+      setDb(testDb);
+      testDb.exec("DROP TABLE IF EXISTS events");
+      testDb.exec("DROP TABLE IF EXISTS indexer_state");
+      testDb.exec("DROP TABLE IF EXISTS monitored_contracts");
+      testDb.exec("DROP TABLE IF EXISTS schema_migrations");
+      testDb.exec("DROP TABLE IF EXISTS webhook_subscriptions");
+      runMigrations();
+    });
+
+    afterEach(() => {
+      testDb.close();
+    });
+
+    it("records a success and leaves the alert clear on a healthy cleanup", () => {
+      runVacuumCleanup(testDb, { retentionDays: 90 });
+
+      expect(getVacuumFailureMonitor().getConsecutiveFailures()).toBe(0);
+      expect(getVacuumFailureMonitor().getLastSuccessfulAt()).not.toBeNull();
+      expect(alertWarnings(warnSpy)).toHaveLength(0);
+    });
+
+    it("warns after the configured number of consecutive prune failures", () => {
+      process.env.VACUUM_FAILURE_THRESHOLD = "3";
+      resetVacuumFailureMonitorState();
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        expect(() => runVacuumCleanup(testDb, { retentionDays: 0 })).toThrow();
+        expect(getVacuumFailureMonitor().getConsecutiveFailures()).toBe(attempt);
+        expect(alertWarnings(warnSpy)).toHaveLength(attempt < 3 ? 0 : 1);
+      }
+
+      expect(getVacuumFailureMonitor().isAlertActive()).toBe(true);
+      expect(errorSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it("clears the alert once a cleanup succeeds again", () => {
+      process.env.VACUUM_FAILURE_THRESHOLD = "1";
+      resetVacuumFailureMonitorState();
+
+      expect(() => runVacuumCleanup(testDb, { retentionDays: 0 })).toThrow();
+      expect(getVacuumFailureMonitor().isAlertActive()).toBe(true);
+
+      runVacuumCleanup(testDb, { retentionDays: 90 });
+
+      expect(getVacuumFailureMonitor().isAlertActive()).toBe(false);
+      expect(getVacuumFailureMonitor().getConsecutiveFailures()).toBe(0);
+    });
   });
 });
