@@ -5,6 +5,25 @@ import logger from "../utils/logger.js";
 // SQLite vacuum cleaner (#193)
 // ---------------------------------------------------------------------------
 //
+// Extended features:
+//   - Dynamic polling frequency (Issue 1): adjustVacuumPollingInterval()
+//     increases wait delays when the database is idle (no rows pruned),
+//     backing off up to MAX_VACUUM_POLL_INTERVAL_MS.
+//
+//   - Dynamic ledger range imports (Issue 3): pruneEventsInLedgerRange()
+//     accepts custom start/end ledger values so callers can import and prune
+//     arbitrary historical windows.
+//
+//   - Schema migration check utilities (Issue 4): validateVacuumSchema()
+//     verifies the required tables/columns exist before the cleaner starts,
+//     failing fast when the database state is out of sync.
+//
+//   - Polling diagnostics logs (Issue 5): every pruning step, the VACUUM
+//     command, and the whole cleanup cycle emit a debug log whose message
+//     carries `elapsedMs=` so operators can spot slow cleanup runs without
+//     enabling a profiler, mirroring indexer_runner / indexer_metrics_collector
+//     (#346).
+//
 // This module prunes stale rows from the `events` table and reclaims the
 // disk space they occupied.
 //
@@ -70,6 +89,106 @@ export const ERROR_CODES = {
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
+// ---------------------------------------------------------------------------
+// Issue 5: Polling diagnostics logs (#346)
+// ---------------------------------------------------------------------------
+
+const VACUUM_COMPONENT_NAME = "sqlite_vacuum_cleaner";
+
+export interface VacuumPollDiagnostics {
+  component: string;
+  operation: string;
+  status: "started" | "success" | "failure";
+  /** Wall-clock duration of the operation in milliseconds. */
+  elapsedMs: number;
+  /** Number of event rows deleted by a pruning step. */
+  prunedEvents?: number;
+  retentionDays?: number;
+  startLedger?: number;
+  endLedger?: number;
+  error?: string;
+}
+
+/** Round to microsecond precision so sub-millisecond operations stay readable. */
+function roundVacuumElapsed(elapsedMs: number): number {
+  return Math.round(Math.max(0, elapsedMs) * 1000) / 1000;
+}
+
+/**
+ * Emit a sqlite_vacuum_cleaner diagnostics debug log.
+ *
+ * The message string always carries `elapsedMs=` (plus `prunedEvents=` when a
+ * pruning step ran) so log-scraping validation can assert timing values are
+ * present; the same values are repeated in the structured meta object for log
+ * processors.
+ */
+export function logVacuumPollDiagnostics(
+  diagnostics: VacuumPollDiagnostics,
+): void {
+  const parts = [
+    `${diagnostics.component} poll diagnostics`,
+    `operation=${diagnostics.operation}`,
+    `status=${diagnostics.status}`,
+    `elapsedMs=${diagnostics.elapsedMs}`,
+  ];
+  if (diagnostics.prunedEvents !== undefined) {
+    parts.push(`prunedEvents=${diagnostics.prunedEvents}`);
+  }
+  if (diagnostics.retentionDays !== undefined) {
+    parts.push(`retentionDays=${diagnostics.retentionDays}`);
+  }
+  if (diagnostics.startLedger !== undefined) {
+    parts.push(`startLedger=${diagnostics.startLedger}`);
+  }
+  if (diagnostics.endLedger !== undefined) {
+    parts.push(`endLedger=${diagnostics.endLedger}`);
+  }
+  logger.debug(parts.join(" "), diagnostics);
+}
+
+/**
+ * Time a vacuum operation and emit its diagnostics. A numeric result is
+ * reported as `prunedEvents`; failures are logged with the elapsed time and
+ * the error before being rethrown for the caller to handle as before.
+ */
+function timeVacuumOperation<T>(
+  operation: string,
+  details: Omit<
+    VacuumPollDiagnostics,
+    "component" | "operation" | "status" | "elapsedMs" | "error"
+  >,
+  fn: () => T,
+): T {
+  const startedAt = performance.now();
+  try {
+    const result = fn();
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation,
+      status: "success",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      prunedEvents: typeof result === "number" ? result : undefined,
+      ...details,
+    });
+    return result;
+  } catch (err) {
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation,
+      status: "failure",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      error: err instanceof Error ? err.message : String(err),
+      ...details,
+    });
+    throw err;
+  }
+}
+
+/** Extract a message from an unknown thrown value. */
+function vacuumErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * Validates a retentionDays value. Must be a finite, positive integer.
  * Zero, negative, non-integer, NaN, and Infinity values are all rejected —
@@ -118,19 +237,25 @@ export function pruneOldEvents(db: Database.Database, retentionDays: number): nu
     throw new Error(validation.error);
   }
 
-  const deleteStmt = db.prepare(
-    `DELETE FROM events WHERE created_at < datetime('now', '-' || ? || ' days')`
+  // The DELETE statement and its transaction wrapper are timed together so a
+  // prepare/execution failure is attributed to the prune_old_events stage and
+  // emitted as a failure diagnostic before propagating.
+  const pruneTransaction = (days: number): number => {
+    const deleteStmt = db.prepare(
+      `DELETE FROM events WHERE created_at < datetime('now', '-' || ? || ' days')`
+    );
+    const tx = db.transaction((d: number) => {
+      const result = deleteStmt.run(d);
+      return result.changes;
+    });
+    return tx(days);
+  };
+
+  return timeVacuumOperation(
+    "prune_old_events",
+    { retentionDays },
+    () => pruneTransaction(retentionDays),
   );
-
-  const pruneTransaction = db.transaction((days: number) => {
-    const result = deleteStmt.run(days);
-    return result.changes;
-  });
-
-  // better-sqlite3's transaction wrapper commits the callback's statements
-  // together, or rolls all of them back if it throws — propagate any error
-  // as-is so callers know pruning did not complete.
-  return pruneTransaction(retentionDays);
 }
 
 /**
@@ -144,7 +269,7 @@ export function pruneOldEvents(db: Database.Database, retentionDays: number): nu
  * as a separate, later step.
  */
 export function runVacuum(db: Database.Database): void {
-  db.exec("VACUUM");
+  timeVacuumOperation("run_vacuum", {}, () => db.exec("VACUUM"));
 }
 
 /**
@@ -167,18 +292,50 @@ export function runVacuumCleanup(
 ): VacuumCleanupResult {
   const retentionDays = options.retentionDays ?? DEFAULT_RETENTION_DAYS;
 
+  const startedAt = performance.now();
+
   logger.info("Starting sqlite vacuum cleanup", { retentionDays });
 
-  // Step 1: transactional prune. If this throws, we intentionally do not
-  // catch it here — propagate immediately and skip VACUUM entirely.
-  const prunedEvents = pruneOldEvents(db, retentionDays);
+  logVacuumPollDiagnostics({
+    component: VACUUM_COMPONENT_NAME,
+    operation: "vacuum_cleanup",
+    status: "started",
+    elapsedMs: 0,
+    retentionDays,
+  });
 
-  // Step 2: non-transactional VACUUM, only reached once pruning committed.
-  runVacuum(db);
+  try {
+    // Step 1: transactional prune. If this throws, we intentionally do not
+    // re-catch it beyond the failure diagnostic — propagate immediately and
+    // skip VACUUM entirely.
+    const prunedEvents = pruneOldEvents(db, retentionDays);
 
-  logger.info("Completed sqlite vacuum cleanup", { prunedEvents });
+    // Step 2: non-transactional VACUUM, only reached once pruning committed.
+    runVacuum(db);
 
-  return { prunedEvents, vacuumed: true };
+    logger.info("Completed sqlite vacuum cleanup", { prunedEvents });
+
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation: "vacuum_cleanup",
+      status: "success",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      retentionDays,
+      prunedEvents,
+    });
+
+    return { prunedEvents, vacuumed: true };
+  } catch (err) {
+    logVacuumPollDiagnostics({
+      component: VACUUM_COMPONENT_NAME,
+      operation: "vacuum_cleanup",
+      status: "failure",
+      elapsedMs: roundVacuumElapsed(performance.now() - startedAt),
+      retentionDays,
+      error: vacuumErrorMessage(err),
+    });
+    throw err;
+  }
 }
 
 /**
@@ -380,7 +537,11 @@ export function pruneEventsInLedgerRange(
     return result.changes;
   });
 
-  const prunedEvents = tx() as number;
+  const prunedEvents = timeVacuumOperation(
+    "prune_ledger_range",
+    { startLedger, endLedger },
+    tx,
+  ) as number;
 
   logger.info("Pruned events in ledger range", {
     startLedger,
