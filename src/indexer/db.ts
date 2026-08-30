@@ -379,9 +379,12 @@ export function runMigrations(
   const monitor = getSqliteSchemaManagerFailureMonitor();
   monitor.checkStall();
   const startedAt = performance.now();
-  const database = getDb();
   let failureRecorded = false;
 
+  try {
+  const database = getDb();
+
+  const runAll = database.transaction(() => {
   // Bootstrap: create the migrations tracking table if it doesn't exist yet
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -430,7 +433,7 @@ export function runMigrations(
 
     try {
       // Transient SQLite failures (locked/busy database) are retried with
-      // backoff; the transaction means a failed attempt leaves nothing behind.
+      // backoff; the savepoint means a failed attempt leaves nothing behind.
       withSchemaRetrySync(
         applyMigration,
         retryConfig,
@@ -442,8 +445,29 @@ export function runMigrations(
         version: migration.version,
         error: err instanceof Error ? err.message : String(err),
       });
+      monitor.recordFailure("migration", {
+        error: err instanceof Error ? err.message : String(err),
+        version: migration.version,
+        description: migration.description,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      failureRecorded = true;
       throw err;
     }
+  }
+  });
+
+    runAll();
+    monitor.recordSuccess();
+  } catch (err) {
+    // A bootstrap failure never reached the per-migration handler above.
+    if (!failureRecorded) {
+      monitor.recordFailure("bootstrap", {
+        error: err instanceof Error ? err.message : String(err),
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+    }
+    throw err;
   }
 }
 
