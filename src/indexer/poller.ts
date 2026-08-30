@@ -12,6 +12,7 @@ import {
   type EventRow,
 } from "./db.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
+import { fetchEventsWithRetry } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
@@ -69,19 +70,6 @@ export function enqueueEventInsert(
   );
   return run;
 }
-
-const EVENT_TYPES = [
-  "initialized",
-  "funded",
-  "delivered",
-  "approved",
-  "dispute_raised",
-  "dispute_resolved",
-  "partial_release",
-  "auto_release_claimed",
-  "token_whitelisted",
-  "token_removed",
-];
 
 /**
  * Poll events for all active contract IDs stored in monitored_contracts (#85).
@@ -146,13 +134,7 @@ export async function pollEvents(): Promise<boolean> {
     const eventsStart = performance.now();
     const events = await server.getEvents({
       startLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds,
-          topics: [[...EVENT_TYPES]],
-        },
-      ],
+      contractIds,
       limit: 100,
     });
     const eventsElapsed = performance.now() - eventsStart;
