@@ -154,7 +154,23 @@ const MIGRATIONS: Migration[] = [
         ON events (contract_id, event_type, ledger_sequence);
     `,
   },
+  {
+    version: 6,
+    description: "add indexer_metrics_collector aggregation index (#335)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+    `,
+  },
 ];
+
+/**
+ * Migration versions this build ships, ascending. Callers compare these
+ * against `schema_migrations` to detect a database that is behind the code.
+ */
+export function getShippedMigrationVersions(): number[] {
+  return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
+}
 
 // ---------------------------------------------------------------------------
 // Exponential backoff retry for schema manager (#258)
@@ -310,81 +326,66 @@ export async function withSchemaRetry<T>(
 /**
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
- *
- * The entire operation (bootstrap + migration loop) runs inside an outer
- * transaction so that *any* failure mid-operation triggers a full ROLLBACK
- * and no partial schema / migration state ever persists on disk (#186).
  */
-export function runMigrations(
-  retryConfig: Partial<SchemaRetryConfig> = {},
-): void {
-  withSchemaRetrySync(
-    () => {
-      applyPendingMigrations();
-    },
-    retryConfig,
-    "sqlite_schema_manager.runMigrations",
-  );
-}
-
-function applyPendingMigrations(): void {
+export function runMigrations(): void {
   const database = getDb();
 
-  const runAll = database.transaction(() => {
-    // Bootstrap: create the migrations tracking table if it doesn't exist yet
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        description TEXT NOT NULL,
-        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+  // Bootstrap: create the migrations tracking table if it doesn't exist yet
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      description TEXT NOT NULL,
+      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 
-      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        contract_id TEXT NOT NULL,
-        webhook_url TEXT NOT NULL,
-        event_types TEXT NOT NULL DEFAULT '*',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(contract_id, webhook_url)
-      );
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contract_id TEXT NOT NULL,
+      webhook_url TEXT NOT NULL,
+      event_types TEXT NOT NULL DEFAULT '*',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(contract_id, webhook_url)
+    );
 
-      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL UNIQUE,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL UNIQUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
 
-    for (const migration of MIGRATIONS) {
-      const applied = database
-        .prepare("SELECT version FROM schema_migrations WHERE version = ?")
-        .get(migration.version);
+  for (const migration of MIGRATIONS) {
+    const applied = database
+      .prepare("SELECT version FROM schema_migrations WHERE version = ?")
+      .get(migration.version);
 
-      if (applied) continue;
+    if (applied) continue;
 
-      logger.info("Applying DB migration", {
-        version: migration.version,
-        description: migration.description,
-      });
+    logger.info("Applying DB migration", {
+      version: migration.version,
+      description: migration.description,
+    });
 
+    // Run migration inside a transaction – rolls back fully on any error
+    const applyMigration = database.transaction(() => {
       database.exec(migration.up);
       database
         .prepare(
           "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
         )
         .run(migration.version, migration.description);
-
-      logger.info("Migration applied", { version: migration.version });
-    }
-  });
-
-  try {
-    runAll();
-  } catch (err) {
-    logger.error("Schema migration failed – full rollback executed", {
-      error: err instanceof Error ? err.message : String(err),
     });
-    throw err;
+
+    try {
+      applyMigration();
+      logger.info("Migration applied", { version: migration.version });
+    } catch (err) {
+      logger.error("Migration failed – rolled back", {
+        version: migration.version,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   }
 }
 

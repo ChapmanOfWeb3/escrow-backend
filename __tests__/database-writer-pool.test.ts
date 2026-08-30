@@ -593,4 +593,230 @@ describe("DatabaseWriterPool – Concurrent Write Operations", () => {
       expect(rows).toHaveLength(1);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Simulated RPC events → database schema integration (#333)
+  // -------------------------------------------------------------------------
+
+  describe("Simulated RPC events — database schema integration", () => {
+    /**
+     * Helper: simulate an RPC event insertion into the events table,
+     * mirroring the pattern used by insertEventBatch in db.ts.
+     */
+    function simulateRpcEvent(
+      contractId: string,
+      eventType: string,
+      ledgerSequence: number,
+      timestamp: number,
+      dataJson: string,
+    ): WriteOperation<{ changes: number; lastInsertRowid: number | bigint }> {
+      return createSqlOperation(
+        `rpc-event-${contractId}-${ledgerSequence}`,
+        `INSERT OR IGNORE INTO events
+           (contract_id, event_type, ledger_sequence, timestamp, data_json)
+         VALUES (?, ?, ?, ?, ?)`,
+        [contractId, eventType, ledgerSequence, timestamp, dataJson],
+      );
+    }
+
+    it("simulated ContractInitialized event is written to events schema", async () => {
+      const op = simulateRpcEvent(
+        "CONTRACT-1",
+        "ContractInitialized",
+        100,
+        1700000000,
+        JSON.stringify({ client: "GABC", freelancer: "GDEF", amount: 500 }),
+      );
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(true);
+      expect(result.data?.changes).toBe(1);
+
+      const row = testDb
+        .prepare("SELECT * FROM events WHERE contract_id = ?")
+        .get("CONTRACT-1") as any;
+      expect(row).toBeDefined();
+      expect(row.event_type).toBe("ContractInitialized");
+      expect(row.ledger_sequence).toBe(100);
+      expect(row.timestamp).toBe(1700000000);
+    });
+
+    it("simulated MilestoneApproved event is written to events schema", async () => {
+      const op = simulateRpcEvent(
+        "CONTRACT-2",
+        "MilestoneApproved",
+        200,
+        1700001000,
+        JSON.stringify({ milestone_index: 0, approved_by: "GABC" }),
+      );
+
+      const result = await queueWrite(op);
+
+      expect(result.success).toBe(true);
+
+      const row = testDb
+        .prepare("SELECT event_type FROM events WHERE contract_id = ? AND event_type = ?")
+        .get("CONTRACT-2", "MilestoneApproved") as any;
+      expect(row).toBeDefined();
+      expect(row.event_type).toBe("MilestoneApproved");
+    });
+
+    it("multiple simulated RPC events for the same contract are all written", async () => {
+      const events = [
+        { type: "ContractInitialized", ledger: 300 },
+        { type: "FundsDeposited", ledger: 310 },
+        { type: "MilestoneApproved", ledger: 320 },
+        { type: "ContractCompleted", ledger: 330 },
+      ];
+
+      const operations = events.map((ev) =>
+        simulateRpcEvent("CONTRACT-3", ev.type, ev.ledger, 1700002000 + ev.ledger, "{}"),
+      );
+
+      const results = await Promise.all(operations.map((op) => queueWrite(op)));
+
+      expect(results.every((r) => r.success)).toBe(true);
+
+      const count = (
+        testDb
+          .prepare("SELECT COUNT(*) as cnt FROM events WHERE contract_id = ?")
+          .get("CONTRACT-3") as { cnt: number }
+      ).cnt;
+      expect(count).toBe(events.length);
+    });
+
+    it("duplicate RPC events (same contract+ledger+type) are not double-written", async () => {
+      const op1 = simulateRpcEvent("CONTRACT-4", "FundsDeposited", 400, 1700003000, "{}");
+      const op2 = simulateRpcEvent("CONTRACT-4", "FundsDeposited", 400, 1700003000, "{}");
+
+      const r1 = await queueWrite(op1);
+      const r2 = await queueWrite(op2);
+
+      expect(r1.success).toBe(true);
+      expect(r2.success).toBe(true);
+
+      // UNIQUE constraint means second insert is ignored.
+      const count = (
+        testDb
+          .prepare(
+            "SELECT COUNT(*) as cnt FROM events WHERE contract_id = ? AND event_type = ?",
+          )
+          .get("CONTRACT-4", "FundsDeposited") as { cnt: number }
+      ).cnt;
+      expect(count).toBe(1);
+    });
+
+    it("concurrent simulated RPC events from multiple contracts are all persisted", async () => {
+      const contracts = ["CA", "CB", "CC", "CD", "CE"];
+      const operations = contracts.map((c, i) =>
+        simulateRpcEvent(c, "ContractInitialized", 100 + i, 1700004000 + i, "{}"),
+      );
+
+      const results = await Promise.all(operations.map((op) => queueWrite(op)));
+
+      expect(results.every((r) => r.success)).toBe(true);
+
+      const total = (
+        testDb.prepare("SELECT COUNT(*) as cnt FROM events").get() as { cnt: number }
+      ).cnt;
+      expect(total).toBe(contracts.length);
+    });
+
+    it("simulated events survive a read-after-write consistency check", async () => {
+      const op = simulateRpcEvent(
+        "CONTRACT-6",
+        "ContractInitialized",
+        600,
+        1700005000,
+        JSON.stringify({ client: "GXYZ" }),
+      );
+
+      await queueWrite(op);
+
+      // Read back using a separate query to confirm write committed.
+      const row = testDb
+        .prepare("SELECT data_json FROM events WHERE contract_id = ?")
+        .get("CONTRACT-6") as { data_json: string };
+      expect(row).toBeDefined();
+
+      const parsed = JSON.parse(row.data_json);
+      expect(parsed.client).toBe("GXYZ");
+    });
+
+    it("batch write of simulated RPC events is atomic", async () => {
+      const events = [
+        { type: "ContractInitialized", ledger: 700 },
+        { type: "FundsDeposited", ledger: 701 },
+        { type: "MilestoneApproved", ledger: 702 },
+      ];
+
+      const operations = events.map((ev) =>
+        simulateRpcEvent("CONTRACT-7", ev.type, ev.ledger, 1700006000 + ev.ledger, "{}"),
+      );
+
+      const result = await executeBatchWrite(operations, "rpc-event-batch");
+
+      expect(result.success).toBe(true);
+      expect(result.data).toHaveLength(3);
+
+      const count = (
+        testDb
+          .prepare("SELECT COUNT(*) as cnt FROM events WHERE contract_id = ?")
+          .get("CONTRACT-7") as { cnt: number }
+      ).cnt;
+      expect(count).toBe(3);
+    });
+
+    it("all required events schema columns are populated after write", async () => {
+      const op = simulateRpcEvent(
+        "CONTRACT-8",
+        "ContractInitialized",
+        800,
+        1700007000,
+        JSON.stringify({ test: true }),
+      );
+
+      await queueWrite(op);
+
+      const row = testDb
+        .prepare("SELECT * FROM events WHERE contract_id = ?")
+        .get("CONTRACT-8") as any;
+
+      expect(row.id).toBeDefined();
+      expect(row.contract_id).toBe("CONTRACT-8");
+      expect(row.event_type).toBe("ContractInitialized");
+      expect(row.ledger_sequence).toBe(800);
+      expect(row.timestamp).toBe(1700007000);
+      expect(row.data_json).toBe(JSON.stringify({ test: true }));
+      expect(row.created_at).toBeDefined();
+    });
+
+    it("write-through transaction provides ACID guarantees for RPC events", async () => {
+      const failingOp: WriteOperation<void> = {
+        name: "failing-rpc-event",
+        execute: (db) => {
+          // Insert one valid event
+          db.prepare(
+            `INSERT OR IGNORE INTO events
+               (contract_id, event_type, ledger_sequence, timestamp, data_json)
+             VALUES (?, ?, ?, ?, ?)`,
+          ).run("C-OK", "ContractInitialized", 900, 1700008000, "{}");
+
+          // Then fail
+          throw new Error("Simulated RPC write failure");
+        },
+      };
+
+      const result = await executeWriteTransaction(failingOp);
+
+      expect(result.success).toBe(false);
+
+      // The entire transaction should have rolled back — no rows inserted.
+      const count = (
+        testDb.prepare("SELECT COUNT(*) as cnt FROM events WHERE contract_id = ?").get("C-OK") as { cnt: number }
+      ).cnt;
+      expect(count).toBe(0);
+    });
+  });
 });

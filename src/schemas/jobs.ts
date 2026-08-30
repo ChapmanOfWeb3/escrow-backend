@@ -162,25 +162,6 @@ export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
 }).strict();
 
-/**
- * POST /:contractId/whitelist/update body.
- * Builds an unsigned tx to add or remove a token from the contract whitelist.
- */
-export const whitelistUpdateBodySchema = z
-  .object({
-    token: z
-      .string({ required_error: "token is required", invalid_type_error: "token must be a string" })
-      .refine(isValidStellarContractId, {
-        message: "token must be a valid Stellar contract address (C...)",
-      }),
-    action: z.enum(["add", "remove"], {
-      required_error: "action is required",
-      invalid_type_error: "action must be 'add' or 'remove'",
-    }),
-    sourceAddress: stellarAccountField("sourceAddress"),
-  })
-  .strict();
-
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
   address: stellarAddressSchema,
@@ -293,6 +274,30 @@ export const createJobDraftLegacyBodySchema = z.object({
     .min(1, "milestones must contain at least one entry"),
 });
 
+/**
+ * POST /:contractId/whitelist/update body.
+ * Validates the token address and the action (add/remove).
+ */
+export const whitelistUpdateBodySchema = z.object({
+  token: z
+    .string({
+      required_error: "token is required",
+      invalid_type_error: "token must be a string",
+    })
+    .min(1, "token cannot be empty")
+    .refine(isValidStellarContractId, {
+      message: "token must be a valid Stellar contract address (C...)",
+    }),
+  action: z
+    .enum(["add", "remove"], {
+      required_error: "action is required",
+      invalid_type_error: "action must be one of: add, remove",
+    }),
+  adminAddress: stellarAccountField("adminAddress"),
+}).strict();
+
+export type WhitelistUpdateBody = z.infer<typeof whitelistUpdateBodySchema>;
+
 export type CreateJobDraftLegacyBody = z.infer<typeof createJobDraftLegacyBodySchema>;
 
 /**
@@ -350,7 +355,6 @@ export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
 export type SubmitBody = z.infer<typeof submitBodySchema>;
 export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
 export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;
-export type WhitelistUpdateBody = z.infer<typeof whitelistUpdateBodySchema>;
 export type ByWalletParams = z.infer<typeof byWalletParamsSchema>;
 export type ByWalletQuery = z.infer<typeof byWalletQuerySchema>;
 export type CreateJobDraftBody = z.infer<typeof createJobDraftBodySchema>;

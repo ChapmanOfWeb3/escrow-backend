@@ -65,10 +65,11 @@ describe("Indexer Database", () => {
       const rows = testDb
         .prepare("SELECT version FROM schema_migrations")
         .all();
-      // We ship 5 migrations (events/indexer_state + monitored_contracts + indexes +
-      // ledger range indexes + schema-manager lookup indexes)
+      // We ship 6 migrations (events/indexer_state + monitored_contracts + indexes +
+      // ledger range indexes + schema-manager lookup indexes +
+      // indexer_metrics_collector aggregation index)
       const versions = [...new Set((rows as any[]).map((r) => r.version))];
-      expect(versions.length).toBe(5);
+      expect(versions.length).toBe(6);
     });
   });
 
