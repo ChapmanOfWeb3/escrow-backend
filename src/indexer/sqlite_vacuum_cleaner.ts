@@ -1,5 +1,69 @@
 import type Database from "better-sqlite3";
+import { getDb } from "./db.js";
 import logger from "../utils/logger.js";
+
+// ---------------------------------------------------------------------------
+// SQLite index structures (#344)
+// ---------------------------------------------------------------------------
+// The cleaner's two hot predicates are the retention sweep (created_at < …)
+// and the ledger-range prune (ledger_sequence BETWEEN …). Migration 6 creates
+// these indexes; the helpers below name them and prove the planner uses them.
+
+export const VACUUM_CLEANER_INDEXES = {
+  /** Retention sweep: DELETE ... WHERE created_at < cutoff. */
+  eventsCreatedAt: "idx_events_created_at",
+  /** Ledger-range prune: DELETE ... WHERE ledger_sequence BETWEEN ? AND ?. */
+  eventsLedgerSequence: "idx_events_ledger_sequence",
+  /** Composite for range-scoped retention sweeps. */
+  eventsCreatedAtLedger: "idx_events_created_at_ledger",
+  /** Composite for retention-scoped range prunes. */
+  eventsLedgerCreatedAt: "idx_events_ledger_created_at",
+} as const;
+
+/** Every index name the vacuum cleaner manages, in declaration order. */
+export function getVacuumIndexNames(): string[] {
+  return Object.values(VACUUM_CLEANER_INDEXES);
+}
+
+/**
+ * Create any managed index that is missing and return all of their names.
+ * Idempotent: safe to call on a database migration 6 has already touched.
+ */
+export function ensureVacuumIndexes(targetDb?: Database.Database): string[] {
+  const database = targetDb || getDb();
+
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsCreatedAt}
+      ON events (created_at);
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsLedgerSequence}
+      ON events (ledger_sequence);
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsCreatedAtLedger}
+      ON events (created_at, ledger_sequence);
+    CREATE INDEX IF NOT EXISTS ${VACUUM_CLEANER_INDEXES.eventsLedgerCreatedAt}
+      ON events (ledger_sequence, created_at);
+  `);
+
+  return getVacuumIndexNames();
+}
+
+/** EXPLAIN QUERY PLAN rows for a statement, with its bind parameters. */
+export function vacuumExplainQueryPlan(
+  targetDb: Database.Database,
+  sql: string,
+  ...params: unknown[]
+): Array<Record<string, unknown>> {
+  return targetDb
+    .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+    .all(...(params as never[])) as Array<Record<string, unknown>>;
+}
+
+/** True when any plan row references the expected index name. */
+export function vacuumQueryPlanUsesIndex(
+  plan: Array<Record<string, unknown>>,
+  indexName: string,
+): boolean {
+  return plan.some((row) => String(row.detail ?? "").includes(indexName));
+}
 
 // ---------------------------------------------------------------------------
 // SQLite vacuum cleaner (#193)

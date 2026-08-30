@@ -139,6 +139,35 @@ export function resetFailureState(): void {
   failureMonitor.reset();
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic poll interval (#265)
+// ---------------------------------------------------------------------------
+
+const POLL_INTERVAL_MIN_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
+const POLL_INTERVAL_MAX_MS = parseInt(
+  process.env.POLL_INTERVAL_MAX_MS || "120000",
+  10,
+);
+const POLL_INTERVAL_BACKOFF = 2;
+
+/**
+ * Next poll delay given the current one and whether the last poll saw activity.
+ *
+ * Idle polls back off geometrically up to POLL_INTERVAL_MAX_MS; the first
+ * active poll drops straight back to the minimum. Pure function so the backoff
+ * curve can be reasoned about (and tested) without running the loop.
+ */
+export function nextPollIntervalMs(
+  currentIntervalMs: number,
+  sawActivity: boolean,
+): number {
+  if (sawActivity) return POLL_INTERVAL_MIN_MS;
+  return Math.min(currentIntervalMs * POLL_INTERVAL_BACKOFF, POLL_INTERVAL_MAX_MS);
+}
+
+/** The interval the poll loop is currently using. */
+export { getCurrentPollIntervalMs };
+
 /** Map an RPC event notification onto the row shape `events` stores. */
 function toEventRow(event: any, fallbackContractId: string): EventRow {
   return {

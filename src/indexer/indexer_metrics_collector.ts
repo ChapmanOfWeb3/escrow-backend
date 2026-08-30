@@ -701,6 +701,13 @@ export function getIndexerMetricsQueue(): IndexerMetricsEventQueue {
   return defaultQueue;
 }
 
+/** Drop queue, alert monitor and in-flight collection state. For tests. */
+export function resetIndexerMetricsCollectorState(): void {
+  defaultMonitor = new IndexerMetricsFailureMonitor();
+  defaultQueue = new IndexerMetricsEventQueue();
+  inFlightCollection = null;
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic poller throttling parameters (#341)
 // ---------------------------------------------------------------------------

@@ -34,18 +34,31 @@ function makeSuccessResult(
   };
 }
 
+/**
+ * Stand-in for the slice of `Server` that `fetchEventsWithRetry` needs.
+ *
+ * A bare `jest.fn()` infers `Mock<UnknownFunction>`, which makes
+ * `mockResolvedValue` expect `never` and leaves the object unassignable to the
+ * `Pick<Server, "getEvents">` parameter. Typing the mock explicitly keeps both
+ * the call sites and the `.mock.calls` assertions well typed.
+ */
+type MockEventsFn = jest.Mock<(params: GetEventsParams) => Promise<RpcGetEventsResult>>;
+type MockServer = Parameters<typeof fetchEventsWithRetry>[0] & {
+  getEvents: MockEventsFn;
+};
+
 /** Build a mock `Server.getEvents` that returns `result`. */
-function makeSuccessServer(result: RpcGetEventsResult = makeSuccessResult()) {
-  return {
-    getEvents: jest.fn().mockResolvedValue(result),
-  };
+function makeSuccessServer(result: RpcGetEventsResult = makeSuccessResult()): MockServer {
+  const getEvents = jest.fn() as MockEventsFn;
+  getEvents.mockResolvedValue(result);
+  return { getEvents } as unknown as MockServer;
 }
 
 /** Build a mock `Server.getEvents` that always throws `err`. */
-function makeFailingServer(err: Error) {
-  return {
-    getEvents: jest.fn().mockRejectedValue(err),
-  };
+function makeFailingServer(err: Error): MockServer {
+  const getEvents = jest.fn() as MockEventsFn;
+  getEvents.mockRejectedValue(err);
+  return { getEvents } as unknown as MockServer;
 }
 
 /**
@@ -58,13 +71,13 @@ function makePartialFailServer(
   successResult: RpcGetEventsResult = makeSuccessResult(1)
 ) {
   let calls = 0;
-  return {
-    getEvents: jest.fn().mockImplementation(() => {
-      calls += 1;
-      if (calls <= failCount) return Promise.reject(err);
-      return Promise.resolve(successResult);
-    }),
-  };
+  const getEvents = jest.fn() as MockEventsFn;
+  getEvents.mockImplementation(() => {
+    calls += 1;
+    if (calls <= failCount) return Promise.reject(err);
+    return Promise.resolve(successResult);
+  });
+  return { getEvents } as unknown as MockServer;
 }
 
 const BASE_PARAMS: GetEventsParams = {
@@ -196,7 +209,7 @@ describe("fetchEventsWithRetry – success path", () => {
 
     await fetchEventsWithRetry(server, BASE_PARAMS, { sleep: noopSleep });
 
-    const callArgs = server.getEvents.mock.calls[0][0] as {
+    const callArgs = server.getEvents.mock.calls[0][0] as unknown as {
       filters: Array<{ topics: string[][] }>;
     };
     expect(callArgs.filters[0].topics[0]).toEqual([...EVENT_TYPES]);
@@ -212,7 +225,7 @@ describe("fetchEventsWithRetry – success path", () => {
 
     await fetchEventsWithRetry(server, params, { sleep: noopSleep });
 
-    const callArgs = server.getEvents.mock.calls[0][0] as {
+    const callArgs = server.getEvents.mock.calls[0][0] as unknown as {
       startLedger: number;
       limit: number;
       filters: Array<{ contractIds: string[] }>;
@@ -231,7 +244,7 @@ describe("fetchEventsWithRetry – success path", () => {
       { sleep: noopSleep }
     );
 
-    const callArgs = server.getEvents.mock.calls[0][0] as { limit: number };
+    const callArgs = server.getEvents.mock.calls[0][0] as unknown as { limit: number };
     expect(callArgs.limit).toBe(100);
   });
 
@@ -581,7 +594,7 @@ describe("fetchEventsWithRetry – retry frequency increases up to max attempts"
         fakeNow += 1;
         return Promise.reject(err);
       }),
-    };
+    } as unknown as MockServer;
 
     await fetchEventsWithRetry(server, BASE_PARAMS, {
       maxAttempts: MAX_ATTEMPTS,
@@ -603,7 +616,7 @@ describe("fetchEventsWithRetry – retry frequency increases up to max attempts"
         callCount++;
         return Promise.reject(err);
       }),
-    };
+    } as unknown as MockServer;
 
     const maxAttempts = 4;
 
@@ -634,7 +647,7 @@ describe("fetchEventsWithRetry – mixed error scenarios", () => {
         if (callCount <= 2) return Promise.reject(connectionErr);
         return Promise.reject(nonConnectionErr);
       }),
-    };
+    } as unknown as MockServer;
 
     await expect(
       fetchEventsWithRetry(server, BASE_PARAMS, { sleep: noopSleep })
@@ -656,7 +669,7 @@ describe("fetchEventsWithRetry – mixed error scenarios", () => {
         if (callCount === 1) return Promise.reject(connErr);
         return Promise.reject(badErr);
       }),
-    };
+    } as unknown as MockServer;
 
     await expect(
       fetchEventsWithRetry(server, BASE_PARAMS, { sleep: noopSleep })
