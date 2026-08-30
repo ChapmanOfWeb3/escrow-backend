@@ -65,6 +65,22 @@ export function resetJobsByWalletCache(): void {
   inFlightJobsByWalletRequests.clear();
 }
 
+/**
+ * Index names used by the indexer_runner execution loop – validated via
+ * EXPLAIN QUERY PLAN (#250).
+ */
+export const INDEXER_RUNNER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+} as const;
+
+/** Index names created by the schema-manager migration (#259). */
+export const SCHEMA_MANAGER_INDEXES = {
+  monitoredContractsActive: "idx_monitored_contracts_active",
+  eventsCreatedAt: "idx_events_created_at",
+  eventsContractTypeLedger: "idx_events_contract_type_ledger",
+} as const;
+
 // ---------------------------------------------------------------------------
 // Migration manager (#84)
 // ---------------------------------------------------------------------------
