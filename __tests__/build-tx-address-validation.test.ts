@@ -18,7 +18,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
 }));
 
 jest.unstable_mockModule("../src/utils/logger.js", () => ({
-  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 
 const { default: router } = await import("../src/routes/jobs.js");
