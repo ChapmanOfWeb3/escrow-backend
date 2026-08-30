@@ -274,7 +274,118 @@ export const createJobDraftLegacyBodySchema = z.object({
     .min(1, "milestones must contain at least one entry"),
 });
 
+/**
+ * POST /:contractId/whitelist/update body.
+ * Validates the token address and the action (add/remove).
+ */
+export const whitelistUpdateBodySchema = z.object({
+  token: z
+    .string({
+      required_error: "token is required",
+      invalid_type_error: "token must be a string",
+    })
+    .min(1, "token cannot be empty")
+    .refine(isValidStellarContractId, {
+      message: "token must be a valid Stellar contract address (C...)",
+    }),
+  action: z
+    .enum(["add", "remove"], {
+      required_error: "action is required",
+      invalid_type_error: "action must be one of: add, remove",
+    }),
+  adminAddress: stellarAccountField("adminAddress"),
+}).strict();
+
+export type WhitelistUpdateBody = z.infer<typeof whitelistUpdateBodySchema>;
+
 export type CreateJobDraftLegacyBody = z.infer<typeof createJobDraftLegacyBodySchema>;
+
+/**
+ * Validates a Stellar address that can be either a public key account address (G...)
+ * or a Soroban contract address (C...).
+ */
+export const stellarAddressOrContractSchema = z
+  .string({ required_error: "Address is required" })
+  .refine((v) => isValidStellarAddress(v) || isValidStellarContractId(v), {
+    message: "Invalid Stellar address",
+  });
+
+/**
+ * POST /:contractId/whitelist/update body schema.
+ * Accepts `addresses` (or `tokens` fallback) array containing valid Stellar addresses.
+ */
+export const updateWhitelistBodySchema = z
+  .object({
+    addresses: z
+      .array(stellarAddressOrContractSchema, {
+        required_error: "addresses array is required",
+        invalid_type_error: "addresses must be an array",
+      })
+      .optional(),
+    tokens: z
+      .array(stellarAddressOrContractSchema, {
+        invalid_type_error: "tokens must be an array",
+      })
+      .optional(),
+  })
+  .superRefine((data, ctx) => {
+    const addresses = data.addresses ?? data.tokens;
+    if (!addresses) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "addresses array is required",
+        path: ["addresses"],
+      });
+      return;
+    }
+    if (addresses.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "addresses array cannot be empty",
+        path: ["addresses"],
+      });
+    }
+  });
+
+export type UpdateWhitelistBody = z.infer<typeof updateWhitelistBodySchema>;
+
+/**
+ * POST /:contractId/whitelist/update accepts two historical body shapes:
+ *
+ * - the single-token form `{ token, action, adminAddress }`
+ *   (`whitelistUpdateBodySchema`), and
+ * - the bulk form `{ addresses | tokens }` (`updateWhitelistBodySchema`).
+ *
+ * A plain `z.union` would collapse both branches into one `invalid_union`
+ * issue with an empty path, and the route's error responses are asserted
+ * field-by-field. So dispatch on the shape instead and forward the chosen
+ * branch's issues verbatim, which keeps `details[].field` populated.
+ *
+ * An ambiguous body (neither `addresses` nor `tokens` present) is reported
+ * against the single-token form, so an empty `{}` lists token/action/
+ * adminAddress as missing.
+ */
+export const whitelistUpdateRequestSchema = z
+  .object({})
+  .passthrough()
+  .superRefine((data, ctx) => {
+    const body = (data ?? {}) as Record<string, unknown>;
+    const isBulkForm = "addresses" in body || "tokens" in body;
+    const branch = isBulkForm
+      ? updateWhitelistBodySchema
+      : whitelistUpdateBodySchema;
+
+    const result = branch.safeParse(body);
+    if (!result.success) {
+      for (const issue of result.error.issues) {
+        ctx.addIssue(issue);
+      }
+    }
+  });
+
+export type WhitelistUpdateRequestBody =
+  | WhitelistUpdateBody
+  | UpdateWhitelistBody;
 
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;

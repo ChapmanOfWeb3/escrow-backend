@@ -27,6 +27,25 @@ import {
   DEFAULT_LEDGER_RANGE_FAILURE_THRESHOLD,
 } from "../src/indexer/ledger-range-tracker.js";
 
+/**
+ * winston's leveled log methods are overloaded, and the last overload is
+ * `(infoObject: object)`. `jest.spyOn` resolves to that one, so `mock.calls`
+ * is typed as a 1-tuple and the `[1]` metadata argument these assertions read
+ * fails to typecheck — even though `logger.warn(message, meta)` is exactly how
+ * the tracker calls it. Spy through this helper to describe the real shape.
+ */
+type LoggerCall = [message: unknown, meta?: Record<string, unknown>];
+
+function spyOnLogger(method: "warn" | "error" | "debug" | "info"): {
+  mock: { calls: LoggerCall[] };
+  mockClear: () => void;
+} {
+  return jest.spyOn(logger, method) as unknown as {
+    mock: { calls: LoggerCall[] };
+    mockClear: () => void;
+  };
+}
+
 function makeEvent(overrides: Partial<EventRow> = {}): EventRow {
   return {
     contractId: "C1",
@@ -284,7 +303,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
 
   describe("failure and stall alerting (#298)", () => {
     it("starts with zero consecutive failures and does not alert", async () => {
-      const warn = jest.spyOn(logger, "warn");
+      const warn = spyOnLogger("warn");
       const tracker = new LedgerRangeTracker({ name: "alert-zero", failureThreshold: 3 });
       await tracker.processRange({
         startLedger: 1,
@@ -300,8 +319,8 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
     });
 
     it("does not emit a threshold warning below the configured count", async () => {
-      const warn = jest.spyOn(logger, "warn");
-      const error = jest.spyOn(logger, "error");
+      const warn = spyOnLogger("warn");
+      const error = spyOnLogger("error");
       const tracker = new LedgerRangeTracker({ name: "alert-below", failureThreshold: 3 });
 
       await expect(
@@ -337,7 +356,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
     });
 
     it("emits a warning exactly when the threshold is reached", async () => {
-      const warn = jest.spyOn(logger, "warn");
+      const warn = spyOnLogger("warn");
       const tracker = new LedgerRangeTracker({ name: "alert-hit", failureThreshold: 3 });
       const fail = () =>
         tracker.processRange({
@@ -369,7 +388,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
     });
 
     it("does not emit additional threshold alerts while already over the limit", async () => {
-      const warn = jest.spyOn(logger, "warn");
+      const warn = spyOnLogger("warn");
       const tracker = new LedgerRangeTracker({ name: "alert-over", failureThreshold: 2 });
       const fail = () =>
         tracker.processRange({
@@ -413,7 +432,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
     });
 
     it("starts a new consecutive sequence after recovery", async () => {
-      const warn = jest.spyOn(logger, "warn");
+      const warn = spyOnLogger("warn");
       const tracker = new LedgerRangeTracker({ name: "alert-again", failureThreshold: 2 });
       const fail = () =>
         tracker.processRange({
@@ -463,7 +482,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
     });
 
     it("emits a stall warning after the configured quiet period", async () => {
-      const warn = jest.spyOn(logger, "warn");
+      const warn = spyOnLogger("warn");
       const tracker = new LedgerRangeTracker({
         name: "stall",
         stallThresholdMs: 1,
@@ -644,7 +663,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
 
   describe("polling diagnostics (#297)", () => {
     it("emits started and success diagnostics with elapsed time", async () => {
-      const debug = jest.spyOn(logger, "debug");
+      const debug = spyOnLogger("debug");
       const tracker = new LedgerRangeTracker({ name: "diag" });
       const result = await tracker.processRange({
         startLedger: 11,
@@ -677,7 +696,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
     });
 
     it("includes elapsed time on failure diagnostics", async () => {
-      const debug = jest.spyOn(logger, "debug");
+      const debug = spyOnLogger("debug");
       const tracker = new LedgerRangeTracker({ name: "diag-fail" });
       await expect(
         tracker.processRange({
@@ -701,7 +720,7 @@ describe("ledger_range_tracker improvements (#296, #297, #298, #299)", () => {
     });
 
     it("logs per-page diagnostics when fetching chunks", async () => {
-      const debug = jest.spyOn(logger, "debug");
+      const debug = spyOnLogger("debug");
       const tracker = new LedgerRangeTracker({ name: "diag-pages", pageSize: 2 });
       await tracker.processRange({
         startLedger: 1,

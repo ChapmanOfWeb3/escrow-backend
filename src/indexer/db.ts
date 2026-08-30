@@ -140,74 +140,252 @@ const MIGRATIONS: Migration[] = [
         ON events (ledger_sequence, event_type);
     `,
   },
+  {
+    version: 5,
+    description: "add sqlite_schema_manager lookup indexes (#259)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_monitored_contracts_active
+        ON monitored_contracts (active);
+
+      CREATE INDEX IF NOT EXISTS idx_events_created_at
+        ON events (created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_events_contract_type_ledger
+        ON events (contract_id, event_type, ledger_sequence);
+    `,
+  },
+  {
+    version: 6,
+    description: "add indexer_metrics_collector aggregation index (#335)",
+    up: `
+      CREATE INDEX IF NOT EXISTS idx_events_event_type
+        ON events (event_type);
+    `,
+  },
 ];
+
+/**
+ * Migration versions this build ships, ascending. Callers compare these
+ * against `schema_migrations` to detect a database that is behind the code.
+ */
+export function getShippedMigrationVersions(): number[] {
+  return MIGRATIONS.map((migration) => migration.version).sort((a, b) => a - b);
+}
+
+// ---------------------------------------------------------------------------
+// Exponential backoff retry for schema manager (#258)
+// Retries transient SQLite / connection / timeout failures during migrations.
+// ---------------------------------------------------------------------------
+
+export interface SchemaRetryConfig {
+  /** Maximum number of retry attempts (default: 5) */
+  maxRetries: number;
+  /** Initial delay in ms after first failure (default: 50) */
+  initialBackoffMs: number;
+  /** Multiplier applied to backoff on each consecutive failure (default: 2) */
+  backoffMultiplier: number;
+  /** Ceiling delay in ms (default: 2000) */
+  maxBackoffMs: number;
+}
+
+const DEFAULT_SCHEMA_RETRY_CONFIG: SchemaRetryConfig = {
+  maxRetries: 5,
+  initialBackoffMs: 50,
+  backoffMultiplier: 2,
+  maxBackoffMs: 2000,
+};
+
+/** Retryable patterns for SQLite locks and connection/RPC-style timeouts. */
+const SCHEMA_RETRYABLE_PATTERNS = [
+  "timeout",
+  "SQLITE_BUSY",
+  "SQLITE_LOCKED",
+  "database is locked",
+  "database is busy",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "connect timeout",
+  "connection reset",
+  "connection refused",
+  "connection dropped",
+  "RPC connection",
+];
+
+export function isSchemaRetryableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  return SCHEMA_RETRYABLE_PATTERNS.some((p) =>
+    msg.toLowerCase().includes(p.toLowerCase()),
+  );
+}
+
+/**
+ * Compute the backoff delay for a given attempt number.
+ * attempt 0 → initialBackoffMs
+ * attempt 1 → initialBackoffMs * multiplier
+ * etc., capped at maxBackoffMs.
+ */
+export function computeSchemaBackoffMs(
+  attempt: number,
+  config: Pick<
+    SchemaRetryConfig,
+    "initialBackoffMs" | "backoffMultiplier" | "maxBackoffMs"
+  >,
+): number {
+  return Math.min(
+    config.initialBackoffMs * Math.pow(config.backoffMultiplier, attempt),
+    config.maxBackoffMs,
+  );
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a synchronous schema operation with exponential backoff retry.
+ * Used by runMigrations so existing sync callers stay unchanged.
+ */
+export function withSchemaRetrySync<T>(
+  fn: () => T,
+  config: Partial<SchemaRetryConfig> = {},
+  context: string = "sqlite_schema_manager",
+): T {
+  const cfg = { ...DEFAULT_SCHEMA_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isSchemaRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeSchemaBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      sleepSync(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
+
+/**
+ * Async variant of schema retry for callers that prefer Promise-based backoff
+ * (e.g. unit tests asserting increasing delays without blocking the event loop).
+ */
+export async function withSchemaRetry<T>(
+  fn: () => Promise<T> | T,
+  config: Partial<SchemaRetryConfig> = {},
+  context: string = "sqlite_schema_manager",
+): Promise<T> {
+  const cfg = { ...DEFAULT_SCHEMA_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isSchemaRetryableError(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeSchemaBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      await sleep(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} failed after retries`);
+}
 
 /**
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
- *
- * The entire operation (bootstrap + migration loop) runs inside an outer
- * transaction so that *any* failure mid-operation triggers a full ROLLBACK
- * and no partial schema / migration state ever persists on disk (#186).
  */
 export function runMigrations(): void {
   const database = getDb();
 
-  const runAll = database.transaction(() => {
-    // Bootstrap: create the migrations tracking table if it doesn't exist yet
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        description TEXT NOT NULL,
-        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+  // Bootstrap: create the migrations tracking table if it doesn't exist yet
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      description TEXT NOT NULL,
+      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 
-      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        contract_id TEXT NOT NULL,
-        webhook_url TEXT NOT NULL,
-        event_types TEXT NOT NULL DEFAULT '*',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(contract_id, webhook_url)
-      );
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contract_id TEXT NOT NULL,
+      webhook_url TEXT NOT NULL,
+      event_types TEXT NOT NULL DEFAULT '*',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(contract_id, webhook_url)
+    );
 
-      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL UNIQUE,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL UNIQUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
 
-    for (const migration of MIGRATIONS) {
-      const applied = database
-        .prepare("SELECT version FROM schema_migrations WHERE version = ?")
-        .get(migration.version);
+  for (const migration of MIGRATIONS) {
+    const applied = database
+      .prepare("SELECT version FROM schema_migrations WHERE version = ?")
+      .get(migration.version);
 
-      if (applied) continue;
+    if (applied) continue;
 
-      logger.info("Applying DB migration", {
-        version: migration.version,
-        description: migration.description,
-      });
+    logger.info("Applying DB migration", {
+      version: migration.version,
+      description: migration.description,
+    });
 
+    // Run migration inside a transaction – rolls back fully on any error
+    const applyMigration = database.transaction(() => {
       database.exec(migration.up);
       database
         .prepare(
           "INSERT INTO schema_migrations (version, description) VALUES (?, ?)"
         )
         .run(migration.version, migration.description);
-
-      logger.info("Migration applied", { version: migration.version });
-    }
-  });
-
-  try {
-    runAll();
-  } catch (err) {
-    logger.error("Schema migration failed – full rollback executed", {
-      error: err instanceof Error ? err.message : String(err),
     });
-    throw err;
+
+    try {
+      applyMigration();
+      logger.info("Migration applied", { version: migration.version });
+    } catch (err) {
+      logger.error("Migration failed – rolled back", {
+        version: migration.version,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   }
 }
 
@@ -517,27 +695,35 @@ export function setLastIndexedLedger(seq: number) {
  * Registers a contract for polling, or re-activates it if it was previously
  * deregistered. Idempotent - calling this repeatedly for the same
  * contract_id never creates duplicate rows.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function registerContract(contractId: string, label?: string): void {
   const db = getDb();
-  db.prepare(
-    `INSERT INTO monitored_contracts (contract_id, label, active)
-     VALUES (?, ?, 1)
-     ON CONFLICT(contract_id) DO UPDATE SET
-       active = 1,
-       label = COALESCE(excluded.label, monitored_contracts.label)`
-  ).run(contractId, label ?? null);
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO monitored_contracts (contract_id, label, active)
+       VALUES (?, ?, 1)
+       ON CONFLICT(contract_id) DO UPDATE SET
+         active = 1,
+         label = COALESCE(excluded.label, monitored_contracts.label)`
+    ).run(contractId, label ?? null);
+  });
+  tx();
 }
 
 /**
  * Marks a contract inactive so it's excluded from getActiveContractIds()
  * without deleting its historical event data.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function deregisterContract(contractId: string): void {
   const db = getDb();
-  db.prepare(
-    "UPDATE monitored_contracts SET active = 0 WHERE contract_id = ?"
-  ).run(contractId);
+  const tx = db.transaction(() => {
+    db.prepare(
+      "UPDATE monitored_contracts SET active = 0 WHERE contract_id = ?"
+    ).run(contractId);
+  });
+  tx();
 }
 
 /**
@@ -557,6 +743,7 @@ export function getActiveContractIds(): string[] {
 
 /**
  * Insert a single event row.  For atomic batch inserts use insertEventBatch().
+ * Wrapped in a transaction so concurrent writes never leave partial state.
  */
 export function insertEvent(
   contractId: string,
@@ -566,19 +753,71 @@ export function insertEvent(
   dataJson: string
 ): boolean {
   const db = getDb();
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO events 
-    (contract_id, event_type, ledger_sequence, timestamp, data_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-  const result = stmt.run(
-    contractId,
-    eventType,
-    ledgerSequence,
-    timestamp,
-    dataJson
-  );
-  return result.changes > 0;
+  const tx = db.transaction(() => {
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO events 
+      (contract_id, event_type, ledger_sequence, timestamp, data_json)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const result = stmt.run(
+      contractId,
+      eventType,
+      ledgerSequence,
+      timestamp,
+      dataJson
+    );
+    return result.changes > 0;
+  });
+  return tx();
+}
+
+export interface WebhookSubscription {
+  id: number;
+  url: string;
+  created_at: string;
+}
+
+/**
+ * Add a global webhook subscription. Runs INSERT + SELECT inside a single
+ * transaction so the returned row always reflects what was just committed,
+ * even under concurrent writes.
+ */
+export function addWebhookSubscription(url: string): WebhookSubscription {
+  const db = getDb();
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("INSERT INTO webhook_subscriptions (url) VALUES (?)")
+      .run(url);
+    const row = db
+      .prepare(
+        "SELECT id, url, created_at FROM webhook_subscriptions WHERE id = ?"
+      )
+      .get(result.lastInsertRowid);
+    return row as WebhookSubscription;
+  });
+  return tx();
+}
+
+/**
+ * Remove a global webhook subscription by URL.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
+ */
+export function removeWebhookSubscription(url: string): boolean {
+  const db = getDb();
+  const tx = db.transaction(() => {
+    const result = db
+      .prepare("DELETE FROM webhook_subscriptions WHERE url = ?")
+      .run(url);
+    return result.changes > 0;
+  });
+  return tx();
+}
+
+export function getWebhookSubscriptions(): WebhookSubscription[] {
+  const db = getDb();
+  return db
+    .prepare("SELECT id, url, created_at FROM webhook_subscriptions ORDER BY id")
+    .all() as WebhookSubscription[];
 }
 
 export interface EventRow {
@@ -846,14 +1085,18 @@ export interface WebhookSubscription {
   created_at: string;
 }
 
+/**
+ * Add a per-contract webhook subscription. Runs INSERT + SELECT inside a
+ * single transaction so the returned row always reflects what was just
+ * committed, even under concurrent writes.
+ */
 export function addSubscription(
   contractId: string,
   webhookUrl: string,
   eventTypes: string[]
 ): WebhookSubscription {
   const db = getDb();
-
-  const addTx = db.transaction(() => {
+  const tx = db.transaction(() => {
     const stmt = db.prepare(`
       INSERT OR IGNORE INTO webhook_subscriptions
       (contract_id, webhook_url, event_types)
@@ -864,39 +1107,22 @@ export function addSubscription(
       .prepare("SELECT * FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
       .get(contractId, webhookUrl) as WebhookSubscription;
   });
-
-  try {
-    return addTx();
-  } catch (err) {
-    logger.error("addSubscription failed – transaction rolled back", {
-      contractId,
-      webhookUrl,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
-  }
+  return tx();
 }
 
+/**
+ * Remove a per-contract webhook subscription.
+ * Wrapped in a transaction so concurrent writes never leave partial state.
+ */
 export function removeSubscription(contractId: string, webhookUrl: string): boolean {
   const db = getDb();
-
-  const removeTx = db.transaction(() => {
+  const tx = db.transaction(() => {
     const result = db
       .prepare("DELETE FROM webhook_subscriptions WHERE contract_id = ? AND webhook_url = ?")
       .run(contractId, webhookUrl);
     return result.changes > 0;
   });
-
-  try {
-    return removeTx();
-  } catch (err) {
-    logger.error("removeSubscription failed – transaction rolled back", {
-      contractId,
-      webhookUrl,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
-  }
+  return tx();
 }
 
 export function getSubscriptions(): WebhookSubscription[] {

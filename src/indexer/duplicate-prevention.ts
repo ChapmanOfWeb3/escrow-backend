@@ -372,6 +372,11 @@ export function findUnsyncedRanges(
  * Uses INSERT OR IGNORE at the DB level for idempotency, and tracks the
  * sync range metadata atomically.
  *
+ * All event inserts and the sync_ranges metadata write execute inside a
+ * single better-sqlite3 transaction. If any step throws, better-sqlite3
+ * automatically rolls back the entire transaction so no partial state is
+ * left in the database (#189).
+ *
  * @param events - Array of event rows to insert
  * @param syncRange - The ledger range being synced
  * @returns DuplicateCheckResult with counts
@@ -405,6 +410,7 @@ export function countEventsInRange(
 
 /**
  * Delete event data for a specific ledger range (useful for re-sync).
+ * Wrapped in a transaction so both events and sync_ranges deletes are atomic.
  */
 export function deleteEventsInRange(
   startLedger: number,
@@ -428,5 +434,7 @@ export function deleteEventsInRange(
     ).run(startLedger, endLedger);
   }
 
-  return result.changes;
+    return result.changes;
+  });
+  return tx();
 }

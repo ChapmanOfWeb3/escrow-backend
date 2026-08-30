@@ -61,13 +61,20 @@ describe("Indexer Database", () => {
 
     it("does not re-apply already-applied migrations (idempotent)", () => {
       // Running again should not throw and should not duplicate rows
+      const before = testDb
+        .prepare("SELECT version FROM schema_migrations")
+        .all() as Array<{ version: number }>;
+
       runMigrations();
-      const rows = testDb
+
+      const after = testDb
         .prepare("SELECT version FROM schema_migrations")
         .all();
-      // We ship 4 migrations (events/indexer_state + monitored_contracts + indexes + ledger range indexes)
+      // We ship 6 migrations (events/indexer_state + monitored_contracts + indexes +
+      // ledger range indexes + schema-manager lookup indexes +
+      // indexer_metrics_collector aggregation index)
       const versions = [...new Set((rows as any[]).map((r) => r.version))];
-      expect(versions.length).toBe(4);
+      expect(versions.length).toBe(6);
     });
   });
 
