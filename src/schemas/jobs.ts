@@ -162,25 +162,6 @@ export const claimAutoReleaseBodySchema = z.object({
   sourceAddress: stellarAccountField("sourceAddress"),
 }).strict();
 
-/**
- * POST /:contractId/whitelist/update body.
- * Builds an unsigned tx to add or remove a token from the contract whitelist.
- */
-export const whitelistUpdateBodySchema = z
-  .object({
-    token: z
-      .string({ required_error: "token is required", invalid_type_error: "token must be a string" })
-      .refine(isValidStellarContractId, {
-        message: "token must be a valid Stellar contract address (C...)",
-      }),
-    action: z.enum(["add", "remove"], {
-      required_error: "action is required",
-      invalid_type_error: "action must be 'add' or 'remove'",
-    }),
-    sourceAddress: stellarAccountField("sourceAddress"),
-  })
-  .strict();
-
 /** Route params: /by-wallet/:address */
 export const byWalletParamsSchema = z.object({
   address: stellarAddressSchema,
@@ -319,13 +300,61 @@ export type WhitelistUpdateBody = z.infer<typeof whitelistUpdateBodySchema>;
 
 export type CreateJobDraftLegacyBody = z.infer<typeof createJobDraftLegacyBodySchema>;
 
+/**
+ * Validates a Stellar address that can be either a public key account address (G...)
+ * or a Soroban contract address (C...).
+ */
+export const stellarAddressOrContractSchema = z
+  .string({ required_error: "Address is required" })
+  .refine((v) => isValidStellarAddress(v) || isValidStellarContractId(v), {
+    message: "Invalid Stellar address",
+  });
+
+/**
+ * POST /:contractId/whitelist/update body schema.
+ * Accepts `addresses` (or `tokens` fallback) array containing valid Stellar addresses.
+ */
+export const updateWhitelistBodySchema = z
+  .object({
+    addresses: z
+      .array(stellarAddressOrContractSchema, {
+        required_error: "addresses array is required",
+        invalid_type_error: "addresses must be an array",
+      })
+      .optional(),
+    tokens: z
+      .array(stellarAddressOrContractSchema, {
+        invalid_type_error: "tokens must be an array",
+      })
+      .optional(),
+  })
+  .superRefine((data, ctx) => {
+    const addresses = data.addresses ?? data.tokens;
+    if (!addresses) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "addresses array is required",
+        path: ["addresses"],
+      });
+      return;
+    }
+    if (addresses.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "addresses array cannot be empty",
+        path: ["addresses"],
+      });
+    }
+  });
+
+export type UpdateWhitelistBody = z.infer<typeof updateWhitelistBodySchema>;
+
 export type ContractIdParams = z.infer<typeof contractIdParamsSchema>;
 export type ContractMilestoneParams = z.infer<typeof contractMilestoneParamsSchema>;
 export type BuildTxBody = z.infer<typeof buildTxBodySchema>;
 export type SubmitBody = z.infer<typeof submitBodySchema>;
 export type PartialReleaseBody = z.infer<typeof partialReleaseBodySchema>;
 export type ClaimAutoReleaseBody = z.infer<typeof claimAutoReleaseBodySchema>;
-export type WhitelistUpdateBody = z.infer<typeof whitelistUpdateBodySchema>;
 export type ByWalletParams = z.infer<typeof byWalletParamsSchema>;
 export type ByWalletQuery = z.infer<typeof byWalletQuerySchema>;
 export type CreateJobDraftBody = z.infer<typeof createJobDraftBodySchema>;

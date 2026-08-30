@@ -5,19 +5,6 @@ import logger from "../utils/logger.js";
 // SQLite vacuum cleaner (#193)
 // ---------------------------------------------------------------------------
 //
-// Extended features:
-//   - Dynamic polling frequency (Issue 1): adjustVacuumPollingInterval()
-//     increases wait delays when the database is idle (no rows pruned),
-//     backing off up to MAX_VACUUM_POLL_INTERVAL_MS.
-//
-//   - Dynamic ledger range imports (Issue 3): pruneEventsInLedgerRange()
-//     accepts custom start/end ledger values so callers can import and prune
-//     arbitrary historical windows.
-//
-//   - Schema migration check utilities (Issue 4): validateVacuumSchema()
-//     verifies the required tables/columns exist before the cleaner starts,
-//     failing fast when the database state is out of sync.
-//
 // This module prunes stale rows from the `events` table and reclaims the
 // disk space they occupied.
 //
