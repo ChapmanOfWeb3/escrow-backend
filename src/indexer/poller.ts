@@ -15,6 +15,7 @@ import {
   type EventRow,
 } from "./db.js";
 import { RpcPollerClient } from "./rpc-poller-client.js";
+import { IndexerRunnerFailureMonitor } from "./indexer_runner.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
 import { fetchEventsWithRetry } from "./event_type_filter.js";
 import logger from "../utils/logger.js";
@@ -51,81 +52,21 @@ const rpcClient = new RpcPollerClient(RPC_URL, {
 // a poll loop that stops succeeding for longer than the stall threshold is
 // reported even while individual polls keep "working".
 
-const DEFAULT_FAILURE_THRESHOLD = 3;
-const DEFAULT_STALL_THRESHOLD_MS = 120_000;
-
-function readPositiveIntEnv(names: string[], fallback: number): number {
-  for (const name of names) {
-    const raw = process.env[name];
-    if (raw === undefined) continue;
-    const parsed = parseInt(raw, 10);
-    if (Number.isFinite(parsed) && parsed > 0) return parsed;
-  }
-  return fallback;
-}
-
-class IndexerRunnerFailureMonitor {
-  private consecutiveFailures = 0;
-  private lastSuccessfulAt: number | null = null;
-  private stallAlerted = false;
-
-  get stallThresholdMs(): number {
-    return readPositiveIntEnv(
-      ["INDEXER_RUNNER_STALL_THRESHOLD_MS", "POLLER_STALL_THRESHOLD_MS"],
-      DEFAULT_STALL_THRESHOLD_MS,
-    );
-  }
-
-  getFailureThreshold(): number {
-    return readPositiveIntEnv(
-      ["INDEXER_RUNNER_FAILURE_THRESHOLD", "POLLER_FAILURE_THRESHOLD"],
-      DEFAULT_FAILURE_THRESHOLD,
-    );
-  }
-
-  getConsecutiveFailures(): number {
-    return this.consecutiveFailures;
-  }
-
-  getLastSuccessfulAt(): number | null {
-    return this.lastSuccessfulAt;
-  }
-
-  recordSuccess(): void {
-    this.consecutiveFailures = 0;
-    this.lastSuccessfulAt = Date.now();
-    this.stallAlerted = false;
-  }
-
-  recordFailure(): number {
-    this.consecutiveFailures += 1;
-    return this.consecutiveFailures;
-  }
-
-  /** Warn once per stall episode when no poll has succeeded in the window. */
-  checkStall(): void {
-    if (this.lastSuccessfulAt === null) return;
-    const elapsed = Date.now() - this.lastSuccessfulAt;
-    if (elapsed <= this.stallThresholdMs) return;
-    if (this.stallAlerted) return;
-
-    this.stallAlerted = true;
-    logger.warn("Poller stall detected – no successful poll for threshold period", {
-      elapsedMs: elapsed,
-      stallThresholdMs: this.stallThresholdMs,
-      consecutiveFailures: this.consecutiveFailures,
-    });
-  }
-
-  /** Reset in place – callers hold a reference to this instance. */
-  reset(): void {
-    this.consecutiveFailures = 0;
-    this.lastSuccessfulAt = null;
-    this.stallAlerted = false;
-  }
-}
-
-const failureMonitor = new IndexerRunnerFailureMonitor();
+const failureMonitor = new IndexerRunnerFailureMonitor({
+  name: "indexer_runner",
+  failureThreshold: parseInt(
+    process.env.INDEXER_RUNNER_FAILURE_THRESHOLD ||
+      process.env.POLLER_FAILURE_THRESHOLD ||
+      "3",
+    10,
+  ),
+  stallThresholdMs: parseInt(
+    process.env.INDEXER_RUNNER_STALL_THRESHOLD_MS ||
+      process.env.POLLER_STALL_THRESHOLD_MS ||
+      "120000",
+    10,
+  ),
+});
 
 export function getConsecutiveFailures(): number {
   return failureMonitor.getConsecutiveFailures();
@@ -506,7 +447,10 @@ export async function pollEvents(): Promise<boolean> {
     return true;
   } catch (err) {
     const totalElapsed = performance.now() - pollStart;
-    const consecutiveFailures = failureMonitor.recordFailure();
+    const consecutiveFailures = failureMonitor.recordFailure("poll", {
+      error: err instanceof Error ? err.message : String(err),
+      operation: "poll_events",
+    });
 
     logger.error("Error polling events", {
       error: err instanceof Error ? err.message : String(err),

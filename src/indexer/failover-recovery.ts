@@ -2,6 +2,26 @@ import { getDb } from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
+ * Debug line for one RPC round against a failover node (#249).
+ *
+ * The elapsed time and payload size are embedded in the message string as well
+ * as the metadata, so operators can grep slow or oversized rounds straight out
+ * of plain-text logs without a structured log backend.
+ */
+export function logPollDiagnostics(
+  nodeUrl: string,
+  startedAt: number,
+  payloadSizeBytes: number,
+): void {
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+
+  logger.debug(
+    `failover_recovery poll elapsedMs=${elapsedMs} payloadSizeBytes=${payloadSizeBytes}`,
+    { nodeUrl, elapsedMs, payloadSizeBytes },
+  );
+}
+
+/**
  * FailoverRecovery tracks the health of the RPC nodes the indexer reads from and
  * manages failover between them. Every write runs inside a SQLite transaction so
  * related fields (failure count, backoff, healthy flag, audit log) can never be

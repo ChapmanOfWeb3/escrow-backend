@@ -359,7 +359,9 @@ export async function withSchemaRetry<T>(
  * Ensures the schema_migrations tracking table exists, then applies any
  * pending migrations in version order, each wrapped in its own transaction.
  */
-export function runMigrations(): void {
+export function runMigrations(
+  retryConfig: Partial<SchemaRetryConfig> = {},
+): void {
   const monitor = getSqliteSchemaManagerFailureMonitor();
   monitor.checkStall();
   const startedAt = performance.now();
@@ -413,7 +415,13 @@ export function runMigrations(): void {
     });
 
     try {
-      applyMigration();
+      // Transient SQLite failures (locked/busy database) are retried with
+      // backoff; the transaction means a failed attempt leaves nothing behind.
+      withSchemaRetrySync(
+        applyMigration,
+        retryConfig,
+        `migration_${migration.version}`,
+      );
       logger.info("Migration applied", { version: migration.version });
     } catch (err) {
       logger.error("Migration failed – rolled back", {
