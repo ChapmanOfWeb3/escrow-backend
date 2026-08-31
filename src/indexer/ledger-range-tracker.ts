@@ -1131,6 +1131,70 @@ export const LEDGER_RANGE_INDEXES = {
   ledgerSequence: "idx_events_ledger_sequence",
 } as const;
 
+export interface LedgerRangeTrackerSchemaReport {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  errors: string[];
+}
+
+export function verifyLedgerRangeTrackerSchema(): LedgerRangeTrackerSchemaReport {
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const errors: string[] = [];
+
+  const requiredTables = ["events", "indexer_state", "schema_migrations"];
+  for (const table of requiredTables) {
+    const row = getDb()
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table);
+    if (!row) {
+      missingTables.push(table);
+    }
+  }
+
+  const eventsColumns = ["id", "contract_id", "event_type", "ledger_sequence", "timestamp", "data_json", "created_at"];
+  const stateColumns = ["key", "value"];
+
+  const checkTable = (table: string, required: string[]) => {
+    if (!getDb().prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) {
+      return;
+    }
+    const rows = getDb()
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as Array<{ name: string }>;
+    const names = new Set(rows.map((row) => row.name));
+    const missing = required.filter((col) => !names.has(col));
+    if (missing.length > 0) missingColumns[table] = missing;
+  };
+
+  checkTable("events", eventsColumns);
+  checkTable("indexer_state", stateColumns);
+
+  const shipped = getDb().prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>;
+  const versions = shipped.map((row) => row.version);
+  for (const version of [1, 2, 3, 4, 5, 6, 7]) {
+    if (!versions.includes(version)) {
+      errors.push(`migration version gap: expected ${version} to be applied`);
+    }
+  }
+
+  const valid = missingTables.length === 0 && Object.keys(missingColumns).length === 0 && errors.length === 0;
+  return { valid, missingTables, missingColumns, errors };
+}
+
+export function assertLedgerRangeTrackerSchemaValid(): void {
+  const result = verifyLedgerRangeTrackerSchema();
+  if (!result.valid) {
+    const reasons = [
+      ...result.missingTables.map((table) => `missing table: ${table}`),
+      ...Object.entries(result.missingColumns).map(([table, cols]) => `missing columns in ${table}: ${cols.join(", ")}`),
+      ...result.errors,
+    ];
+    throw new Error(`LedgerRangeTracker schema verification failed: cannot start with invalid schema (${reasons.join("; ")})`);
+  }
+}
+
 /**
  * Return SQLite EXPLAIN QUERY PLAN rows for a parameterized statement.
  * Useful in tests to assert index usage for ledger range lookups (#295).
