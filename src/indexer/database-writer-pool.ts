@@ -1540,6 +1540,84 @@ export function resetWriterPoolStartState(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic polling frequency intervals based on ledger processing loads
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_WRITER_POOL_POLL_INTERVAL_MS = parseInt(
+  process.env.WRITER_POOL_POLL_INTERVAL_MS || "1000",
+  10
+);
+export const MIN_WRITER_POOL_POLL_INTERVAL_MS = parseInt(
+  process.env.WRITER_POOL_MIN_POLL_INTERVAL_MS || "100",
+  10
+);
+export const MAX_WRITER_POOL_POLL_INTERVAL_MS = parseInt(
+  process.env.WRITER_POOL_MAX_POLL_INTERVAL_MS || "10000",
+  10
+);
+
+export const WRITER_POOL_IDLE_BACKOFF_FACTOR = 2;
+export const WRITER_POOL_IDLE_THRESHOLD_CYCLES = 2;
+
+export interface WriterPoolPollingState {
+  currentIntervalMs: number;
+  idleCycles: number;
+  lastAdjustedAt: number;
+}
+
+let writerPoolPollingState: WriterPoolPollingState = {
+  currentIntervalMs: DEFAULT_WRITER_POOL_POLL_INTERVAL_MS,
+  idleCycles: 0,
+  lastAdjustedAt: Date.now(),
+};
+
+/** Returns a read-only snapshot of the current writer pool polling state. */
+export function getWriterPoolPollingState(): WriterPoolPollingState {
+  return { ...writerPoolPollingState };
+}
+
+/** Resets polling state to defaults. Useful for tests. */
+export function resetWriterPoolPollingState(): void {
+  writerPoolPollingState = {
+    currentIntervalMs: DEFAULT_WRITER_POOL_POLL_INTERVAL_MS,
+    idleCycles: 0,
+    lastAdjustedAt: Date.now(),
+  };
+}
+
+/**
+ * Adjusts the writer pool polling interval based on the number of events processed.
+ * 
+ * - If `eventsProcessed === 0` for at least WRITER_POOL_IDLE_THRESHOLD_CYCLES
+ *   consecutive cycles, the interval doubles (up to MAX_WRITER_POOL_POLL_INTERVAL_MS).
+ * - If events were processed, the interval is reset to its minimum.
+ * 
+ * @param eventsProcessed - Number of events processed in the most recent cycle.
+ * @returns Updated polling state snapshot.
+ */
+export function adjustWriterPoolPollingInterval(
+  eventsProcessed: number
+): WriterPoolPollingState {
+  const state = writerPoolPollingState;
+
+  if (eventsProcessed === 0) {
+    state.idleCycles += 1;
+    if (state.idleCycles >= WRITER_POOL_IDLE_THRESHOLD_CYCLES) {
+      state.currentIntervalMs = Math.min(
+        state.currentIntervalMs * WRITER_POOL_IDLE_BACKOFF_FACTOR,
+        MAX_WRITER_POOL_POLL_INTERVAL_MS
+      );
+    }
+  } else {
+    state.idleCycles = 0;
+    state.currentIntervalMs = MIN_WRITER_POOL_POLL_INTERVAL_MS;
+  }
+
+  state.lastAdjustedAt = Date.now();
+  return { ...state };
+}
+
+// ---------------------------------------------------------------------------
 // Dynamic historical sync ranges (#330)
 // ---------------------------------------------------------------------------
 
