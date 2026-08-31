@@ -14,6 +14,9 @@ import { getJobsByWallet, getEventsByContract } from "../indexer/db.js";
 import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
+  validate(contractIdParamsSchema, "params", (req) =>
+    logger.warn("Invalid contract ID", { contractId: req.params.contractId }),
+  ),
   whitelistUpdateRateLimit,
   partialReleaseRateLimit,
   buildTxRateLimit,
