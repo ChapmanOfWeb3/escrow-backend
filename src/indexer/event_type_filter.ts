@@ -125,7 +125,9 @@ const defaultSleep = (ms: number): Promise<void> =>
  *                 or the first non-connection error encountered.
  */
 export async function fetchEventsWithRetry(
-  server: Pick<Server, "getEvents">,
+  server: {
+    getEvents: (params: any) => Promise<any> | any;
+  },
   params: GetEventsParams,
   options: FetchEventsOptions = {}
 ): Promise<RpcGetEventsResult> {

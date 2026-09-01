@@ -85,6 +85,23 @@ function mapHealthRow(row: HealthRow): NodeHealthStatus {
   };
 }
 
+/** Backwards-compatible poll diagnostics helper used by older tests. */
+export function logPollDiagnostics(
+  nodeUrl: string,
+  startedAt: number,
+  payloadSizeBytes: number,
+): void {
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  logger.debug(
+    `failover_recovery poll diagnostics nodeUrl=${nodeUrl} elapsedMs=${elapsedMs} payloadSizeBytes=${payloadSizeBytes}`,
+    {
+      nodeUrl,
+      elapsedMs,
+      payloadSizeBytes,
+    },
+  );
+}
+
 /**
  * Create the health/failover tables when absent and seed the singleton
  * failover_state row. Safe to call repeatedly.

@@ -15,6 +15,7 @@ import {
   runVacuumWithRetry,
   runVacuumCleanupWithRetry,
   DEFAULT_VACUUM_RETRY_CONFIG,
+  fastConfig,
 } from "../src/indexer/sqlite_vacuum_cleaner.js";
 import logger from "../src/utils/logger.js";
 
