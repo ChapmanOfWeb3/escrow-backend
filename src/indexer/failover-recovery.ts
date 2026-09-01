@@ -2,6 +2,55 @@ import { getDb } from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
+ * Retries an async operation with exponentially increasing delays.
+ *
+ * A connection dropout to a Soroban RPC node is usually transient, so the
+ * caller gets `maxAttempts` tries with the pause doubling each time
+ * (`baseDelayMs`, `2x`, `4x`, ...). Only the gaps between attempts are
+ * delayed -- the first call is immediate and a successful attempt returns
+ * straight away -- so N attempts sleep at most N-1 times.
+ *
+ * The error from the final attempt is rethrown, so callers see the reason the
+ * operation actually gave up rather than a wrapper.
+ *
+ * @param operation   The work to attempt. Re-invoked on each retry.
+ * @param maxAttempts Total attempts, including the first. Values below 1 are
+ *                    treated as 1.
+ * @param baseDelayMs Delay before the second attempt; doubles thereafter.
+ */
+export async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxAttempts = 3,
+  baseDelayMs = 100,
+): Promise<T> {
+  const attempts = Math.max(1, maxAttempts);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+
+      // No pause after the final attempt -- it would delay the rejection
+      // without buying another try.
+      if (attempt === attempts - 1) break;
+
+      const delayMs = baseDelayMs * 2 ** attempt;
+      logger.warn("Operation failed, retrying with backoff", {
+        attempt: attempt + 1,
+        maxAttempts: attempts,
+        delayMs,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw lastError;
+}
+
+/**
  * Debug line for one RPC round against a failover node (#249).
  *
  * The elapsed time and payload size are embedded in the message string as well
