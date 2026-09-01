@@ -33,6 +33,8 @@ import {
   timeRemainingSecurityHeaders,
   byWalletCors,
   byWalletSecurityHeaders,
+  partialReleaseCors,
+  partialReleaseSecurityHeaders,
   claimAutoReleaseCors,
   claimAutoReleaseSecurityHeaders,
   updateWhitelistCors,
@@ -1116,8 +1118,15 @@ router.post(
 // ---------------------------------------------------------------------------
 // POST /api/jobs/:contractId/milestones/:index/partial-release
 // ---------------------------------------------------------------------------
+router.options(
+  "/:contractId/milestones/:index/partial-release",
+  partialReleaseCors,
+);
+
 router.post(
   "/:contractId/milestones/:index/partial-release",
+  partialReleaseCors,
+  partialReleaseSecurityHeaders,
   partialReleaseRateLimit,
   validateWithFields(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for partial-release", { params: req.params }),
@@ -1156,8 +1165,6 @@ router.post(
         amount,
         sourceAddress,
       });
-
-      const contract = new Contract(contractId as string);
 
       let account;
       try {
@@ -1204,17 +1211,6 @@ router.post(
       if (!requestPromise) {
         requestPromise = (async (): Promise<string> => {
           const contract = new Contract(contractId as string);
-
-          let account;
-          try {
-            account = await server.getAccount(sourceAddress as string);
-          } catch (err: any) {
-            const errMsg = String(err?.message || err);
-            const { status, message } = classifySimError(errMsg);
-            logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
-            throw { status, message };
-          }
-
           const amountNum = BigInt(amount);
 
           const tx = new TransactionBuilder(account, {
