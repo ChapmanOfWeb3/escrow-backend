@@ -1150,7 +1150,6 @@ router.post(
       }
 
       const { amount, sourceAddress } = req.body;
-      const cacheKey = `${contractId}:${index}:${sourceAddress}`;
 
       logger.debug("Partial-release handler entered", {
         traceId,
@@ -1166,19 +1165,6 @@ router.post(
         amount,
         sourceAddress,
       });
-
-      const cached = partialReleaseCache.get<string>(cacheKey);
-      if (cached !== undefined) {
-        logger.info("Partial-release XDR served from cache", {
-          traceId,
-          contractId,
-          index,
-          sourceAddress,
-          xdrLength: cached.length,
-        });
-        res.json({ success: true, xdr: cached });
-        return;
-      }
 
       let account;
       try {

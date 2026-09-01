@@ -623,50 +623,6 @@ export class VacuumFailureMonitor {
 
 let defaultVacuumFailureMonitor = new VacuumFailureMonitor();
 
-export const VACUUM_CLEANER_INDEXES = {
-  eventsCreatedAt: "idx_events_created_at",
-  eventsLedgerSequence: "idx_events_ledger_sequence",
-  eventsCreatedAtLedger: "idx_events_created_at_ledger",
-  eventsLedgerCreatedAt: "idx_events_ledger_created_at",
-} as const;
-
-export function getVacuumIndexNames(): string[] {
-  return Object.values(VACUUM_CLEANER_INDEXES);
-}
-
-export function ensureVacuumIndexes(db: Database.Database): string[] {
-  const indexNames = getVacuumIndexNames();
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_events_created_at ON events (created_at);
-    CREATE INDEX IF NOT EXISTS idx_events_ledger_sequence ON events (ledger_sequence);
-    CREATE INDEX IF NOT EXISTS idx_events_created_at_ledger ON events (created_at, ledger_sequence);
-    CREATE INDEX IF NOT EXISTS idx_events_ledger_created_at ON events (ledger_sequence, created_at);
-  `);
-  return indexNames;
-}
-
-export function vacuumExplainQueryPlan(
-  db: Database.Database,
-  sql: string,
-  ...params: unknown[]
-): Array<Record<string, unknown>> {
-  return db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<Record<string, unknown>>;
-}
-
-export function vacuumQueryPlanUsesIndex(
-  plan: Array<Record<string, unknown>>,
-  indexName: string,
-): boolean {
-  return plan.some((row) => Object.values(row).some((value) => typeof value === "string" && value.includes(indexName)));
-}
-
-export const fastConfig = {
-  maxRetries: 1,
-  initialBackoffMs: 1,
-  backoffMultiplier: 2,
-  maxBackoffMs: 10,
-};
-
 /** The monitor backing `runVacuumCleanup`. */
 export function getVacuumFailureMonitor(): VacuumFailureMonitor {
   return defaultVacuumFailureMonitor;
