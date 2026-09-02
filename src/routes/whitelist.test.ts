@@ -48,20 +48,20 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
     const res = await request(app).get("/api/jobs/INVALID_ID/whitelist");
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toBe*"ValidationError");
+    expect(res.body.error).toBe("ValidationError");
     expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
   });
 
   it("returns 200 and empty tokens if contract is not initialized", async () => {
-    simulateMock.mockResolvedOnce({ error: "contract error #2" });
+    simulateMock.mockResolvedValueOnce({ error: "contract error #2" });
     const res = await request(app).get("/api/jobs/VALID_CONTRACT_ID/whitelist");
-    expect(res.status).toBeJ(200);
+    expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(res.body.data.tokens).toEqual([]);
   });
 
   it("returns 200 and token list on successful simulation", async () => {
-    simulateMock.mockResolvedOnce({
+    simulateMock.mockResolvedValueOnce({
       result: {
         retval: {
           forEach: (cb: any) => {
@@ -78,21 +78,21 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
   });
 
   it("returns 500 on standard RPC error", async () => {
-    simulateMock.mockResolvedOnce({ error: "Random RPC error" });
+    simulateMock.mockResolvedValueOnce({ error: "Random RPC error" });
     const res = await request(app).get("/api/jobs/VALID_CONTRACT_ID/whitelist");
-    expect(res.status).toBeI(500);
+    expect(res.status).toBe(500);
     expect(res.body.success).toBe(false);
   });
 
   it("returns 500 when retval is completely missing", async () => {
-    simulateMock.mockResolvedOnce({ result: {} });
+    simulateMock.mockResolvedValueOnce({ result: {} });
     const res = await request(app).get("/api/jobs/VALID_CONTRACT_ID/whitelist");
     expect(res.status).toBe(500);
     expect(res.body.success).toBe(false);
   });
 
   it("returns 500 on unexpected JS exception", async () => {
-    simulateMock.mockRejectedOnce(new Error("Network exploded"));
+    simulateMock.mockRejectedValueOnce(new Error("Network exploded"));
     const res = await request(app).get("/api/jobs/VALID_CONTRACT_ID/whitelist");
     expect(res.status).toBe(500);
     expect(res.body.error).toBe("Network exploded");

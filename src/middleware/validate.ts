@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import { z, ZodError, ZodSchema } from "zod";
+import { ZodError, ZodSchema } from "zod";
 
 type Target = "params" | "body" | "query";
 
@@ -104,10 +104,3 @@ export function validateWithFields(
     next();
   };
 }
-
-// Route-specific validation for GET /api/jobs/:contractId/whitelist
-export const whitelistParamsSchema = z.object({
-  contractId: z.coerce.number().int().positive("contractId must be a positive integer"),
-});
-
-export const validateWhitelistParams = validate(whitelistParamsSchema, "params");
